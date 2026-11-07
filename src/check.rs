@@ -144,6 +144,13 @@ fn cache_dir() -> PathBuf {
     base.join("minka-syu")
 }
 
+/// The throwaway pacman DB root a check refreshes. Browsing reads it
+/// (when present) so search results reflect the last check's view of
+/// the repos rather than the system DB's.
+pub fn checkdb_path() -> PathBuf {
+    cache_dir().join("checkdb")
+}
+
 pub fn load_state() -> Option<State> {
     let text = std::fs::read_to_string(state_path()).ok()?;
     serde_json::from_str(&text).ok()
@@ -202,7 +209,7 @@ fn is_root() -> bool {
 /// symlink to the real one, so `-Sy` refreshes only the copy and -Qu
 /// against it can never leave the system in partial-upgrade state.
 fn refresh_temp_db() -> Result<PathBuf, String> {
-    let db = cache_dir().join("checkdb");
+    let db = checkdb_path();
     std::fs::create_dir_all(db.join("sync"))
         .map_err(|e| format!("creating temp db: {e}"))?;
     let local_link = db.join("local");
@@ -312,11 +319,20 @@ mod tests {
                 alpm::InstalledPkg {
                     version: "3:1.39.7-1.1".into(),
                     repo: Some("cachyos-extra-v4".into()),
+                    description: String::new(),
+                    size_bytes: 0,
+                    explicit: true,
                 },
             ),
             (
                 "gitkraken".to_string(),
-                alpm::InstalledPkg { version: "12.6.1-1".into(), repo: None },
+                alpm::InstalledPkg {
+                    version: "12.6.1-1".into(),
+                    repo: None,
+                    description: String::new(),
+                    size_bytes: 0,
+                    explicit: true,
+                },
             ),
         ])
     }

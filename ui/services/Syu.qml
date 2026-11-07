@@ -22,6 +22,17 @@ Singleton {
     property var state: null            // {schema, checked_at, updates, repo_change_count, ...}
     property string lastError: ""
 
+    // Browsing. Search results belong to the last query only; the
+    // installed list is a snapshot, re-asked on demand (the terminal
+    // does the mutating, so nothing here can watch it change live).
+    property bool searching: false
+    property bool searched: false
+    property var searchResults: []
+    property bool searchTruncated: false
+    property bool loadingInstalled: false
+    property bool installedLoaded: false
+    property var installedList: []
+
     // Requests made before the child process has finished starting. The
     // window asks for its state in Component.onCompleted, which fires
     // BEFORE Process.running flips true -- dropping those would leave a
@@ -64,11 +75,56 @@ Singleton {
     }
 
     // Opens the terminal running paru (the core owns the argv:
-    // rio -e paru -Syu --sudoloop). Nothing to show from the reply
-    // beyond a failed spawn, which lands in lastError via request().
-    function apply() {
+    // rio -e paru -Syu --sudoloop). `ignore` names updates unticked
+    // in the list: skipped this once via --ignore, not remembered.
+    // Nothing to show from the reply beyond a failed spawn, which
+    // lands in lastError via request().
+    function apply(ignore) {
         lastError = "";
-        request("apply", undefined, undefined);
+        request("apply", { ignore: ignore ?? [] }, undefined);
+    }
+
+    function search(query) {
+        if (searching || !query || query.trim().length === 0)
+            return;
+        searching = true;
+        searched = true;
+        lastError = "";
+        request("search", { query: query.trim() }, (result, error) => {
+            searching = false;
+            if (!error && result) {
+                root.searchResults = result.results ?? [];
+                root.searchTruncated = result.truncated ?? false;
+            }
+        });
+    }
+
+    function loadInstalled() {
+        if (loadingInstalled)
+            return;
+        loadingInstalled = true;
+        lastError = "";
+        request("installed", undefined, (result, error) => {
+            loadingInstalled = false;
+            if (!error && result) {
+                root.installedList = result;
+                root.installedLoaded = true;
+            }
+        });
+    }
+
+    function installPackages(names) {
+        if (!names || names.length === 0)
+            return;
+        lastError = "";
+        request("install", { packages: names }, undefined);
+    }
+
+    function removePackages(names) {
+        if (!names || names.length === 0)
+            return;
+        lastError = "";
+        request("remove", { packages: names }, undefined);
     }
 
     NdjsonRpc {
@@ -105,6 +161,8 @@ Singleton {
         onExited: {
             rpc.reset();
             root.checking = false;
+            root.searching = false;
+            root.loadingInstalled = false;
             root.lastError = "update core exited";
         }
     }

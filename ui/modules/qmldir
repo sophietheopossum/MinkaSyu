@@ -1,3 +1,6 @@
 module modules
 PushButton 1.0 PushButton.qml
 UpdateRow 1.0 UpdateRow.qml
+CheckBox 1.0 CheckBox.qml
+PackageRow 1.0 PackageRow.qml
+SearchField 1.0 SearchField.qml

@@ -16,15 +16,28 @@ RowLayout {
 
     required property var update
 
+    // Unticked = ignored for this run only (--ignore); the window
+    // owns the set, this row only shows and reports.
+    property bool selected: true
+    signal toggled
+
     readonly property bool repoChanged: update.transition === "changed"
     readonly property bool unknownSource: update.transition === "unknown_source"
 
     spacing: 10
     Layout.fillWidth: true
 
+    CheckBox {
+        checked: root.selected
+        Layout.alignment: Qt.AlignTop
+        Layout.topMargin: 2
+        onToggled: root.toggled()
+    }
+
     ColumnLayout {
         Layout.fillWidth: true
         spacing: 1
+        opacity: root.selected ? 1.0 : 0.45
 
         Text {
             text: root.update.name

@@ -12,21 +12,34 @@ pub struct InstalledPkg {
     /// Absent for packages installed from files (most AUR/manual builds)
     /// and for anything installed before libalpm recorded it.
     pub repo: Option<String>,
+    pub description: String,
+    /// Installed size in bytes (`%SIZE%`); 0 when unrecorded.
+    pub size_bytes: u64,
+    /// Explicitly installed, as opposed to pulled in as a dependency.
+    /// libalpm writes `%REASON% 1` for dependencies and omits the
+    /// field entirely for explicit installs.
+    pub explicit: bool,
 }
 
-/// Parse one local-DB `desc` file into (name, version, installed_db).
+/// Parse one local-DB `desc` file into (name, package).
 /// Format: `%FIELD%` line, value line(s), blank line, repeated.
-pub fn parse_desc(text: &str) -> (Option<String>, Option<String>, Option<String>) {
-    // desc files are small; collect field -> first value line directly.
+/// Only the first value line of each field we care about is read.
+pub fn parse_desc(text: &str) -> (Option<String>, Option<InstalledPkg>) {
     let mut name = None;
     let mut version = None;
     let mut repo = None;
+    let mut description = None;
+    let mut size = None;
+    let mut reason = None;
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
         let target = match line.trim() {
             "%NAME%" => &mut name,
             "%VERSION%" => &mut version,
             "%INSTALLED_DB%" => &mut repo,
+            "%DESC%" => &mut description,
+            "%SIZE%" => &mut size,
+            "%REASON%" => &mut reason,
             _ => continue,
         };
         if let Some(value) = lines.next() {
@@ -36,7 +49,14 @@ pub fn parse_desc(text: &str) -> (Option<String>, Option<String>, Option<String>
             }
         }
     }
-    (name, version, repo)
+    let pkg = version.map(|version| InstalledPkg {
+        version,
+        repo,
+        description: description.unwrap_or_default(),
+        size_bytes: size.and_then(|s| s.parse().ok()).unwrap_or(0),
+        explicit: reason.as_deref() != Some("1"),
+    });
+    (name, pkg)
 }
 
 /// Read every installed package's version + origin repo from the local DB.
@@ -50,9 +70,9 @@ pub fn read_installed(local_db: &Path) -> HashMap<String, InstalledPkg> {
         let Ok(text) = std::fs::read_to_string(&desc_path) else {
             continue;
         };
-        let (name, version, repo) = parse_desc(&text);
-        if let (Some(name), Some(version)) = (name, version) {
-            out.insert(name, InstalledPkg { version, repo });
+        let (name, pkg) = parse_desc(&text);
+        if let (Some(name), Some(pkg)) = (name, pkg) {
+            out.insert(name, pkg);
         }
     }
     out
@@ -100,20 +120,26 @@ mod tests {
 
     #[test]
     fn desc_with_installed_db() {
-        let text = "%NAME%\nbcachefs-dkms\n\n%VERSION%\n3:1.39.7-1.1\n\n%INSTALLED_DB%\ncachyos-extra-v4\n\n%DESC%\nx\n";
-        let (name, version, repo) = parse_desc(text);
+        let text = "%NAME%\nbcachefs-dkms\n\n%VERSION%\n3:1.39.7-1.1\n\n%INSTALLED_DB%\ncachyos-extra-v4\n\n%DESC%\nbcachefs DKMS\n\n%SIZE%\n123456\n\n%REASON%\n1\n";
+        let (name, pkg) = parse_desc(text);
         assert_eq!(name.as_deref(), Some("bcachefs-dkms"));
-        assert_eq!(version.as_deref(), Some("3:1.39.7-1.1"));
-        assert_eq!(repo.as_deref(), Some("cachyos-extra-v4"));
+        let pkg = pkg.expect("pkg");
+        assert_eq!(pkg.version, "3:1.39.7-1.1");
+        assert_eq!(pkg.repo.as_deref(), Some("cachyos-extra-v4"));
+        assert_eq!(pkg.description, "bcachefs DKMS");
+        assert_eq!(pkg.size_bytes, 123456);
+        assert!(!pkg.explicit, "REASON 1 is a dependency install");
     }
 
     #[test]
     fn desc_without_installed_db() {
         let text = "%NAME%\ngitkraken\n\n%VERSION%\n12.6.1-1\n";
-        let (name, version, repo) = parse_desc(text);
+        let (name, pkg) = parse_desc(text);
         assert_eq!(name.as_deref(), Some("gitkraken"));
-        assert_eq!(version.as_deref(), Some("12.6.1-1"));
-        assert_eq!(repo, None);
+        let pkg = pkg.expect("pkg");
+        assert_eq!(pkg.version, "12.6.1-1");
+        assert_eq!(pkg.repo, None);
+        assert!(pkg.explicit, "no REASON field means explicitly installed");
     }
 
     #[test]

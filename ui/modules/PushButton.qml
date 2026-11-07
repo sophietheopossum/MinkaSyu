@@ -9,6 +9,9 @@ Rectangle {
 
     property string label
     property bool primary: false
+    // A latched-on look for tab/toggle use, in purple: red is reserved
+    // for the one consequential action per page.
+    property bool toggled: false
     // `enabled` is inherited from Item: it already gates input and is what callers expect.
 
     signal clicked
@@ -19,9 +22,10 @@ Rectangle {
     opacity: root.enabled ? 1.0 : 0.4
     color: !root.enabled ? Theme.surface
          : root.primary ? (area.containsMouse ? Theme.red : Theme.redDim)
+         : root.toggled ? Theme.purpleDim
                         : (area.containsMouse ? Theme.surfaceRaised : Theme.surface)
     border.width: 1
-    border.color: root.primary ? Theme.red : Theme.line
+    border.color: root.primary ? Theme.red : root.toggled ? Theme.purple : Theme.line
 
     Text {
         id: caption

@@ -1,0 +1,187 @@
+#!/bin/sh
+# minkasyu - pacman -Syu that can see past repository order.
+#
+#   minkasyu [--all]  sync, upgrade, then offer shadowed switches
+#   minkasyu check [--all]  report only. Default: [minka] shadows only;
+#                     --all also reports ordinary cross-repo version skew.
+#
+# Why this exists: pacman resolves a package name from the FIRST repo
+# in pacman.conf that contains it, comparing versions only there. The
+# local [minka] repo sits last on purpose, so a locally published
+# rebuild of an upstream package is invisible to -Syu even when newer -
+# and an upstream fix is likewise invisible while a local shadow is
+# published. minkasyu finds both cases by comparing versions across
+# ALL repos, then lets pacman do the actual work.
+
+set -eu
+
+prog=$(readlink -f "$0")
+
+die() { echo "minkasyu: $*" >&2; exit 1; }
+
+usage() {
+	sed -n '2,14p' "$prog" | sed 's/^# \{0,1\}//' >&2
+	exit 1
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# find_shadows: print one TSV line per interesting package:
+#   CLASS \t name \t installed \t pick-repo \t pick-ver \t best-repo \t best-ver
+#
+# $mode controls the shadow class: by default ("minka") only shadows
+# whose newest copy lives in [minka] are reported. Cross-repo version
+# skew elsewhere (CachyOS v4 repos lagging their non-v4 counterparts)
+# is normal distro behaviour, not shadowing; chasing it would trade
+# v4-optimized builds for generic ones. --all lifts the filter.
+#
+# CLASS is:
+#   shadow    a repo pacman would NOT pick has the newest version and
+#             it is newer than what is installed: -Syu cannot see it.
+#   handback  installed version is the one published in [minka], but
+#             another repo is newer now: upstream has caught up, so
+#             the local shadow can be retired (minkarepo remove).
+find_shadows() {
+	# name<TAB>version for installed packages
+	pacman -Q | awk '{print $1"\t"$2}' > "$tmp/installed"
+
+	# Installed packages present in >1 repo with differing versions.
+	# pacman -Sl prints in pacman.conf repo order, so the first entry
+	# seen per name is the one pacman itself would pick.
+	pacman -Sl | awk '{print $2"\t"$1"\t"$3}' | awk -F'\t' '
+		FNR==NR { inst[$1]=$2; next }
+		!($1 in inst) { next }
+		{
+			if (!($1 in firstrepo)) { firstrepo[$1]=$2; firstver[$1]=$3 }
+			if ($3 != firstver[$1]) diff[$1]=1
+			entries[$1] = entries[$1] $2 "=" $3 " "
+			n[$1]++
+		}
+		END {
+			for (name in n)
+				if (n[name] > 1 && (name in diff))
+					print name"\t"inst[name]"\t"firstrepo[name]"\t"firstver[name]"\t"entries[name]
+		}' "$tmp/installed" - > "$tmp/candidates"
+
+	while IFS="$(printf '\t')" read -r name instver pickrepo pickver entries; do
+		bestrepo=$pickrepo
+		bestver=$pickver
+		minkaver=
+		for rv in $entries; do
+			r=${rv%%=*}
+			v=${rv#*=}
+			[ "$r" = "minka" ] && minkaver=$v
+			if [ "$(vercmp "$v" "$bestver")" -gt 0 ]; then
+				bestver=$v
+				bestrepo=$r
+			fi
+		done
+
+		# Nothing newer anywhere than what is installed: uninteresting.
+		[ "$(vercmp "$bestver" "$instver")" -gt 0 ] || continue
+
+		if [ "$bestrepo" != "$pickrepo" ] && { [ "$mode" = all ] || [ "$bestrepo" = minka ]; }; then
+			printf 'shadow\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$name" "$instver" "$pickrepo" "$pickver" "$bestrepo" "$bestver"
+		elif [ -n "$minkaver" ] && [ "$minkaver" = "$instver" ]; then
+			# pacman WILL offer this upgrade itself (best == pick);
+			# flag it only so the stale shadow can be retired.
+			printf 'handback\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$name" "$instver" "$pickrepo" "$pickver" "$bestrepo" "$bestver"
+		fi
+	done < "$tmp/candidates"
+}
+
+report() {
+	# $1: file with find_shadows output
+	shadows=$(grep -c '^shadow' "$1" || true)
+	handbacks=$(grep -c '^handback' "$1" || true)
+
+	if [ "$shadows" -gt 0 ]; then
+		echo "Shadowed updates (-Syu cannot see these):"
+		while IFS="$(printf '\t')" read -r _ name instver pickrepo pickver bestrepo bestver; do
+			printf '  %s: installed %s, pacman picks %s %s, newest is %s %s\n' \
+				"$name" "$instver" "$pickrepo" "$pickver" "$bestrepo" "$bestver"
+		done <<EOF
+$(grep '^shadow' "$1")
+EOF
+	fi
+
+	if [ "$handbacks" -gt 0 ]; then
+		echo "Upstream has caught up (retire the local shadow after upgrading):"
+		while IFS="$(printf '\t')" read -r _ name instver pickrepo pickver bestrepo bestver; do
+			printf '  %s: running [minka] %s, %s now has %s -> minkarepo remove %s\n' \
+				"$name" "$instver" "$bestrepo" "$bestver" "$name"
+		done <<EOF
+$(grep '^handback' "$1")
+EOF
+	fi
+
+	if [ "$shadows" -eq 0 ] && [ "$handbacks" -eq 0 ]; then
+		echo "No shadowed updates."
+	fi
+}
+
+ask_yes() {
+	# $1: prompt. Returns 0 only on an explicit y/Y. Reads the tty so
+	# prompts keep working when stdin is a pipe or heredoc.
+	printf '%s [y/N] ' "$1" > /dev/tty
+	read -r ans < /dev/tty || return 1
+	case $ans in
+		y|Y) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+cmd_check() {
+	find_shadows > "$tmp/shadows"
+	report "$tmp/shadows"
+}
+
+cmd_upgrade() {
+	sudo pacman -Sy
+
+	find_shadows > "$tmp/shadows"
+	report "$tmp/shadows"
+
+	sudo pacman -Su || die "pacman -Su failed; resolve that first, then rerun"
+
+	# Installed versions just moved; recompute before offering switches
+	# so we never act on pre-upgrade state.
+	find_shadows > "$tmp/shadows"
+
+	grep '^shadow' "$tmp/shadows" > "$tmp/shadow-list" || true
+	while IFS="$(printf '\t')" read -r _ name instver _pickrepo _pickver bestrepo bestver; do
+		if ask_yes "Switch $name $instver -> $bestrepo $bestver?"; then
+			sudo pacman -S "$bestrepo/$name" || die "installing $bestrepo/$name failed"
+			# If the version we just replaced is still published in
+			# [minka], the shadow has done its job; retiring it is a
+			# deliberate act, so only print the command.
+			if pacman -Sl minka 2>/dev/null | grep -qF "minka $name $instver"; then
+				echo "note: $name $instver is still published in [minka]; retire it with: minkarepo remove $name"
+			fi
+		fi
+	done < "$tmp/shadow-list"
+
+	# Handbacks were already handled by the -Su above; just remind.
+	grep '^handback' "$tmp/shadows" > "$tmp/handback-list" || true
+	while IFS="$(printf '\t')" read -r _ name _i _pr _pv _br _bv; do
+		echo "note: upstream has caught up for $name; retire the shadow with: minkarepo remove $name"
+	done < "$tmp/handback-list"
+}
+
+mode=minka
+cmd=upgrade
+for arg in "$@"; do
+	case $arg in
+		check) cmd=check ;;
+		--all) mode=all ;;
+		*) usage ;;
+	esac
+done
+
+case $cmd in
+	check) cmd_check ;;
+	upgrade) cmd_upgrade ;;
+esac

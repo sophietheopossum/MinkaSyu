@@ -1,0 +1,111 @@
+pragma Singleton
+import QtQuick
+import Quickshell
+// Through the config-root symlink: Quickshell only honours qmldir registration
+// for paths inside the shell root.
+import "../MinkaLink"
+
+// The update core, spoken to over its stdio.
+//
+// Same shape as MinkaLedger's transport: NdjsonRpc owns the id
+// correlation, CoreProcess owns the child, this object owns nothing but
+// the pipe and the last state document handed to it. The core owns
+// checking, repository provenance and the state file; this window is a
+// view over `state`, refreshed on the core's {event:"state"} broadcast.
+Singleton {
+    id: root
+
+    property string binary: Quickshell.env("MINKA_SYU_BIN") || "minka-syu"
+
+    readonly property bool running: core.running
+    property bool checking: false       // a check is in flight (seconds, not ms)
+    property var state: null            // {schema, checked_at, updates, repo_change_count, ...}
+    property string lastError: ""
+
+    // Requests made before the child process has finished starting. The
+    // window asks for its state in Component.onCompleted, which fires
+    // BEFORE Process.running flips true -- dropping those would leave a
+    // permanently empty window that had merely asked too early.
+    property var _pendingStart: []
+
+    function request(method, params, onResult) {
+        if (!core.running) {
+            _pendingStart.push({ method, params, onResult });
+            return;
+        }
+        rpc.request(method, params, (result, error) => {
+            if (error)
+                root.lastError = error.message || String(error.code);
+            if (onResult)
+                onResult(result, error);
+        });
+    }
+
+    function _flushPendingStart() {
+        const queued = _pendingStart;
+        _pendingStart = [];
+        for (const q of queued)
+            root.request(q.method, q.params, q.onResult);
+    }
+
+    function refresh() {
+        request("get_state", undefined, result => { root.state = result; });
+    }
+
+    function recheck() {
+        if (checking)
+            return;
+        checking = true;
+        lastError = "";
+        // On success the core broadcasts the fresh state; the reply only
+        // needs to end the in-flight flag. On failure there is no
+        // broadcast and the old state stays on screen.
+        request("check", undefined, () => { checking = false; });
+    }
+
+    // Opens the terminal running paru (the core owns the argv:
+    // rio -e paru -Syu --sudoloop). Nothing to show from the reply
+    // beyond a failed spawn, which lands in lastError via request().
+    function apply() {
+        lastError = "";
+        request("apply", undefined, undefined);
+    }
+
+    NdjsonRpc {
+        id: rpc
+        writeLine: line => core.write(line)
+        onBroadcast: (name, payload) => {
+            if (name === "state") {
+                root.state = payload;
+                root.checking = false;
+            }
+        }
+    }
+
+    CoreProcess {
+        id: core
+        command: [root.binary, "serve"]
+
+        onLine: line => rpc.feedLine(line)
+        onStarted: {
+            root.lastError = "";
+            // Deferred, not synchronous: `started` is emitted from
+            // inside the child's runningChanged notification, BEFORE
+            // the `running` binding that request() checks has
+            // re-evaluated. Flushing inline sees running=false and
+            // re-queues everything into a queue nobody flushes again
+            // -- the initial get_state never reached the core, and a
+            // fresh window sat on "waiting for the core…" until
+            // Recheck was clicked (verified headless, 7/11/2026).
+            Qt.callLater(() => {
+                root._flushPendingStart();
+                root.refresh();
+            });
+        }
+        onExited: {
+            rpc.reset();
+            root.checking = false;
+            root.lastError = "update core exited";
+        }
+    }
+}

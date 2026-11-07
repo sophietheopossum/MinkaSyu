@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic MinkaSyu update check
+
+[Timer]
+# Shortly after login, then every 4 hours. Persistent=true catches a
+# check missed while the machine was off; the delay avoids every user's
+# timer firing on the hour in lockstep.
+OnBootSec=5min
+OnUnitActiveSec=4h
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

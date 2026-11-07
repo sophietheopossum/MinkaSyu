@@ -1,0 +1,15 @@
+[Unit]
+Description=MinkaSyu update check
+# The check downloads sync databases into a throwaway DB root; give the
+# network a chance to be up first (a failed run is retried on the next
+# timer tick regardless).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/minka-syu check --notify
+# Runs in its own cgroup like everything else; keep it polite while it
+# shells out to pacman/paru.
+Nice=10
+IOSchedulingClass=idle

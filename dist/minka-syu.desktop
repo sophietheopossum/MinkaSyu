@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MinkaSyu
+GenericName=System Updates
+Comment=Check for repository and AUR updates; apply with paru
+Exec=qs -p /usr/share/minka-syu/ui
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=updates;pacman;paru;aur;packages;

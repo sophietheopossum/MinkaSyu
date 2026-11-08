@@ -20,6 +20,7 @@ RowLayout {
     // owns the set, this row only shows and reports.
     property bool selected: true
     signal toggled
+    signal nameClicked
 
     readonly property bool repoChanged: update.transition === "changed"
     readonly property bool unknownSource: update.transition === "unknown_source"
@@ -44,8 +45,17 @@ RowLayout {
             color: Theme.text
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize
+            font.underline: nameArea.containsMouse
             elide: Text.ElideRight
             Layout.fillWidth: true
+
+            MouseArea {
+                id: nameArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.nameClicked()
+            }
         }
 
         RowLayout {

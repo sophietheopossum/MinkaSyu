@@ -17,6 +17,7 @@ RowLayout {
     property string marker: ""        // e.g. "installed 1.2-3" or "dependency"
     property bool selected: false
     signal toggled
+    signal nameClicked
 
     spacing: 10
 
@@ -41,7 +42,16 @@ RowLayout {
                 color: Theme.text
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize
+                font.underline: nameArea.containsMouse
                 elide: Text.ElideRight
+
+                MouseArea {
+                    id: nameArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.nameClicked()
+                }
             }
             Text {
                 text: root.version

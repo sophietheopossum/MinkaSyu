@@ -18,6 +18,7 @@
 //! state behind.
 
 mod alpm;
+mod appstream;
 mod catalog;
 mod check;
 
@@ -35,6 +36,7 @@ fn main() {
         "apply" => cmd_apply(rest.contains(&"--dry-run"), &parse_ignore(&rest)),
         "search" => cmd_search(&rest.join(" ")),
         "installed" => cmd_installed(),
+        "appstream" => cmd_appstream(rest.first().copied().unwrap_or("")),
         "install" => cmd_packages(true, rest.contains(&"--dry-run"), &positional(&rest)),
         "remove" => cmd_packages(false, rest.contains(&"--dry-run"), &positional(&rest)),
         "serve" => {
@@ -191,6 +193,29 @@ fn cmd_search(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_appstream(package: &str) -> Result<(), String> {
+    if !valid_package_name(package) {
+        return Err(format!("invalid package name: {package:?}"));
+    }
+    match appstream::run_appstream(package) {
+        Some(info) => {
+            println!("{} ({})", info.name, info.id);
+            println!("{}", info.summary);
+            if !info.description.is_empty() {
+                println!("\n{}", info.description);
+            }
+            if !info.homepage.is_empty() {
+                println!("\nHomepage: {}", info.homepage);
+            }
+            if !info.screenshots.is_empty() {
+                println!("Screenshot: {}", info.screenshots[0]);
+            }
+            Ok(())
+        }
+        None => Err(format!("no AppStream data for {package}")),
+    }
+}
+
 fn cmd_installed() -> Result<(), String> {
     for e in catalog::run_installed() {
         println!(
@@ -299,6 +324,19 @@ fn dispatch(
         }
         "installed" => {
             serde_json::to_value(catalog::run_installed())
+                .map_err(|e| Error::internal(e.to_string()))
+        }
+        "appstream" => {
+            let package = params
+                .get("package")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_code("appstream needs a package".to_string()))?;
+            if !valid_package_name(package) {
+                return Err(error_code(format!("invalid package name: {package:?}")));
+            }
+            // Null (not an error) when no component claims the
+            // package: absence of garnish is a normal answer.
+            serde_json::to_value(appstream::run_appstream(package))
                 .map_err(|e| Error::internal(e.to_string()))
         }
         "install" => {

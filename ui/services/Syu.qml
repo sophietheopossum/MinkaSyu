@@ -33,6 +33,14 @@ Singleton {
     property bool installedLoaded: false
     property var installedList: []
 
+    // AppStream detail for the last-clicked package name. Loaded is
+    // separate from the data: "loaded, and there was none" (null)
+    // is a normal answer for libraries and most AUR packages.
+    property string appstreamFor: ""
+    property bool appstreamLoading: false
+    property bool appstreamLoaded: false
+    property var appstreamData: null
+
     // Requests made before the child process has finished starting. The
     // window asks for its state in Component.onCompleted, which fires
     // BEFORE Process.running flips true -- dropping those would leave a
@@ -113,6 +121,23 @@ Singleton {
         });
     }
 
+    function loadAppstream(name) {
+        appstreamFor = name;
+        appstreamData = null;
+        appstreamLoaded = false;
+        appstreamLoading = true;
+        request("appstream", { package: name }, (result, error) => {
+            // A slow answer for a package the user has clicked past
+            // must not land in the now-open detail view.
+            if (root.appstreamFor !== name)
+                return;
+            appstreamLoading = false;
+            appstreamLoaded = true;
+            if (!error)
+                root.appstreamData = result;
+        });
+    }
+
     function installPackages(names) {
         if (!names || names.length === 0)
             return;
@@ -163,6 +188,7 @@ Singleton {
             root.checking = false;
             root.searching = false;
             root.loadingInstalled = false;
+            root.appstreamLoading = false;
             root.lastError = "update core exited";
         }
     }

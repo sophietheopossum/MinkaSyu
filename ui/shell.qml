@@ -56,6 +56,22 @@ ShellRoot {
         function selectionNames(setName) {
             return Object.keys(win[setName]);
         }
+
+        // Package detail overlay: AppStream garnish over the pacman
+        // facts the row already knows. The fallback is what shows
+        // while loading, and all that shows when a package has no
+        // AppStream component at all.
+        property bool detailVisible: false
+        property string detailName: ""
+        property var detailFallback: null     // {version, repo, description}
+        readonly property var detailApp: Syu.appstreamFor === detailName ? Syu.appstreamData : null
+
+        function openDetail(name, fallback) {
+            detailName = name;
+            detailFallback = fallback;
+            detailVisible = true;
+            Syu.loadAppstream(name);
+        }
         function formatSize(bytes) {
             if (!bytes)
                 return "";
@@ -297,6 +313,7 @@ ShellRoot {
                                     update: modelData
                                     selected: !win.ignoredUpdates[modelData.name]
                                     onToggled: win.toggleIn("ignoredUpdates", modelData.name)
+                                    onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" })
                                 }
                             }
 
@@ -316,6 +333,7 @@ ShellRoot {
                                     update: modelData
                                     selected: !win.ignoredUpdates[modelData.name]
                                     onToggled: win.toggleIn("ignoredUpdates", modelData.name)
+                                    onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" })
                                 }
                             }
 
@@ -411,6 +429,7 @@ ShellRoot {
                             marker: modelData.installed_version ? "installed " + modelData.installed_version : ""
                             selected: !!win.installSelection[modelData.name]
                             onToggled: win.toggleIn("installSelection", modelData.name)
+                            onNameClicked: win.openDetail(modelData.name, { version: modelData.version, repo: modelData.repo, description: modelData.description ?? "" })
                         }
                     }
 
@@ -494,6 +513,7 @@ ShellRoot {
                             marker: modelData.explicit ? win.formatSize(modelData.size_bytes) : "dependency"
                             selected: !!win.removeSelection[modelData.name]
                             onToggled: win.toggleIn("removeSelection", modelData.name)
+                            onNameClicked: win.openDetail(modelData.name, { version: modelData.version, repo: modelData.repo, description: modelData.description ?? "" })
                         }
                     }
 
@@ -524,6 +544,195 @@ ShellRoot {
                         }
                     }
                 }
+            }
+        }
+
+        // ---- Package detail overlay ------------------------------
+        // AppStream garnish (name/summary/description/screenshot)
+        // over the pacman facts from the row that was clicked. Click
+        // outside, Close, or Escape dismisses it.
+        Item {
+            anchors.fill: parent
+            visible: win.detailVisible
+            z: 10
+
+            Rectangle {
+                anchors.fill: parent
+                color: Theme.ground
+                opacity: 0.88
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: win.detailVisible = false
+                }
+            }
+
+            Rectangle {
+                id: detailPanel
+                anchors.centerIn: parent
+                width: Math.min(680, parent.width - 48)
+                height: Math.min(560, parent.height - 48)
+                radius: 8
+                color: Theme.surface
+                border.width: 1
+                border.color: Theme.line
+
+                MouseArea { anchors.fill: parent }   // eat clicks so the scrim doesn't close us
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 10
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        Image {
+                            visible: status === Image.Ready
+                            source: win.detailApp?.icon_url ?? ""
+                            Layout.preferredWidth: 56
+                            Layout.preferredHeight: 56
+                            fillMode: Image.PreserveAspectFit
+                            asynchronous: true
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: win.detailApp?.name || win.detailName
+                                color: Theme.text
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize + 3
+                                font.bold: true
+                                elide: Text.ElideRight
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: text.length > 0
+                                text: win.detailApp?.summary ?? ""
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                                wrapMode: Text.Wrap
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: win.detailName
+                                    + (win.detailFallback?.version ? "  " + win.detailFallback.version : "")
+                                    + (win.detailFallback?.repo ? "  [" + win.detailFallback.repo + "]" : "")
+                                    + (win.detailApp?.id ? "  ·  " + win.detailApp.id : "")
+                                color: Theme.textFaint
+                                font.family: Theme.monoFamily
+                                font.pixelSize: Theme.fontSize - 2
+                                elide: Text.ElideRight
+                            }
+                        }
+                        PushButton {
+                            label: "Close"
+                            Layout.alignment: Qt.AlignTop
+                            onClicked: win.detailVisible = false
+                        }
+                    }
+
+                    Flickable {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        contentHeight: detailColumn.implicitHeight
+                        boundsBehavior: Flickable.StopAtBounds
+
+                        ColumnLayout {
+                            id: detailColumn
+                            width: parent.width
+                            spacing: 10
+
+                            Image {
+                                visible: status === Image.Ready
+                                source: (win.detailApp?.screenshots?.length ?? 0) > 0 ? win.detailApp.screenshots[0] : ""
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: visible ? 240 : 0
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+
+                            Text {
+                                visible: Syu.appstreamLoading && Syu.appstreamFor === win.detailName
+                                text: "Loading AppStream data…"
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            Text {
+                                visible: Syu.appstreamLoaded && Syu.appstreamFor === win.detailName && !win.detailApp
+                                text: "No AppStream data for this package — showing pacman data only."
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                visible: text.length > 0
+                                text: win.detailApp?.description || ((Syu.appstreamLoaded && !win.detailApp) ? (win.detailFallback?.description ?? "") : "")
+                                color: Theme.text
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+
+                            Text {
+                                visible: (win.detailApp?.developer ?? "").length > 0
+                                text: "Developer:  " + (win.detailApp?.developer ?? "")
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            Text {
+                                visible: (win.detailApp?.categories?.length ?? 0) > 0
+                                text: "Categories:  " + (win.detailApp?.categories?.join(" · ") ?? "")
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                visible: (win.detailApp?.license ?? "").length > 0
+                                text: "Licence:  " + (win.detailApp?.license ?? "")
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            Text {
+                                visible: (win.detailApp?.homepage ?? "").length > 0
+                                text: win.detailApp?.homepage ?? ""
+                                color: homepageArea.containsMouse ? Theme.purple : Theme.purpleDim
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                                font.underline: homepageArea.containsMouse
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+
+                                MouseArea {
+                                    id: homepageArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: Qt.openUrlExternally(win.detailApp?.homepage ?? "")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Shortcut {
+                sequence: "Escape"
+                enabled: win.detailVisible
+                onActivated: win.detailVisible = false
             }
         }
     }

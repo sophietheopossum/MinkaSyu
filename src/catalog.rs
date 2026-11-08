@@ -6,6 +6,7 @@
 use crate::alpm;
 use crate::check;
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -27,6 +28,26 @@ pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     /// True when the AUR or total cap cut results off; refine the query.
     pub truncated: bool,
+}
+
+/// One concrete build of a package offered by a sync repo (or the
+/// AUR), for the repository picker. Options are in pacman.conf order
+/// with the AUR last; `target` is the argv form (`repo/name`, AUR
+/// included) that pins exactly this build.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepoOption {
+    pub repo: String,
+    pub name: String,
+    pub version: String,
+    pub architecture: String,
+    pub description: String,
+    pub target: String,
+    /// The first sync option: the one plain pacman would choose.
+    pub is_default: bool,
+    /// This exact repo+version is what is installed.
+    pub is_installed: bool,
+    /// Highest version among the options (libalpm ordering).
+    pub is_newest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -196,6 +217,161 @@ pub fn run_installed() -> Vec<InstalledEntry> {
     out
 }
 
+/// Parse `pacman -Si` output into (repo, name) -> (architecture,
+/// description). Blocks are `Key : value` lines separated by blanks;
+/// only the fields we show are kept.
+pub fn parse_sync_info(text: &str) -> HashMap<(String, String), (String, String)> {
+    let mut out = HashMap::new();
+    let mut repo = String::new();
+    let mut name = String::new();
+    let mut arch = String::new();
+    let mut desc = String::new();
+    let flush = |repo: &str, name: &str, arch: &str, desc: &str, out: &mut HashMap<(String, String), (String, String)>| {
+        if !repo.is_empty() && !name.is_empty() {
+            out.insert((repo.to_string(), name.to_string()), (arch.to_string(), desc.to_string()));
+        }
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            flush(&repo, &name, &arch, &desc, &mut out);
+            repo.clear();
+            name.clear();
+            arch.clear();
+            desc.clear();
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let value = value.trim();
+        match key.trim() {
+            "Repository" => repo = value.to_string(),
+            "Name" => name = value.to_string(),
+            "Architecture" => arch = value.to_string(),
+            "Description" => desc = value.to_string(),
+            _ => {}
+        }
+    }
+    flush(&repo, &name, &arch, &desc, &mut out);
+    out
+}
+
+/// Mark the highest version(s) in place; first option wins ties so a
+/// list has exactly one `is_newest` unless there are no options.
+fn mark_newest(options: &mut [RepoOption], cmp: &dyn Fn(&str, &str) -> Ordering) {
+    if options.is_empty() {
+        return;
+    }
+    let mut best = 0;
+    for i in 1..options.len() {
+        if cmp(&options[i].version, &options[best].version) == Ordering::Greater {
+            best = i;
+        }
+    }
+    options[best].is_newest = true;
+}
+
+/// Assemble picker options from sync entries (already in rank order),
+/// optional -Si details, exact AUR hits, and the installed map. Pure
+/// apart from the injected version comparison.
+pub fn build_repo_options(
+    package: &str,
+    sync: &[alpm::SyncEntry],
+    info: &HashMap<(String, String), (String, String)>,
+    aur_hits: &[SearchResult],
+    installed: &HashMap<String, alpm::InstalledPkg>,
+    cmp: &dyn Fn(&str, &str) -> Ordering,
+) -> Vec<RepoOption> {
+    let installed_pkg = installed.get(package);
+    let is_installed = |repo: &str, version: &str| -> bool {
+        let Some(pkg) = installed_pkg else { return false };
+        if pkg.version != version {
+            return false;
+        }
+        match &pkg.repo {
+            Some(origin) => origin == repo,
+            // No recorded origin and not offered by any sync repo:
+            // it can only have come from the AUR / a local build.
+            None => repo == "aur" && !sync.iter().any(|e| e.name == package),
+        }
+    };
+
+    let mut out: Vec<RepoOption> = Vec::new();
+    for (idx, entry) in sync.iter().filter(|e| e.name == package).enumerate() {
+        let (arch, desc) = info
+            .get(&(entry.repo.clone(), entry.name.clone()))
+            .cloned()
+            .unwrap_or_default();
+        out.push(RepoOption {
+            target: format!("{}/{}", entry.repo, entry.name),
+            is_default: idx == 0,
+            is_installed: is_installed(&entry.repo, &entry.version),
+            is_newest: false,
+            repo: entry.repo.clone(),
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            architecture: arch,
+            description: desc,
+        });
+    }
+    for hit in aur_hits.iter().filter(|h| h.name == package && h.repo == "aur") {
+        out.push(RepoOption {
+            target: format!("aur/{}", hit.name),
+            is_default: false,
+            is_installed: is_installed("aur", &hit.version),
+            is_newest: false,
+            repo: "aur".to_string(),
+            name: hit.name.clone(),
+            version: hit.version.clone(),
+            architecture: String::new(),
+            description: hit.description.clone(),
+        });
+    }
+    mark_newest(&mut out, cmp);
+    out
+}
+
+/// Architecture + description for a handful of repo/name targets via
+/// one `pacman -Si` call; empty on any failure (the picker still
+/// works from the sync list alone).
+fn sync_info(targets: &[String]) -> HashMap<(String, String), (String, String)> {
+    if targets.is_empty() {
+        return HashMap::new();
+    }
+    let mut args: Vec<String> = vec!["-Si".into(), "--color".into(), "never".into()];
+    let checkdb = check::checkdb_path();
+    if checkdb.join("sync").exists() {
+        if let Some(s) = checkdb.to_str() {
+            args.push("--dbpath".into());
+            args.push(s.to_string());
+        }
+    }
+    args.push("--".into());
+    args.extend(targets.iter().cloned());
+    capture_search("pacman", &args).map(|t| parse_sync_info(&t)).unwrap_or_default()
+}
+
+/// Every build of one package the repos (+ AUR) currently offer, in
+/// rank order, for the repository picker.
+pub fn run_package_repos(package: &str) -> Vec<RepoOption> {
+    let installed = alpm::read_installed(Path::new("/var/lib/pacman/local"));
+    let sync = sync_entries();
+    let targets: Vec<String> = sync
+        .iter()
+        .filter(|e| e.name == package)
+        .map(|e| format!("{}/{}", e.repo, e.name))
+        .collect();
+    let info = sync_info(&targets);
+
+    let exact = format!("^{}$", escape_regex(package));
+    let aur_hits = capture_search(
+        "paru",
+        &["-Ssa".into(), "--color".into(), "never".into(), "--".into(), exact],
+    )
+    .map(|t| parse_search_output(&t, &installed))
+    .unwrap_or_default();
+
+    build_repo_options(package, &sync, &info, &aur_hits, &installed, &check::system_vercmp)
+}
+
 fn sync_entries() -> Vec<alpm::SyncEntry> {
     let checkdb = check::checkdb_path();
     let args: Vec<String> = if checkdb.join("sync").exists() {
@@ -243,6 +419,35 @@ cachyos-extra-v4/fastfetch 2.70.0-1.1 [0 B 2.01 MiB] [installed]\n    A fast sys
         assert_eq!(hits[1].installed_version.as_deref(), Some("2.70.0-1.1"));
         assert_eq!(hits[2].repo, "aur");
         assert_eq!(hits[2].installed_version, None);
+    }
+
+    #[test]
+    fn builds_repo_options_in_rank_order() {
+        let sync = alpm::parse_sync_list(
+            "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.1\n\
+             extra bcachefs-dkms 3:1.39.7-1\n\
+             minka bcachefs-dkms 3:1.39.7-2\n",
+        );
+        let info = parse_sync_info(
+            "Repository      : minka\nName            : bcachefs-dkms\nArchitecture    : x86_64\nDescription     : bcachefs DKMS\n\n",
+        );
+        let installed = HashMap::from([(
+            "bcachefs-dkms".to_string(),
+            alpm::InstalledPkg {
+                version: "3:1.39.7-1.1".into(),
+                repo: Some("cachyos-extra-v4".into()),
+                description: String::new(),
+                size_bytes: 0,
+                explicit: true,
+            },
+        )]);
+        let opts = build_repo_options("bcachefs-dkms", &sync, &info, &[], &installed, &|a, b| a.cmp(b));
+        assert_eq!(opts.len(), 3);
+        assert!(opts[0].is_default && opts[0].is_installed && !opts[0].is_newest);
+        assert_eq!(opts[0].target, "cachyos-extra-v4/bcachefs-dkms");
+        assert!(opts[2].is_newest && !opts[2].is_default);
+        assert_eq!(opts[2].architecture, "x86_64");
+        assert_eq!(opts[2].target, "minka/bcachefs-dkms");
     }
 
     #[test]

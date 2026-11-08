@@ -56,6 +56,43 @@ ShellRoot {
         function selectionNames(setName) {
             return Object.keys(win[setName]);
         }
+        function setIgnored(name, ignored) {
+            if (!!ignoredUpdates[name] === ignored)
+                return;
+            const next = Object.assign({}, ignoredUpdates);
+            if (ignored)
+                next[name] = true;
+            else
+                delete next[name];
+            ignoredUpdates = next;
+        }
+
+        // Browse selections are repo-qualified targets, one build per
+        // package: ticking another repo's row of the same package
+        // moves the tick rather than selecting two builds.
+        function installTargetFor(name) {
+            for (const key of Object.keys(installSelection))
+                if (key === name || key.endsWith("/" + name))
+                    return key;
+            return "";
+        }
+        function selectInstallTarget(target, name) {
+            const next = {};
+            for (const key of Object.keys(installSelection))
+                if (key !== name && !key.endsWith("/" + name))
+                    next[key] = true;
+            next[target] = true;
+            installSelection = next;
+        }
+        function toggleInstallTarget(target, name) {
+            if (installSelection[target]) {
+                const next = Object.assign({}, installSelection);
+                delete next[target];
+                installSelection = next;
+            } else {
+                selectInstallTarget(target, name);
+            }
+        }
 
         // Package detail overlay: AppStream garnish over the pacman
         // facts the row already knows. The fallback is what shows
@@ -63,14 +100,88 @@ ShellRoot {
         // AppStream component at all.
         property bool detailVisible: false
         property string detailName: ""
+        property string detailContext: ""    // updates | browse | installed
         property var detailFallback: null     // {version, repo, description}
+        property string detailRepoTarget: ""
         readonly property var detailApp: Syu.appstreamFor === detailName ? Syu.appstreamData : null
+        readonly property var detailRepos: Syu.reposFor === detailName ? Syu.repoOptions : []
+        readonly property var detailSelectedOption: detailRepos.find(o => o.target === detailRepoTarget) ?? null
 
-        function openDetail(name, fallback) {
+        // Manual repository choices for pending updates, name ->
+        // {repo, version, target}. In memory only, like the ticks.
+        property var repoOverrides: ({})
+
+        function openDetail(name, fallback, context) {
             detailName = name;
             detailFallback = fallback;
+            detailContext = context ?? "";
             detailVisible = true;
+            detailRepoTarget = repoOverrides[name]?.target
+                ?? installTargetFor(name)
+                ?? (fallback?.repo ? fallback.repo + "/" + name : "");
+            if (detailRepoTarget === "")
+                detailRepoTarget = fallback?.repo ? fallback.repo + "/" + name : "";
             Syu.loadAppstream(name);
+            Syu.loadRepos(name);
+        }
+
+        function defaultDetailTarget() {
+            if (detailRepos.length === 0)
+                return detailFallback?.repo ? detailFallback.repo + "/" + detailName : "";
+            if (detailContext === "updates") {
+                const ov = repoOverrides[detailName];
+                if (ov && detailRepos.some(o => o.target === ov.target))
+                    return ov.target;
+                const u = effectiveUpdates.find(x => x.name === detailName);
+                if (u) {
+                    const t = u.candidate_repo + "/" + u.name;
+                    if (detailRepos.some(o => o.target === t))
+                        return t;
+                }
+            }
+            if (detailContext === "browse") {
+                const chosen = installTargetFor(detailName);
+                if (chosen && detailRepos.some(o => o.target === chosen))
+                    return chosen;
+            }
+            if (detailContext === "installed") {
+                const inst = detailRepos.find(o => o.is_installed);
+                if (inst)
+                    return inst.target;
+            }
+            const fallback = detailFallback?.repo ? detailFallback.repo + "/" + detailName : "";
+            if (fallback && detailRepos.some(o => o.target === fallback))
+                return fallback;
+            return detailRepos[0].target;
+        }
+
+        function syncDetailRepoSelection() {
+            if (!detailVisible || !Syu.reposLoaded || Syu.reposFor !== detailName)
+                return;
+            if (!detailRepos.some(o => o.target === detailRepoTarget))
+                detailRepoTarget = defaultDetailTarget();
+        }
+
+        function chooseDetailRepo() {
+            const option = detailSelectedOption;
+            if (!option)
+                return;
+            if (detailContext === "updates") {
+                const next = Object.assign({}, repoOverrides);
+                next[option.name] = { repo: option.repo, version: option.version, target: option.target };
+                repoOverrides = next;
+                setIgnored(option.name, false);
+            } else if (detailContext === "browse") {
+                selectInstallTarget(option.target, option.name);
+            } else if (detailContext === "installed") {
+                Syu.installPackages([option.target]);
+            }
+            detailVisible = false;
+        }
+
+        Connections {
+            target: Syu
+            function onRepoOptionsChanged() { win.syncDetailRepoSelection(); }
         }
         function formatSize(bytes) {
             if (!bytes)
@@ -82,16 +193,38 @@ ShellRoot {
             return Math.round(bytes / 1024) + " KiB";
         }
 
+        function effectiveUpdate(u) {
+            const ov = repoOverrides[u.name];
+            if (!ov)
+                return u;
+            const copy = Object.assign({}, u);
+            const defaultRepo = u.explicit_target ? (u.first_repo ?? u.candidate_repo) : u.candidate_repo;
+            copy.new_version = ov.version;
+            copy.candidate_repo = ov.repo;
+            copy.explicit_target = ov.repo !== defaultRepo;
+            if (copy.explicit_target && !copy.first_repo) {
+                copy.first_repo = defaultRepo;
+                copy.first_version = u.new_version;
+            }
+            if (!copy.explicit_target) {
+                copy.first_repo = null;
+                copy.first_version = null;
+            }
+            copy.transition = !u.installed_repo ? "unknown_source" : (u.installed_repo === ov.repo ? "same" : "changed");
+            return copy;
+        }
+
         readonly property var updates: Syu.state ? (Syu.state.updates ?? []) : []
+        readonly property var effectiveUpdates: updates.map(u => win.effectiveUpdate(u))
         readonly property int checkedAt: Syu.state ? (Syu.state.checked_at ?? 0) : 0
-        readonly property int repoChanges: Syu.state ? (Syu.state.repo_change_count ?? 0) : 0
-        readonly property var repoUpdates: updates.filter(u => u.candidate_repo !== "aur")
-        readonly property var aurUpdates: updates.filter(u => u.candidate_repo === "aur")
+        readonly property int repoChanges: effectiveUpdates.filter(u => u.transition === "changed").length
+        readonly property var repoUpdates: effectiveUpdates.filter(u => u.candidate_repo !== "aur")
+        readonly property var aurUpdates: effectiveUpdates.filter(u => u.candidate_repo === "aur")
         readonly property var ignoredNames: updates.filter(u => ignoredUpdates[u.name]).map(u => u.name)
         readonly property int selectedUpdateCount: updates.length - ignoredNames.length
         // Ticked candidates from a lower-ranked repo than pacman's
         // own: the core adds these as explicit repo/name targets.
-        readonly property var explicitTargets: updates
+        readonly property var explicitTargets: effectiveUpdates
             .filter(u => u.explicit_target === true && !ignoredUpdates[u.name])
             .map(u => u.candidate_repo + "/" + u.name)
 
@@ -133,6 +266,13 @@ ShellRoot {
                 ignoredUpdates = keep;
             if (changedSeeded)
                 _seededExplicit = seeded;
+
+            const keepOverrides = {};
+            for (const u of updates)
+                if (repoOverrides[u.name])
+                    keepOverrides[u.name] = repoOverrides[u.name];
+            if (Object.keys(keepOverrides).length !== Object.keys(repoOverrides).length)
+                repoOverrides = keepOverrides;
         }
 
         property string installedFilter: ""
@@ -342,7 +482,7 @@ ShellRoot {
                                     update: modelData
                                     selected: !win.ignoredUpdates[modelData.name]
                                     onToggled: win.toggleIn("ignoredUpdates", modelData.name)
-                                    onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" })
+                                    onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" }, "updates")
                                 }
                             }
 
@@ -362,7 +502,7 @@ ShellRoot {
                                     update: modelData
                                     selected: !win.ignoredUpdates[modelData.name]
                                     onToggled: win.toggleIn("ignoredUpdates", modelData.name)
-                                    onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" })
+                                    onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" }, "updates")
                                 }
                             }
 
@@ -405,7 +545,7 @@ ShellRoot {
                             label: "Update…"
                             primary: true
                             enabled: win.selectedUpdateCount > 0 && !Syu.checking
-                            onClicked: Syu.apply(win.ignoredNames)
+                            onClicked: Syu.apply(win.ignoredNames, win.explicitTargets)
                         }
                     }
                 }
@@ -463,9 +603,9 @@ ShellRoot {
                             repo: modelData.repo
                             description: modelData.description ?? ""
                             marker: modelData.installed_version ? "installed " + modelData.installed_version : ""
-                            selected: !!win.installSelection[modelData.name]
-                            onToggled: win.toggleIn("installSelection", modelData.name)
-                            onNameClicked: win.openDetail(modelData.name, { version: modelData.version, repo: modelData.repo, description: modelData.description ?? "" })
+                            selected: !!win.installSelection[modelData.repo + "/" + modelData.name]
+                            onToggled: win.toggleInstallTarget(modelData.repo + "/" + modelData.name, modelData.name)
+                            onNameClicked: win.openDetail(modelData.name, { version: modelData.version, repo: modelData.repo, description: modelData.description ?? "" }, "browse")
                         }
                     }
 
@@ -549,7 +689,7 @@ ShellRoot {
                             marker: modelData.explicit ? win.formatSize(modelData.size_bytes) : "dependency"
                             selected: !!win.removeSelection[modelData.name]
                             onToggled: win.toggleIn("removeSelection", modelData.name)
-                            onNameClicked: win.openDetail(modelData.name, { version: modelData.version, repo: modelData.repo, description: modelData.description ?? "" })
+                            onNameClicked: win.openDetail(modelData.name, { version: modelData.version, repo: modelData.repo, description: modelData.description ?? "" }, "installed")
                         }
                     }
 
@@ -694,6 +834,96 @@ ShellRoot {
                             }
 
                             Text {
+                                visible: Syu.reposLoading || win.detailRepos.length > 0
+                                text: "AVAILABLE REPOSITORIES"
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                                font.bold: true
+                            }
+                            Text {
+                                visible: Syu.reposLoading && Syu.reposFor === win.detailName
+                                text: "Loading repository versions…"
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            Text {
+                                visible: Syu.reposLoaded && Syu.reposFor === win.detailName && win.detailRepos.length === 0
+                                text: "No repository builds found for this package."
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 1
+                            }
+                            Repeater {
+                                model: win.detailRepos
+                                Rectangle {
+                                    id: repoOptionRow
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    implicitHeight: 36
+                                    radius: 5
+                                    color: win.detailRepoTarget === repoOptionRow.modelData.target ? Theme.surfaceRaised : Theme.surface
+                                    border.width: 1
+                                    border.color: win.detailRepoTarget === repoOptionRow.modelData.target ? Theme.purple : Theme.line
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 6
+                                        anchors.rightMargin: 9
+                                        spacing: 8
+
+                                        CheckBox {
+                                            checked: win.detailRepoTarget === repoOptionRow.modelData.target
+                                            onToggled: win.detailRepoTarget = repoOptionRow.modelData.target
+                                        }
+                                        Text {
+                                            text: repoOptionRow.modelData.repo
+                                            color: repoOptionRow.modelData.repo === "aur" ? Theme.purple : Theme.text
+                                            font.family: Theme.monoFamily
+                                            font.pixelSize: Theme.fontSize - 1
+                                        }
+                                        Text {
+                                            text: repoOptionRow.modelData.version
+                                            color: Theme.textMuted
+                                            font.family: Theme.monoFamily
+                                            font.pixelSize: Theme.fontSize - 2
+                                            elide: Text.ElideRight
+                                            Layout.fillWidth: true
+                                        }
+                                        Text {
+                                            visible: (repoOptionRow.modelData.architecture ?? "").length > 0
+                                            text: repoOptionRow.modelData.architecture ?? ""
+                                            color: Theme.textFaint
+                                            font.family: Theme.monoFamily
+                                            font.pixelSize: Theme.fontSize - 2
+                                        }
+                                        Text {
+                                            visible: repoOptionRow.modelData.is_default
+                                            text: "pacman default"
+                                            color: Theme.textFaint
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 2
+                                        }
+                                        Text {
+                                            visible: repoOptionRow.modelData.is_newest
+                                            text: "newest"
+                                            color: Theme.purple
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 2
+                                        }
+                                        Text {
+                                            visible: repoOptionRow.modelData.is_installed
+                                            text: "installed"
+                                            color: Theme.okGreen
+                                            font.family: Theme.fontFamily
+                                            font.pixelSize: Theme.fontSize - 2
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text {
                                 visible: Syu.appstreamLoading && Syu.appstreamFor === win.detailName
                                 text: "Loading AppStream data…"
                                 color: Theme.textMuted
@@ -760,6 +990,30 @@ ShellRoot {
                                     onClicked: Qt.openUrlExternally(win.detailApp?.homepage ?? "")
                                 }
                             }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: win.detailRepoTarget.length > 0
+                                ? "Selected build: " + win.detailRepoTarget
+                                : "No repository build selected."
+                            color: Theme.textFaint
+                            font.family: Theme.monoFamily
+                            font.pixelSize: Theme.fontSize - 2
+                            elide: Text.ElideRight
+                        }
+                        PushButton {
+                            label: win.detailContext === "updates" ? "Use for upgrade"
+                                : win.detailContext === "browse" ? "Select for install"
+                                : (win.detailSelectedOption?.is_installed ? "Reinstall selected" : "Install selected")
+                            primary: win.detailContext === "installed"
+                            enabled: win.detailSelectedOption !== null
+                            onClicked: win.chooseDetailRepo()
                         }
                     }
                 }

@@ -41,6 +41,13 @@ Singleton {
     property bool appstreamLoaded: false
     property var appstreamData: null
 
+    // Repository picker data for the detail view: every repo build
+    // of one package, in rank order, AUR last.
+    property string reposFor: ""
+    property bool reposLoading: false
+    property bool reposLoaded: false
+    property var repoOptions: []
+
     // Requests made before the child process has finished starting. The
     // window asks for its state in Component.onCompleted, which fires
     // BEFORE Process.running flips true -- dropping those would leave a
@@ -87,9 +94,9 @@ Singleton {
     // in the list: skipped this once via --ignore, not remembered.
     // Nothing to show from the reply beyond a failed spawn, which
     // lands in lastError via request().
-    function apply(ignore) {
+    function apply(ignore, targets) {
         lastError = "";
-        request("apply", { ignore: ignore ?? [] }, undefined);
+        request("apply", { ignore: ignore ?? [], targets: targets ?? [] }, undefined);
     }
 
     function search(query) {
@@ -135,6 +142,21 @@ Singleton {
             appstreamLoaded = true;
             if (!error)
                 root.appstreamData = result;
+        });
+    }
+
+    function loadRepos(name) {
+        reposFor = name;
+        repoOptions = [];
+        reposLoaded = false;
+        reposLoading = true;
+        request("package_repos", { package: name }, (result, error) => {
+            if (root.reposFor !== name)
+                return;
+            reposLoading = false;
+            reposLoaded = true;
+            if (!error)
+                root.repoOptions = result ?? [];
         });
     }
 
@@ -189,6 +211,7 @@ Singleton {
             root.searching = false;
             root.loadingInstalled = false;
             root.appstreamLoading = false;
+            root.reposLoading = false;
             root.lastError = "update core exited";
         }
     }

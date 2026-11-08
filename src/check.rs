@@ -86,7 +86,7 @@ pub fn parse_update_line(line: &str) -> Option<(String, String, String)> {
 /// with pacman. Returns Equal if the tool cannot be run: the custom
 /// cross-repository scan then simply finds nothing, rather than
 /// inventing an ordering with string comparison.
-fn system_vercmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn system_vercmp(a: &str, b: &str) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }

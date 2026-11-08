@@ -7,6 +7,7 @@
 //!                      open the terminal on `paru -Syu --sudoloop`,
 //!                      optionally ignoring named updates this once
 //!   search <terms...>  search sync repos + AUR by name/description
+//!   repos <pkg>        list every repo build of one package, in rank order
 //!   installed          list installed packages with origin + install reason
 //!   install [--dry-run] <pkg...>   open the terminal on `paru -S <pkg...>`
 //!   remove [--dry-run] <pkg...>    open the terminal on `paru -Rns <pkg...>`
@@ -35,6 +36,7 @@ fn main() {
         "check" => cmd_check(rest.contains(&"--notify")),
         "apply" => cmd_apply(rest.contains(&"--dry-run"), &parse_ignore(&rest)),
         "search" => cmd_search(&rest.join(" ")),
+        "repos" => cmd_repos(rest.first().copied().unwrap_or("")),
         "installed" => cmd_installed(),
         "appstream" => cmd_appstream(rest.first().copied().unwrap_or("")),
         "install" => cmd_packages(true, rest.contains(&"--dry-run"), &positional(&rest)),
@@ -45,7 +47,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "minka-syu: unknown verb '{other}' (expected check|apply|search|installed|install|remove|serve)"
+                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|serve)"
             );
             std::process::exit(2);
         }
@@ -139,11 +141,77 @@ fn validate_targets(targets: &[String]) -> Result<(), String> {
         let Some((repo, name)) = t.split_once('/') else {
             return Err(format!("invalid upgrade target: {t:?}"));
         };
-        if !valid_package_name(repo) || !valid_package_name(name) {
+        if name.contains('/') || !valid_package_name(repo) || !valid_package_name(name) {
             return Err(format!("invalid upgrade target: {t:?}"));
         }
     }
     Ok(())
+}
+
+/// Install inputs may be plain names or the explicit `repo/name`
+/// form the repository picker produces. Two builds of one package in
+/// a single transaction is always a mistake, so reject duplicates
+/// by package name whatever their repos.
+fn validate_install_targets(targets: &[String]) -> Result<(), String> {
+    if targets.is_empty() {
+        return Err("no packages given for install".to_string());
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for t in targets {
+        let name = match t.split_once('/') {
+            Some((repo, name)) => {
+                if name.contains('/') || !valid_package_name(repo) || !valid_package_name(name) {
+                    return Err(format!("invalid install target: {t:?}"));
+                }
+                name
+            }
+            None => {
+                if !valid_package_name(t) {
+                    return Err(format!("invalid package name for install: {t:?}"));
+                }
+                t.as_str()
+            }
+        };
+        if seen.contains(&name) {
+            return Err(format!("duplicate install target for package: {name}"));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
+/// Which explicit repo/name targets an apply carries. With no UI
+/// override list, that is the state's ticked cross-repository
+/// candidates. With one, it is authoritative -- but every target
+/// must name a ticked update in the current state, at most once, so
+/// a stale or forged list cannot smuggle arbitrary packages into a
+/// sudo transaction.
+fn resolve_apply_targets(
+    state: &State,
+    ignore: &[String],
+    requested: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    let Some(requested) = requested else {
+        let targets = explicit_targets(state, ignore);
+        validate_targets(&targets)?;
+        return Ok(targets);
+    };
+    validate_targets(requested)?;
+    let mut seen: Vec<String> = Vec::new();
+    for t in requested {
+        let (_, name) = t.split_once('/').expect("validated above");
+        if seen.iter().any(|n| n == name) {
+            return Err(format!("duplicate upgrade target for package: {name}"));
+        }
+        if ignore.iter().any(|n| n == name) {
+            return Err(format!("upgrade target is also ignored: {t}"));
+        }
+        if !state.updates.iter().any(|u| u.name == name) {
+            return Err(format!("upgrade target is not a pending update: {t}"));
+        }
+        seen.push(name.to_string());
+    }
+    Ok(requested.to_vec())
 }
 
 /// The terminal argv for a system upgrade: $MINKA_SYU_TERMINAL or rio,
@@ -205,11 +273,19 @@ fn launch(argv: &[String], dry_run: bool) -> Result<(), String> {
 }
 
 fn cmd_apply_state(dry_run: bool, ignore: &[String], state: &State) -> Result<(), String> {
+    cmd_apply_state_targets(dry_run, ignore, None, state)
+}
+
+fn cmd_apply_state_targets(
+    dry_run: bool,
+    ignore: &[String],
+    requested: Option<&[String]>,
+    state: &State,
+) -> Result<(), String> {
     if !ignore.is_empty() {
         validate_names(ignore, "--ignore")?;
     }
-    let targets = explicit_targets(state, ignore);
-    validate_targets(&targets)?;
+    let targets = resolve_apply_targets(state, ignore, requested)?;
     launch(&upgrade_argv_with_targets(ignore, &targets), dry_run)
 }
 
@@ -218,8 +294,11 @@ fn cmd_apply(dry_run: bool, ignore: &[String]) -> Result<(), String> {
 }
 
 fn cmd_packages(install: bool, dry_run: bool, packages: &[String]) -> Result<(), String> {
-    let what = if install { "install" } else { "remove" };
-    validate_names(packages, what)?;
+    if install {
+        validate_install_targets(packages)?;
+    } else {
+        validate_names(packages, "remove")?;
+    }
     let argv = if install { install_argv(packages) } else { remove_argv(packages) };
     launch(&argv, dry_run)
 }
@@ -262,6 +341,28 @@ fn cmd_appstream(package: &str) -> Result<(), String> {
         }
         None => Err(format!("no AppStream data for {package}")),
     }
+}
+
+fn cmd_repos(package: &str) -> Result<(), String> {
+    if !valid_package_name(package) {
+        return Err(format!("invalid package name: {package:?}"));
+    }
+    let options = catalog::run_package_repos(package);
+    if options.is_empty() {
+        return Err(format!("{package} is not offered by any repository"));
+    }
+    for o in options {
+        println!(
+            "{} {}{} {}{}{}",
+            o.target,
+            o.version,
+            if o.architecture.is_empty() { String::new() } else { format!(" [{}]", o.architecture) },
+            if o.is_default { " (pacman default)" } else { "" },
+            if o.is_newest { " (newest)" } else { "" },
+            if o.is_installed { " (installed)" } else { "" }
+        );
+    }
+    Ok(())
 }
 
 fn cmd_installed() -> Result<(), String> {
@@ -359,7 +460,16 @@ fn dispatch(
         }
         "apply" => {
             let ignore = string_array(params, "ignore");
-            cmd_apply_state(false, &ignore, state).map_err(error_code)?;
+            // The UI's chosen repo/name targets, when it sends the
+            // key at all (even empty), replace the state-derived set.
+            let requested;
+            let requested_ref = if params.get("targets").is_some() {
+                requested = string_array(params, "targets");
+                Some(requested.as_slice())
+            } else {
+                None
+            };
+            cmd_apply_state_targets(false, &ignore, requested_ref, state).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
         "search" => {
@@ -372,6 +482,17 @@ fn dispatch(
         }
         "installed" => {
             serde_json::to_value(catalog::run_installed())
+                .map_err(|e| Error::internal(e.to_string()))
+        }
+        "package_repos" => {
+            let package = params
+                .get("package")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_code("package_repos needs a package".to_string()))?;
+            if !valid_package_name(package) {
+                return Err(error_code(format!("invalid package name: {package:?}")));
+            }
+            serde_json::to_value(catalog::run_package_repos(package))
                 .map_err(|e| Error::internal(e.to_string()))
         }
         "appstream" => {
@@ -520,6 +641,45 @@ mod tests {
         assert!(validate_targets(&targets).is_ok());
         assert!(validate_targets(&["minka/-Syu".into()]).is_err());
         assert!(validate_targets(&["no-slash".into()]).is_err());
+    }
+
+    #[test]
+    fn requested_targets_must_be_ticked_updates() {
+        let upd = |name: &str| check::Update {
+            name: name.into(),
+            old_version: "1-1".into(),
+            new_version: "1-2".into(),
+            installed_repo: None,
+            candidate_repo: "extra".into(),
+            transition: check::Transition::UnknownSource,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+        };
+        let state = State {
+            schema: 1,
+            checked_at: 0,
+            updates: vec![upd("mesa"), upd("sqlite")],
+            repo_change_count: 0,
+            last_notified_count: 0,
+        };
+        // A manual repo choice for a pending, ticked update is fine.
+        assert_eq!(
+            resolve_apply_targets(&state, &[], Some(&["core/sqlite".to_string()])).unwrap(),
+            ["core/sqlite"]
+        );
+        // Ignored, unknown, and duplicated targets are not.
+        assert!(resolve_apply_targets(&state, &["sqlite".into()], Some(&["core/sqlite".into()])).is_err());
+        assert!(resolve_apply_targets(&state, &[], Some(&["core/notpending".into()])).is_err());
+        assert!(resolve_apply_targets(
+            &state,
+            &[],
+            Some(&["core/sqlite".into(), "extra/sqlite".into()])
+        )
+        .is_err());
+        // Install takes repo-qualified targets but not two builds.
+        assert!(validate_install_targets(&["extra/ardour".into(), "ripgrep".into()]).is_ok());
+        assert!(validate_install_targets(&["extra/ardour".into(), "aur/ardour".into()]).is_err());
     }
 
     #[test]

@@ -89,21 +89,50 @@ ShellRoot {
         readonly property var aurUpdates: updates.filter(u => u.candidate_repo === "aur")
         readonly property var ignoredNames: updates.filter(u => ignoredUpdates[u.name]).map(u => u.name)
         readonly property int selectedUpdateCount: updates.length - ignoredNames.length
+        // Ticked candidates from a lower-ranked repo than pacman's
+        // own: the core adds these as explicit repo/name targets.
+        readonly property var explicitTargets: updates
+            .filter(u => u.explicit_target === true && !ignoredUpdates[u.name])
+            .map(u => u.candidate_repo + "/" + u.name)
+
+        // Lower-repo candidates start UNTICKED (opt-in per package):
+        // the cross-repository scan also finds cases where the newest
+        // version trades a v4-optimized build for a plain one, and
+        // taking that by default would be a nasty surprise. Seeding
+        // is tracked per name for this window's lifetime, so a manual
+        // retick is not undone by a state refresh.
+        property var _seededExplicit: ({})
 
         // A recheck can make unticked names vanish (applied, or the
         // update itself went away); prune so a stale name can never
         // ride into a later --ignore list.
         onUpdatesChanged: {
             const keep = {};
-            let changed = false;
-            for (const u of updates)
+            const seeded = {};
+            let changedIgnored = false;
+            let changedSeeded = false;
+            for (const u of updates) {
                 if (ignoredUpdates[u.name])
                     keep[u.name] = true;
+                if (_seededExplicit[u.name])
+                    seeded[u.name] = true;
+                if (u.explicit_target === true && !seeded[u.name]) {
+                    seeded[u.name] = true;
+                    keep[u.name] = true;
+                    changedSeeded = true;
+                    changedIgnored = true;
+                }
+            }
             for (const k of Object.keys(ignoredUpdates))
                 if (!keep[k])
-                    changed = true;
-            if (changed)
+                    changedIgnored = true;
+            for (const k of Object.keys(_seededExplicit))
+                if (!seeded[k])
+                    changedSeeded = true;
+            if (changedIgnored)
                 ignoredUpdates = keep;
+            if (changedSeeded)
+                _seededExplicit = seeded;
         }
 
         property string installedFilter: ""
@@ -356,9 +385,16 @@ ShellRoot {
 
                         Text {
                             Layout.fillWidth: true
-                            text: win.ignoredNames.length > 0
-                                ? "Opens rio: paru -Syu --ignore " + win.ignoredNames.join(", ")
-                                : "Opens rio running paru -Syu --sudoloop — review and confirm there."
+                            text: {
+                                if (win.ignoredNames.length === 0 && win.explicitTargets.length === 0)
+                                    return "Opens rio running paru -Syu --sudoloop — review and confirm there.";
+                                let s = "Opens rio: paru -Syu --sudoloop";
+                                if (win.ignoredNames.length > 0)
+                                    s += " --ignore=" + win.ignoredNames.join(",");
+                                if (win.explicitTargets.length > 0)
+                                    s += " " + win.explicitTargets.join(" ");
+                                return s;
+                            }
                             color: Theme.textFaint
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 2

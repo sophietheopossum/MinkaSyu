@@ -59,7 +59,18 @@ fn main() {
 fn print_summary(state: &State) {
     for u in &state.updates {
         let from = u.installed_repo.as_deref().unwrap_or("unknown source");
-        if u.transition == check::Transition::Changed {
+        if u.explicit_target {
+            println!(
+                "{} {} -> {}  [repo: {} -> {}; newer than {} {}]",
+                u.name,
+                u.old_version,
+                u.new_version,
+                from,
+                u.candidate_repo,
+                u.first_repo.as_deref().unwrap_or("?"),
+                u.first_version.as_deref().unwrap_or("?")
+            );
+        } else if u.transition == check::Transition::Changed {
             println!("{} {} -> {}  [repo: {} -> {}]", u.name, u.old_version, u.new_version, from, u.candidate_repo);
         } else {
             println!("{} {} -> {}  [{}]", u.name, u.old_version, u.new_version, u.candidate_repo);
@@ -111,11 +122,37 @@ fn terminal() -> String {
     std::env::var("MINKA_SYU_TERMINAL").unwrap_or_else(|_| "rio".to_string())
 }
 
+/// `repo/package` targets selected for a system upgrade: the ticked
+/// updates whose chosen candidate sits in a lower-ranked repository
+/// than pacman's own, so a plain `-Syu` would never select them.
+fn explicit_targets(state: &State, ignore: &[String]) -> Vec<String> {
+    state
+        .updates
+        .iter()
+        .filter(|u| u.explicit_target && !ignore.contains(&u.name))
+        .map(|u| format!("{}/{}", u.candidate_repo, u.name))
+        .collect()
+}
+
+fn validate_targets(targets: &[String]) -> Result<(), String> {
+    for t in targets {
+        let Some((repo, name)) = t.split_once('/') else {
+            return Err(format!("invalid upgrade target: {t:?}"));
+        };
+        if !valid_package_name(repo) || !valid_package_name(name) {
+            return Err(format!("invalid upgrade target: {t:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// The terminal argv for a system upgrade: $MINKA_SYU_TERMINAL or rio,
 /// running paru. Unticked updates become one --ignore list, this run
-/// only; nothing about them is remembered. Rio's -e takes the rest
-/// of argv as the command.
-pub fn upgrade_argv(ignore: &[String]) -> Vec<String> {
+/// only; nothing about them is remembered. Explicit `repo/name`
+/// targets ride along in the same transaction, so libalpm still
+/// resolves the whole upgrade at once. Rio's -e takes the rest of
+/// argv as the command.
+pub fn upgrade_argv_with_targets(ignore: &[String], targets: &[String]) -> Vec<String> {
     let mut argv = vec![
         terminal(),
         "-e".into(),
@@ -126,7 +163,12 @@ pub fn upgrade_argv(ignore: &[String]) -> Vec<String> {
     if !ignore.is_empty() {
         argv.push(format!("--ignore={}", ignore.join(",")));
     }
+    argv.extend(targets.iter().cloned());
     argv
+}
+
+pub fn upgrade_argv(ignore: &[String]) -> Vec<String> {
+    upgrade_argv_with_targets(ignore, &[])
 }
 
 /// For continuity with anything that printed the plain argv.
@@ -162,11 +204,17 @@ fn launch(argv: &[String], dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_apply(dry_run: bool, ignore: &[String]) -> Result<(), String> {
+fn cmd_apply_state(dry_run: bool, ignore: &[String], state: &State) -> Result<(), String> {
     if !ignore.is_empty() {
         validate_names(ignore, "--ignore")?;
     }
-    launch(&upgrade_argv(ignore), dry_run)
+    let targets = explicit_targets(state, ignore);
+    validate_targets(&targets)?;
+    launch(&upgrade_argv_with_targets(ignore, &targets), dry_run)
+}
+
+fn cmd_apply(dry_run: bool, ignore: &[String]) -> Result<(), String> {
+    cmd_apply_state(dry_run, ignore, &state_or_empty())
 }
 
 fn cmd_packages(install: bool, dry_run: bool, packages: &[String]) -> Result<(), String> {
@@ -311,7 +359,7 @@ fn dispatch(
         }
         "apply" => {
             let ignore = string_array(params, "ignore");
-            cmd_apply(false, &ignore).map_err(error_code)?;
+            cmd_apply_state(false, &ignore, state).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
         "search" => {
@@ -435,6 +483,43 @@ mod tests {
         assert!(!valid_package_name(""));
         assert!(validate_names(&[], "install").is_err());
         assert!(validate_names(&["ok-pkg".into()], "install").is_ok());
+    }
+
+    #[test]
+    fn explicit_targets_from_state() {
+        let upd = |name: &str, repo: &str, explicit: bool| check::Update {
+            name: name.into(),
+            old_version: "1-1".into(),
+            new_version: "1-2".into(),
+            installed_repo: None,
+            candidate_repo: repo.into(),
+            transition: check::Transition::UnknownSource,
+            explicit_target: explicit,
+            first_repo: explicit.then(|| "cachyos-extra-v4".to_string()),
+            first_version: explicit.then(|| "1-1".to_string()),
+        };
+        let state = State {
+            schema: 1,
+            checked_at: 0,
+            updates: vec![
+                upd("bcachefs-dkms", "minka", true),
+                upd("mesa", "extra", false),
+                upd("held-back", "minka", true),
+            ],
+            repo_change_count: 0,
+            last_notified_count: 0,
+        };
+        // Unticked explicit candidates are left to --ignore, not targeted.
+        let targets = explicit_targets(&state, &["held-back".to_string()]);
+        assert_eq!(targets, ["minka/bcachefs-dkms"]);
+        let argv = upgrade_argv_with_targets(&["held-back".into()], &targets);
+        assert_eq!(
+            &argv[2..],
+            ["paru", "-Syu", "--sudoloop", "--ignore=held-back", "minka/bcachefs-dkms"]
+        );
+        assert!(validate_targets(&targets).is_ok());
+        assert!(validate_targets(&["minka/-Syu".into()]).is_err());
+        assert!(validate_targets(&["no-slash".into()]).is_err());
     }
 
     #[test]

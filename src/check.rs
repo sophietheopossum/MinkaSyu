@@ -5,6 +5,7 @@
 
 use crate::alpm;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +29,18 @@ pub struct Update {
     /// Repo the candidate comes from ("aur" for AUR updates).
     pub candidate_repo: String,
     pub transition: Transition,
+    /// True when this candidate is a strictly newer version in a
+    /// lower-ranked repository than the one pacman would normally
+    /// choose. Applying it requires an explicit `repo/name` target;
+    /// a plain `-Syu` would never select it.
+    #[serde(default)]
+    pub explicit_target: bool,
+    /// The higher-ranked repo/version pacman would have used instead,
+    /// present only for explicit-target candidates.
+    #[serde(default)]
+    pub first_repo: Option<String>,
+    #[serde(default)]
+    pub first_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,32 +82,172 @@ pub fn parse_update_line(line: &str) -> Option<(String, String, String)> {
     Some((name.to_string(), old.to_string(), new.to_string()))
 }
 
+/// libalpm's version comparison, via the `vercmp` tool that ships
+/// with pacman. Returns Equal if the tool cannot be run: the custom
+/// cross-repository scan then simply finds nothing, rather than
+/// inventing an ordering with string comparison.
+fn system_vercmp(a: &str, b: &str) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let Ok(out) = Command::new("vercmp").args([a, b]).output() else {
+        return Ordering::Equal;
+    };
+    if !out.status.success() {
+        return Ordering::Equal;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<i32>()
+        .map(|n| n.cmp(&0))
+        .unwrap_or(Ordering::Equal)
+}
+
+/// The candidate pacman would use (first entry, in pacman.conf
+/// order) and the best candidate under MinkaSyu's policy: walk the
+/// repos in rank order, and promote a lower-ranked entry only when
+/// its version is strictly newer than the best so far. Equal
+/// versions keep the higher-ranked repository.
+fn ranked_candidates<'a>(
+    entries: &[&'a alpm::SyncEntry],
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Option<(&'a alpm::SyncEntry, &'a alpm::SyncEntry)> {
+    let first = *entries.first()?;
+    let mut best = first;
+    for entry in &entries[1..] {
+        if cmp(&entry.version, &best.version) == Ordering::Greater {
+            best = entry;
+        }
+    }
+    Some((first, best))
+}
+
 /// Merge repo updates (with sync-DB candidate mapping) and AUR updates
-/// into one provenance-stamped list. Pure: all IO happens in run_check.
+/// into one provenance-stamped list.
+///
+/// Standard updates come from `pacman -Qu`, preserving libalpm's own
+/// handling of ignores, replacements, and architecture. On top of
+/// that, a cross-repository scan promotes a strictly newer version
+/// from a lower-ranked repository: it replaces the standard
+/// candidate when there is one, and adds an update pacman would
+/// never offer when the first repository's copy is not newer than
+/// the installed package. A package pacman withheld despite its
+/// first repository being newer (IgnorePkg and friends) is left
+/// alone. Everything except the injected version comparison is pure.
 pub fn merge_updates(
     repo_lines: &str,
     aur_lines: &str,
     installed: &HashMap<String, alpm::InstalledPkg>,
     sync_entries: &[alpm::SyncEntry],
 ) -> Vec<Update> {
+    let mut cache: HashMap<(String, String), Ordering> = HashMap::new();
+    merge_updates_with_cmp(repo_lines, aur_lines, installed, sync_entries, &mut |a, b| {
+        *cache
+            .entry((a.to_string(), b.to_string()))
+            .or_insert_with(|| system_vercmp(a, b))
+    })
+}
+
+fn merge_updates_with_cmp(
+    repo_lines: &str,
+    aur_lines: &str,
+    installed: &HashMap<String, alpm::InstalledPkg>,
+    sync_entries: &[alpm::SyncEntry],
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Vec<Update> {
     let in_sync: HashSet<&str> = sync_entries.iter().map(|e| e.name.as_str()).collect();
+    let mut sync_by_name: HashMap<&str, Vec<&alpm::SyncEntry>> = HashMap::new();
+    for entry in sync_entries {
+        sync_by_name.entry(entry.name.as_str()).or_default().push(entry);
+    }
+    let aur_names: HashSet<String> = aur_lines
+        .lines()
+        .filter_map(parse_update_line)
+        .map(|(name, _, _)| name)
+        .collect();
+
     let mut updates = Vec::new();
+    let mut baseline_names: HashSet<String> = HashSet::new();
 
     for line in repo_lines.lines() {
         let Some((name, old, new)) = parse_update_line(line) else {
             continue;
         };
-        let candidate_repo =
+        baseline_names.insert(name.clone());
+        let mut candidate_repo =
             alpm::candidate_repo(sync_entries, &name, &new).unwrap_or("unknown").to_string();
+        let mut new_version = new;
+        let mut explicit_target = false;
+        let mut first_repo = None;
+        let mut first_version = None;
+
+        // Promote a strictly newer version from a lower-ranked repo
+        // over pacman's own candidate for this update.
+        if let Some(entries) = sync_by_name.get(name.as_str()) {
+            if let Some((first, best)) = ranked_candidates(entries, cmp) {
+                if best.repo != first.repo
+                    && cmp(&best.version, &new_version) == Ordering::Greater
+                {
+                    explicit_target = true;
+                    first_repo = Some(first.repo.clone());
+                    first_version = Some(first.version.clone());
+                    candidate_repo = best.repo.clone();
+                    new_version = best.version.clone();
+                }
+            }
+        }
+
         let installed_repo = installed.get(&name).and_then(|p| p.repo.clone());
         updates.push(Update {
             transition: transition(&installed_repo, &candidate_repo),
             name,
             old_version: old,
-            new_version: new,
+            new_version,
             installed_repo,
             candidate_repo,
+            explicit_target,
+            first_repo,
+            first_version,
         });
+    }
+
+    // Updates pacman cannot see at all: the highest-ranked copy is
+    // not newer than what is installed, but a lower-ranked repo has
+    // a strictly newer version still.
+    for (name, pkg) in installed {
+        if baseline_names.contains(name) || aur_names.contains(name) {
+            continue;
+        }
+        let Some(entries) = sync_by_name.get(name.as_str()) else {
+            continue;
+        };
+        let Some((first, best)) = ranked_candidates(entries, cmp) else {
+            continue;
+        };
+        if best.repo == first.repo {
+            continue;
+        }
+        // Pacman withheld a first-repository upgrade (IgnorePkg et
+        // al.): respect that rather than routing around it.
+        if cmp(&first.version, &pkg.version) == Ordering::Greater {
+            continue;
+        }
+        if cmp(&best.version, &pkg.version) == Ordering::Greater
+            && cmp(&best.version, &first.version) == Ordering::Greater
+        {
+            let installed_repo = pkg.repo.clone();
+            updates.push(Update {
+                transition: transition(&installed_repo, &best.repo),
+                name: name.clone(),
+                old_version: pkg.version.clone(),
+                new_version: best.version.clone(),
+                installed_repo,
+                candidate_repo: best.repo.clone(),
+                explicit_target: true,
+                first_repo: Some(first.repo.clone()),
+                first_version: Some(first.version.clone()),
+            });
+        }
     }
 
     for line in aur_lines.lines() {
@@ -115,6 +268,9 @@ pub fn merge_updates(
             new_version: new,
             installed_repo,
             candidate_repo: "aur".to_string(),
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
         });
     }
 
@@ -354,6 +510,77 @@ mod tests {
         assert_eq!(ups[1].candidate_repo, "aur");
         assert_eq!(ups[1].installed_repo.as_deref(), Some("aur"));
         assert_eq!(ups[1].transition, Transition::Same);
+    }
+
+    #[test]
+    fn finds_newer_version_shadowed_by_first_repo() {
+        // The bcachefs-dkms case: pacman -Qu is silent because the
+        // highest-ranked repo matches the installed version, while a
+        // lower-ranked repo carries a newer one.
+        let sync = alpm::parse_sync_list(
+            "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.1\n\
+             extra bcachefs-dkms 3:1.39.7-1\n\
+             minka bcachefs-dkms 3:1.39.7-2\n",
+        );
+        let ups = merge_updates_with_cmp("", "", &installed_map(), &sync, &mut |a, b| a.cmp(b));
+        assert_eq!(ups.len(), 1);
+        let u = &ups[0];
+        assert_eq!(u.name, "bcachefs-dkms");
+        assert_eq!(u.old_version, "3:1.39.7-1.1");
+        assert_eq!(u.new_version, "3:1.39.7-2");
+        assert_eq!(u.candidate_repo, "minka");
+        assert_eq!(u.transition, Transition::Changed);
+        assert!(u.explicit_target);
+        assert_eq!(u.first_repo.as_deref(), Some("cachyos-extra-v4"));
+        assert_eq!(u.first_version.as_deref(), Some("3:1.39.7-1.1"));
+    }
+
+    #[test]
+    fn promotes_lower_repo_over_standard_candidate_only_when_strictly_newer() {
+        let sync = alpm::parse_sync_list(
+            "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.2\n\
+             minka bcachefs-dkms 3:1.39.7-2\n",
+        );
+        let ups = merge_updates_with_cmp(
+            "bcachefs-dkms 3:1.39.7-1.1 -> 3:1.39.7-1.2\n",
+            "",
+            &installed_map(),
+            &sync,
+            &mut |a, b| a.cmp(b),
+        );
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].new_version, "3:1.39.7-2");
+        assert_eq!(ups[0].candidate_repo, "minka");
+        assert!(ups[0].explicit_target);
+
+        // Equal versions: the higher-ranked repository keeps the win.
+        let tie = alpm::parse_sync_list(
+            "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-2\n\
+             minka bcachefs-dkms 3:1.39.7-2\n",
+        );
+        let ups = merge_updates_with_cmp(
+            "bcachefs-dkms 3:1.39.7-1.1 -> 3:1.39.7-2\n",
+            "",
+            &installed_map(),
+            &tie,
+            &mut |a, b| a.cmp(b),
+        );
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].candidate_repo, "cachyos-extra-v4");
+        assert!(!ups[0].explicit_target);
+    }
+
+    #[test]
+    fn withheld_first_repo_upgrade_is_not_routed_around() {
+        // No baseline line despite the first repo being newer than
+        // installed: pacman withheld it (IgnorePkg etc.), so the
+        // even-newer lower copy must not surface either.
+        let sync = alpm::parse_sync_list(
+            "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.2\n\
+             minka bcachefs-dkms 3:1.39.7-2\n",
+        );
+        let ups = merge_updates_with_cmp("", "", &installed_map(), &sync, &mut |a, b| a.cmp(b));
+        assert!(ups.is_empty());
     }
 
     #[test]

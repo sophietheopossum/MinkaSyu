@@ -24,6 +24,10 @@ RowLayout {
 
     readonly property bool repoChanged: update.transition === "changed"
     readonly property bool unknownSource: update.transition === "unknown_source"
+    // A strictly newer copy in a lower-ranked repo than pacman's own
+    // candidate: chosen by MinkaSyu's cross-repository scan and
+    // applied as an explicit repo/name target.
+    readonly property bool laterRepo: update.explicit_target === true
 
     spacing: 10
     Layout.fillWidth: true
@@ -89,6 +93,14 @@ RowLayout {
                 font.family: Theme.monoFamily
                 font.pixelSize: Theme.fontSize - 2
             }
+            Text {
+                visible: root.laterRepo
+                text: "newer than " + (root.update.first_repo ?? "?") + " " + (root.update.first_version ?? "?")
+                color: Theme.purple
+                font.family: Theme.monoFamily
+                font.pixelSize: Theme.fontSize - 2
+                elide: Text.ElideRight
+            }
         }
     }
 
@@ -96,17 +108,17 @@ RowLayout {
     // deserves attention at a glance, so it gets a filled marker
     // instead of relying on the amber text alone.
     Rectangle {
-        visible: root.repoChanged
+        visible: root.repoChanged || root.laterRepo
         radius: 4
-        color: Theme.warnAmber
+        color: root.repoChanged ? Theme.warnAmber : Theme.purpleDim
         implicitWidth: badgeText.implicitWidth + 12
         implicitHeight: badgeText.implicitHeight + 6
 
         Text {
             id: badgeText
             anchors.centerIn: parent
-            text: "repo change"
-            color: Theme.ground
+            text: root.repoChanged ? "repo change" : "later repo"
+            color: root.repoChanged ? Theme.ground : Theme.text
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize - 3
             font.bold: true

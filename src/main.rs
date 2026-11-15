@@ -61,7 +61,10 @@ fn main() {
 fn print_summary(state: &State) {
     for u in &state.updates {
         let from = u.installed_repo.as_deref().unwrap_or("unknown source");
-        if u.explicit_target {
+        if !u.replaces.is_empty() {
+            let replaced: Vec<String> = u.replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
+            println!("{} {}  [{}] replaces {}", u.name, u.new_version, u.candidate_repo, replaced.join(", "));
+        } else if u.explicit_target {
             println!(
                 "{} {} -> {}  [repo: {} -> {}; newer than {} {}]",
                 u.name,
@@ -199,15 +202,25 @@ fn resolve_apply_targets(
     validate_targets(requested)?;
     let mut seen: Vec<String> = Vec::new();
     for t in requested {
-        let (_, name) = t.split_once('/').expect("validated above");
+        let (repo, name) = t.split_once('/').expect("validated above");
         if seen.iter().any(|n| n == name) {
             return Err(format!("duplicate upgrade target for package: {name}"));
         }
         if ignore.iter().any(|n| n == name) {
             return Err(format!("upgrade target is also ignored: {t}"));
         }
-        if !state.updates.iter().any(|u| u.name == name) {
+        let Some(update) = state.updates.iter().find(|u| u.name == name) else {
             return Err(format!("upgrade target is not a pending update: {t}"));
+        };
+        // A replacement happens only with the build that carries the
+        // replaces entry. Any other repo's package of that name drops
+        // the removal and ends in a conflict with the installed one.
+        if !update.replaces.is_empty() && repo != update.candidate_repo {
+            return Err(format!(
+                "{name} replaces {} only from {}, not from {repo}",
+                update.replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", "),
+                update.candidate_repo
+            ));
         }
         seen.push(name.to_string());
     }

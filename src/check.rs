@@ -122,26 +122,30 @@ fn ranked_candidates<'a>(
     Some((first, best))
 }
 
-/// Merge repo updates (with sync-DB candidate mapping) and AUR updates
-/// into one provenance-stamped list.
+/// Merge repo updates (with sync-DB candidate mapping), replacements
+/// and AUR updates into one provenance-stamped list.
 ///
-/// Standard updates come from `pacman -Qu`, preserving libalpm's own
-/// handling of ignores, replacements, and architecture. On top of
-/// that, a cross-repository scan promotes a strictly newer version
-/// from a lower-ranked repository: it replaces the standard
-/// candidate when there is one, and adds an update pacman would
-/// never offer when the first repository's copy is not newer than
-/// the installed package. A package pacman withheld despite its
-/// first repository being newer (IgnorePkg and friends) is left
-/// alone. Everything except the injected version comparison is pure.
+/// Standard updates come from `pacman -Qu`, which matches by package
+/// name only: it never reports a package that replaces an installed
+/// one under another name, and it lists ignored packages with a
+/// trailing ` [ignored]` (dropped by parse_update_line). Replacements
+/// come from find_replacements instead. On top of that, a
+/// cross-repository scan promotes a strictly newer version from a
+/// lower-ranked repository: it replaces the standard candidate when
+/// there is one, and adds an update pacman would never offer when the
+/// first repository's copy is not newer than the installed package.
+/// A package pacman withheld despite its first repository being newer
+/// (IgnorePkg and friends) is left alone. Everything except the
+/// injected version comparison is pure.
 pub fn merge_updates(
     repo_lines: &str,
     aur_lines: &str,
     installed: &HashMap<String, alpm::InstalledPkg>,
     sync_entries: &[alpm::SyncEntry],
+    replacements: &[Replacement],
 ) -> Vec<Update> {
     let mut cache: HashMap<(String, String), Ordering> = HashMap::new();
-    merge_updates_with_cmp(repo_lines, aur_lines, installed, sync_entries, &mut |a, b| {
+    merge_updates_with_cmp(repo_lines, aur_lines, installed, sync_entries, replacements, &mut |a, b| {
         *cache
             .entry((a.to_string(), b.to_string()))
             .or_insert_with(|| system_vercmp(a, b))
@@ -153,6 +157,7 @@ fn merge_updates_with_cmp(
     aur_lines: &str,
     installed: &HashMap<String, alpm::InstalledPkg>,
     sync_entries: &[alpm::SyncEntry],
+    replacements: &[Replacement],
     cmp: &mut dyn FnMut(&str, &str) -> Ordering,
 ) -> Vec<Update> {
     let in_sync: HashSet<&str> = sync_entries.iter().map(|e| e.name.as_str()).collect();
@@ -271,7 +276,50 @@ fn merge_updates_with_cmp(
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            replaces: Vec::new(),
         });
+    }
+
+    // Replacements: libalpm removes the replaced packages, so any row of
+    // their own is superseded (and unticking one would pass it to
+    // --ignore, which cancels the replacement too). The replacer takes
+    // its repo and version from -Syu's own target set, never from the
+    // by-name ranking above: a same-named package in a higher repo
+    // without the replaces entry is not what -Syu installs.
+    let superseded: HashSet<&str> = replacements
+        .iter()
+        .flat_map(|r| r.replaced.iter().map(|p| p.name.as_str()))
+        .collect();
+    updates.retain(|u| !superseded.contains(u.name.as_str()));
+    for r in replacements {
+        if let Some(row) = updates.iter_mut().find(|u| u.name == r.name) {
+            row.new_version = r.version.clone();
+            row.candidate_repo = r.repo.clone();
+            row.transition = transition(&row.installed_repo, &r.repo);
+            row.explicit_target = false;
+            row.first_repo = None;
+            row.first_version = None;
+            row.replaces = r.replaced.clone();
+        } else if let Some(first) = r.replaced.first() {
+            let (old_version, installed_repo) = match installed.get(&r.name) {
+                // The replacer is installed already: -Syu reinstalls it
+                // and removes the replaced packages.
+                Some(own) => (own.version.clone(), own.repo.clone()),
+                None => (first.version.clone(), first.installed_repo.clone()),
+            };
+            updates.push(Update {
+                transition: transition(&installed_repo, &r.repo),
+                name: r.name.clone(),
+                old_version,
+                new_version: r.version.clone(),
+                installed_repo,
+                candidate_repo: r.repo.clone(),
+                explicit_target: false,
+                first_repo: None,
+                first_version: None,
+                replaces: r.replaced.clone(),
+            });
+        }
     }
 
     updates.sort_by(|a, b| a.name.cmp(&b.name));
@@ -425,7 +473,17 @@ pub fn run_check() -> Result<State, String> {
     });
 
     let installed = alpm::read_installed(Path::new("/var/lib/pacman/local"));
-    let updates = merge_updates(&repo_lines, &aur_lines, &installed, &sync_entries);
+    let replacements = match sysupgrade_targets(db_str) {
+        Ok(text) => {
+            let ignored = ignored_installed(&installed);
+            find_replacements(&text, &installed, &sync_entries, &ignored, &mut system_vercmp)
+        }
+        Err(e) => {
+            eprintln!("minka-syu: replacement check failed, continuing without it: {e}");
+            Vec::new()
+        }
+    };
+    let updates = merge_updates(&repo_lines, &aur_lines, &installed, &sync_entries, &replacements);
     let repo_change_count = updates.iter().filter(|u| u.transition == Transition::Changed).count();
 
     let previous = load_state();

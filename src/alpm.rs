@@ -78,6 +78,52 @@ pub fn read_installed(local_db: &Path) -> HashMap<String, InstalledPkg> {
     out
 }
 
+/// `%GROUPS%` of one local-DB `desc` file: (name, groups). Unlike the
+/// fields parse_desc reads, this one lists one value per line up to
+/// the blank line.
+pub fn parse_groups(text: &str) -> (Option<String>, Vec<String>) {
+    let mut name = None;
+    let mut groups = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        match line.trim() {
+            "%NAME%" => name = lines.next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+            "%GROUPS%" => {
+                for value in lines.by_ref() {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        break;
+                    }
+                    groups.push(value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    (name, groups)
+}
+
+/// Groups of every installed package that belongs to any. Read only
+/// when IgnoreGroup is set, so the ordinary check does not pay for a
+/// second pass over the local DB.
+pub fn read_installed_groups(local_db: &Path) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(local_db) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("desc")) else {
+            continue;
+        };
+        if let (Some(name), groups) = parse_groups(&text) {
+            if !groups.is_empty() {
+                out.insert(name, groups);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncEntry {
     pub repo: String,
@@ -117,6 +163,16 @@ pub fn candidate_repo<'a>(entries: &'a [SyncEntry], name: &str, version: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_parsing() {
+        let desc = "%NAME%\nplasma-desktop\n\n%VERSION%\n6.5-1\n\n%GROUPS%\nplasma\nkde-applications\n\n%DESC%\nx\n\n";
+        assert_eq!(
+            parse_groups(desc),
+            (Some("plasma-desktop".into()), vec!["plasma".to_string(), "kde-applications".to_string()])
+        );
+        assert_eq!(parse_groups("%NAME%\nsolo\n\n"), (Some("solo".into()), vec![]));
+    }
 
     #[test]
     fn desc_with_installed_db() {

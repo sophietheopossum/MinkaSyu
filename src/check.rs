@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,7 +70,10 @@ fn transition(installed_repo: &Option<String>, candidate_repo: &str) -> Transiti
 }
 
 /// Parse one `name old -> new` line (the shared output shape of
-/// `pacman -Qu` and `paru -Qua`). Anything else returns None.
+/// `pacman -Qu` and `paru -Qua`). Anything else returns None, and so
+/// does a line pacman marks ` [ignored]`: -Qu still lists packages
+/// IgnorePkg/IgnoreGroup hold back (and those in a repo without
+/// `Usage = Upgrade`), which -Syu will not touch.
 pub fn parse_update_line(line: &str) -> Option<(String, String, String)> {
     let mut parts = line.split_whitespace();
     let name = parts.next()?;
@@ -79,7 +82,203 @@ pub fn parse_update_line(line: &str) -> Option<(String, String, String)> {
         return None;
     }
     let new = parts.next()?;
+    if parts.next() == Some("[ignored]") {
+        return None;
+    }
     Some((name.to_string(), old.to_string(), new.to_string()))
+}
+
+/// A `%REPLACES%` entry: a package name with an optional version
+/// constraint (`<`, `<=`, `=`, `>=`, `>`), as libalpm writes depstrings.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DepSpec {
+    pub name: String,
+    pub constraint: Option<(String, String)>,
+}
+
+pub(crate) fn parse_depstring(s: &str) -> Option<DepSpec> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let Some(i) = s.find(['<', '>', '=']) else {
+        return Some(DepSpec { name: s.to_string(), constraint: None });
+    };
+    let (name, rest) = s.split_at(i);
+    let op_len = if !rest.starts_with('=') && rest[1..].starts_with('=') { 2 } else { 1 };
+    let (op, version) = rest.split_at(op_len);
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some(DepSpec {
+        name: name.to_string(),
+        constraint: Some((op.to_string(), version.to_string())),
+    })
+}
+
+/// Whether `version` satisfies a depstring constraint, libalpm-style
+/// (the comparison is `vercmp`, injected so tests stay pure).
+fn satisfies(
+    version: &str,
+    constraint: &Option<(String, String)>,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> bool {
+    let Some((op, wanted)) = constraint else {
+        return true;
+    };
+    let ord = cmp(version, wanted);
+    match op.as_str() {
+        "<" => ord == Ordering::Less,
+        "<=" => ord != Ordering::Greater,
+        "=" => ord == Ordering::Equal,
+        ">=" => ord != Ordering::Less,
+        ">" => ord == Ordering::Greater,
+        _ => false,
+    }
+}
+
+/// fnmatch(3) without flags, which is how libalpm matches IgnorePkg
+/// and IgnoreGroup patterns: `*`, `?`, `[...]` (ranges, `!` or `^`
+/// to negate) and `\` escapes.
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    // Some((matched, chars consumed)) for a bracket expression at p[0];
+    // None when it is unterminated, in which case '[' is literal.
+    fn class(p: &[char], c: char) -> Option<(bool, usize)> {
+        let mut i = 1;
+        let negate = matches!(p.get(i), Some('!') | Some('^'));
+        if negate {
+            i += 1;
+        }
+        let start = i;
+        let mut matched = false;
+        while i < p.len() {
+            if p[i] == ']' && i > start {
+                return Some((matched != negate, i + 1));
+            }
+            let mut lo = p[i];
+            if lo == '\\' && i + 1 < p.len() {
+                i += 1;
+                lo = p[i];
+            }
+            if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
+                if lo <= c && c <= p[i + 2] {
+                    matched = true;
+                }
+                i += 3;
+            } else {
+                if lo == c {
+                    matched = true;
+                }
+                i += 1;
+            }
+        }
+        None
+    }
+    fn go(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|k| go(&p[1..], &t[k..])),
+            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some('[') if !t.is_empty() => match class(p, t[0]) {
+                Some((true, used)) => go(&p[used..], &t[1..]),
+                Some((false, _)) => false,
+                None => t[0] == '[' && go(&p[1..], &t[1..]),
+            },
+            Some('\\') if p.len() > 1 => !t.is_empty() && t[0] == p[1] && go(&p[2..], &t[1..]),
+            Some(c) => !t.is_empty() && t[0] == *c && go(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    go(&p, &t)
+}
+
+/// A sysupgrade target that replaces installed packages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Replacement {
+    pub name: String,
+    pub version: String,
+    pub repo: String,
+    pub replaced: Vec<Replaced>,
+}
+
+/// The replacements in `-Syu`'s target set.
+///
+/// `sup_text` is `pacman -Sup -dd --print-format '%n|%v|%r|%R'`:
+/// exactly libalpm's sysupgrade targets with their repo and replaces
+/// list. pacman prints what it would install, not what it would
+/// remove, so a target's %R entry counts as a replacement only when
+/// libalpm's own rules (lib/libalpm/sync.c, check_replacers) agree:
+/// - it names an installed package by NAME (provides never count)
+///   whose installed version satisfies the entry's constraint;
+/// - that package is not itself an upgrade target (then it is being
+///   upgraded, not replaced);
+/// - IgnorePkg/IgnoreGroup do not hold it back (`ignored`);
+/// - no repository ranked above the target's carries a package of
+///   that name: libalpm stops at the first repository holding either
+///   a replacer or the literal name, even an older one.
+///
+/// Ranks come from `sync_entries` (pacman -Sl order).
+pub fn find_replacements(
+    sup_text: &str,
+    installed: &HashMap<String, alpm::InstalledPkg>,
+    sync_entries: &[alpm::SyncEntry],
+    ignored: &HashSet<String>,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Vec<Replacement> {
+    let mut rank: HashMap<&str, usize> = HashMap::new();
+    for e in sync_entries {
+        let next = rank.len();
+        rank.entry(e.repo.as_str()).or_insert(next);
+    }
+    let targets: Vec<(&str, &str, &str, &str)> = sup_text
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.splitn(4, '|');
+            let (name, version, repo) = (f.next()?, f.next()?, f.next()?);
+            let replaces = f.next().unwrap_or("");
+            (!name.is_empty() && !version.is_empty() && !repo.is_empty())
+                .then_some((name, version, repo, replaces))
+        })
+        .collect();
+    let target_names: HashSet<&str> = targets.iter().map(|t| t.0).collect();
+
+    let mut out = Vec::new();
+    for (name, version, repo, replaces) in targets {
+        let own_rank = rank.get(repo).copied().unwrap_or(usize::MAX);
+        let mut replaced = Vec::new();
+        for dep in replaces.split_whitespace().filter_map(parse_depstring) {
+            if dep.name == name || target_names.contains(dep.name.as_str()) || ignored.contains(&dep.name) {
+                continue;
+            }
+            let Some(pkg) = installed.get(&dep.name) else {
+                continue;
+            };
+            if !satisfies(&pkg.version, &dep.constraint, cmp) {
+                continue;
+            }
+            let shadowed = sync_entries.iter().any(|e| {
+                e.name == dep.name && rank.get(e.repo.as_str()).copied().unwrap_or(usize::MAX) < own_rank
+            });
+            if shadowed || replaced.iter().any(|r: &Replaced| r.name == dep.name) {
+                continue;
+            }
+            replaced.push(Replaced {
+                name: dep.name.clone(),
+                version: pkg.version.clone(),
+                installed_repo: pkg.repo.clone(),
+            });
+        }
+        if !replaced.is_empty() {
+            out.push(Replacement {
+                name: name.to_string(),
+                version: version.to_string(),
+                repo: repo.to_string(),
+                replaced,
+            });
+        }
+    }
+    out
 }
 
 /// libalpm's version comparison, via the `vercmp` tool that ships
@@ -438,6 +637,57 @@ fn refresh_temp_db() -> Result<PathBuf, String> {
         ));
     }
     Ok(db)
+}
+
+/// libalpm's own sysupgrade target set, from the private DB the check
+/// just refreshed: what `-Syu` would install, replacements included,
+/// which `-Qu` never reports. Print mode needs neither root nor the DB
+/// lock and answers its own questions; `-dd` keeps one unsatisfiable
+/// dependency elsewhere in the upgrade from failing the whole answer
+/// (and drops pulled-in dependencies from the list). pacman prints
+/// such failures on stdout, so only a zero exit status counts.
+fn sysupgrade_targets(db: &str) -> Result<String, String> {
+    let out = Command::new("pacman")
+        .args(["-Sup", "-dd", "--dbpath", db, "--logfile", "/dev/null"])
+        .args(["--print-format", "%n|%v|%r|%R"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running pacman -Sup: {e}"))?;
+    if !out.status.success() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().chain(text.lines()).rfind(|l| !l.trim().is_empty()).unwrap_or("");
+        return Err(format!("pacman -Sup failed ({}): {last}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Installed packages IgnorePkg / IgnoreGroup hold back, from
+/// pacman-conf (one pattern per line, nothing when unset), matched the
+/// way libalpm does: fnmatch on the package name, and on each of its
+/// groups (%GROUPS% in the local DB). An unreadable configuration
+/// counts as no ignores.
+fn ignored_installed(installed: &HashMap<String, alpm::InstalledPkg>) -> HashSet<String> {
+    let conf = |key: &str| -> Vec<String> {
+        run_capture("pacman-conf", &[key])
+            .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+            .unwrap_or_default()
+    };
+    let pkg_patterns = conf("IgnorePkg");
+    let group_patterns = conf("IgnoreGroup");
+    let mut out: HashSet<String> = installed
+        .keys()
+        .filter(|name| pkg_patterns.iter().any(|p| glob_match(p, name)))
+        .cloned()
+        .collect();
+    if !group_patterns.is_empty() {
+        for (name, groups) in alpm::read_installed_groups(Path::new("/var/lib/pacman/local")) {
+            if groups.iter().any(|g| group_patterns.iter().any(|p| glob_match(p, g))) {
+                out.insert(name);
+            }
+        }
+    }
+    out
 }
 
 /// Run a full check. On success returns the new state (also saved).

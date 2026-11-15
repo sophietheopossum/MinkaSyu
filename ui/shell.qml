@@ -162,9 +162,26 @@ ShellRoot {
                 detailRepoTarget = defaultDetailTarget();
         }
 
+        // A pending replacement (the update carries `replaces`) happens
+        // only with the build from its own candidate repo: a same-named
+        // package from another repo has no replaces entry, so choosing
+        // it would drop the removal and end in a conflict.
+        function replacementFor(option) {
+            if (detailContext !== "updates" || !option)
+                return null;
+            const u = updates.find(x => x.name === option.name);
+            return (u?.replaces ?? []).length > 0 ? u : null;
+        }
+        function replacementBlocked(option) {
+            const u = replacementFor(option);
+            return u !== null && option.repo !== u.candidate_repo;
+        }
+
         function chooseDetailRepo() {
             const option = detailSelectedOption;
             if (!option)
+                return;
+            if (replacementBlocked(option))
                 return;
             if (detailContext === "updates") {
                 const next = Object.assign({}, repoOverrides);
@@ -998,11 +1015,17 @@ ShellRoot {
                         spacing: 10
 
                         Text {
+                            id: selectedBuildText
+                            readonly property var replacement: win.replacementFor(win.detailSelectedOption)
+                            readonly property bool blocked: win.replacementBlocked(win.detailSelectedOption)
                             Layout.fillWidth: true
-                            text: win.detailRepoTarget.length > 0
+                            text: blocked
+                                ? "Only " + replacement.candidate_repo + "/" + replacement.name + " replaces "
+                                    + replacement.replaces.map(r => r.name).join(", ") + "; this build would not."
+                                : win.detailRepoTarget.length > 0
                                 ? "Selected build: " + win.detailRepoTarget
                                 : "No repository build selected."
-                            color: Theme.textFaint
+                            color: blocked ? Theme.warnAmber : Theme.textFaint
                             font.family: Theme.monoFamily
                             font.pixelSize: Theme.fontSize - 2
                             elide: Text.ElideRight
@@ -1012,7 +1035,7 @@ ShellRoot {
                                 : win.detailContext === "browse" ? "Select for install"
                                 : (win.detailSelectedOption?.is_installed ? "Reinstall selected" : "Install selected")
                             primary: win.detailContext === "installed"
-                            enabled: win.detailSelectedOption !== null
+                            enabled: win.detailSelectedOption !== null && !selectedBuildText.blocked
                             onClicked: win.chooseDetailRepo()
                         }
                     }

@@ -11,6 +11,8 @@ import "../services"
 //   - origin unknown (no %INSTALLED_DB% in the local database):
 //     "unknown source -> <candidate>", rendered faint and stated
 //     plainly rather than guessed.
+// A replacement (the candidate's %REPLACES% names an installed
+// package, which -Syu then removes) gets its own line and badge.
 RowLayout {
     id: root
 
@@ -28,6 +30,17 @@ RowLayout {
     // candidate: chosen by MinkaSyu's cross-repository scan and
     // applied as an explicit repo/name target.
     readonly property bool laterRepo: update.explicit_target === true
+    // States from cores before replacements were detected lack the key.
+    readonly property var replaced: update.replaces ?? []
+    readonly property bool replacement: replaced.length > 0
+    // old_version is the replaced package's unless the replacer is
+    // installed itself; "9.4 -> 0.12" across two packages would read
+    // like a downgrade, so then only the new version is shown.
+    readonly property bool replacerInstalled: replacement && update.old_version !== replaced[0].version
+    readonly property string badgeLabel: replacement ? "replaces"
+        : repoChanged ? "repo change"
+        : laterRepo ? "later repo"
+        : ""
 
     spacing: 10
     Layout.fillWidth: true
@@ -66,7 +79,9 @@ RowLayout {
             spacing: 6
 
             Text {
-                text: root.update.old_version + " → " + root.update.new_version
+                text: root.replacement && !root.replacerInstalled
+                    ? root.update.new_version
+                    : root.update.old_version + " → " + root.update.new_version
                 color: Theme.textMuted
                 font.family: Theme.monoFamily
                 font.pixelSize: Theme.fontSize - 2
@@ -102,23 +117,33 @@ RowLayout {
                 elide: Text.ElideRight
             }
         }
+
+        Text {
+            visible: root.replacement
+            text: "replaces " + root.replaced.map(r => r.name + " " + r.version).join(", ")
+            color: Theme.red
+            font.family: Theme.monoFamily
+            font.pixelSize: Theme.fontSize - 2
+            elide: Text.ElideRight
+            Layout.fillWidth: true
+        }
     }
 
-    // The badge: a repo switch is the one thing in this list that
-    // deserves attention at a glance, so it gets a filled marker
-    // instead of relying on the amber text alone.
+    // The badge: a repo switch, or a package that removes another, is
+    // what in this list deserves attention at a glance, so it gets a
+    // filled marker instead of relying on the coloured text alone.
     Rectangle {
-        visible: root.repoChanged || root.laterRepo
+        visible: root.badgeLabel.length > 0
         radius: 4
-        color: root.repoChanged ? Theme.warnAmber : Theme.purpleDim
+        color: root.replacement ? Theme.redDim : root.repoChanged ? Theme.warnAmber : Theme.purpleDim
         implicitWidth: badgeText.implicitWidth + 12
         implicitHeight: badgeText.implicitHeight + 6
 
         Text {
             id: badgeText
             anchors.centerIn: parent
-            text: root.repoChanged ? "repo change" : "later repo"
-            color: root.repoChanged ? Theme.ground : Theme.text
+            text: root.badgeLabel
+            color: root.repoChanged && !root.replacement ? Theme.ground : Theme.text
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize - 3
             font.bold: true

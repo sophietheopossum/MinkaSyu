@@ -683,6 +683,43 @@ mod tests {
     }
 
     #[test]
+    fn replacements_apply_only_from_their_own_repo() {
+        let replacement = check::Update {
+            name: "coreutils-uutils".into(),
+            old_version: "9.4_0.0.28-1".into(),
+            new_version: "0.12.0-1".into(),
+            installed_repo: None,
+            candidate_repo: "minka".into(),
+            transition: check::Transition::UnknownSource,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+            replaces: vec![check::Replaced {
+                name: "coreutils-hybrid".into(),
+                version: "9.4_0.0.28-1".into(),
+                installed_repo: None,
+            }],
+        };
+        let state = State {
+            schema: 1,
+            checked_at: 0,
+            updates: vec![replacement],
+            repo_change_count: 0,
+            last_notified_count: 0,
+        };
+        // Plain -Syu performs it: no explicit target is derived.
+        assert!(explicit_targets(&state, &[]).is_empty());
+        assert!(resolve_apply_targets(&state, &[], None).unwrap().is_empty());
+        // Its own repo is fine; the same-named [cachyos] build is not.
+        assert!(resolve_apply_targets(&state, &[], Some(&["minka/coreutils-uutils".into()])).is_ok());
+        let err = resolve_apply_targets(&state, &[], Some(&["cachyos/coreutils-uutils".into()])).unwrap_err();
+        assert!(err.contains("only from minka"), "{err}");
+        // Unticking it is an ordinary --ignore, which skips the replacement.
+        let argv = upgrade_argv(&["coreutils-uutils".into()]);
+        assert_eq!(&argv[2..], ["paru", "-Syu", "--sudoloop", "--ignore=coreutils-uutils"]);
+    }
+
+    #[test]
     fn ignore_cli_parsing() {
         assert_eq!(parse_ignore(&["--ignore", "a,b"]), ["a", "b"]);
         assert_eq!(parse_ignore(&["--ignore=a,b", "--dry-run"]), ["a", "b"]);

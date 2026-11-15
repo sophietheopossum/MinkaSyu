@@ -503,6 +503,7 @@ mod tests {
             "gitkraken 12.6.1-1 -> 12.6.2-1\n",
             &installed_map(),
             &sync,
+            &[],
         );
         assert_eq!(ups.len(), 2);
         assert_eq!(ups[0].candidate_repo, "minka");
@@ -522,7 +523,7 @@ mod tests {
              extra bcachefs-dkms 3:1.39.7-1\n\
              minka bcachefs-dkms 3:1.39.7-2\n",
         );
-        let ups = merge_updates_with_cmp("", "", &installed_map(), &sync, &mut |a, b| a.cmp(b));
+        let ups = merge_updates_with_cmp("", "", &installed_map(), &sync, &[], &mut |a, b| a.cmp(b));
         assert_eq!(ups.len(), 1);
         let u = &ups[0];
         assert_eq!(u.name, "bcachefs-dkms");
@@ -546,6 +547,7 @@ mod tests {
             "",
             &installed_map(),
             &sync,
+            &[],
             &mut |a, b| a.cmp(b),
         );
         assert_eq!(ups.len(), 1);
@@ -563,6 +565,7 @@ mod tests {
             "",
             &installed_map(),
             &tie,
+            &[],
             &mut |a, b| a.cmp(b),
         );
         assert_eq!(ups.len(), 1);
@@ -579,7 +582,7 @@ mod tests {
             "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.2\n\
              minka bcachefs-dkms 3:1.39.7-2\n",
         );
-        let ups = merge_updates_with_cmp("", "", &installed_map(), &sync, &mut |a, b| a.cmp(b));
+        let ups = merge_updates_with_cmp("", "", &installed_map(), &sync, &[], &mut |a, b| a.cmp(b));
         assert!(ups.is_empty());
     }
 
@@ -591,6 +594,209 @@ mod tests {
         );
         assert_eq!(parse_update_line(":: some notice"), None);
         assert_eq!(parse_update_line(""), None);
+        // -Qu lists IgnorePkg'd packages too; -Syu will not touch them.
+        assert_eq!(parse_update_line("linux 6.1-1 -> 6.2-1 [ignored]"), None);
+    }
+
+    fn pkg(version: &str, repo: Option<&str>) -> alpm::InstalledPkg {
+        alpm::InstalledPkg {
+            version: version.into(),
+            repo: repo.map(String::from),
+            description: String::new(),
+            size_bytes: 0,
+            explicit: true,
+        }
+    }
+
+    // The live situation on 15/11/2026: [cachyos] (ranked first) has a
+    // same-named coreutils-uutils without a replaces entry, [minka] has
+    // the one that replaces the orphaned, foreign coreutils-hybrid.
+    fn coreutils_sync() -> Vec<alpm::SyncEntry> {
+        alpm::parse_sync_list(
+            "cachyos coreutils-uutils 0.2.2-3\n\
+             extra uutils-coreutils 0.12.0-3\n\
+             minka coreutils-uutils 0.12.0-1\n",
+        )
+    }
+
+    fn coreutils_installed() -> HashMap<String, alpm::InstalledPkg> {
+        HashMap::from([
+            ("coreutils-hybrid".to_string(), pkg("9.4_0.0.28-1", None)),
+            ("uutils-coreutils".to_string(), pkg("0.12.0-3", Some("extra"))),
+        ])
+    }
+
+    #[test]
+    fn depstring_parsing() {
+        let d = |s| parse_depstring(s);
+        assert_eq!(d("old").unwrap(), DepSpec { name: "old".into(), constraint: None });
+        assert_eq!(d("kconfig<5.111").unwrap().constraint, Some(("<".into(), "5.111".into())));
+        assert_eq!(d("a<=2").unwrap().constraint, Some(("<=".into(), "2".into())));
+        assert_eq!(d("a>=2").unwrap().constraint, Some((">=".into(), "2".into())));
+        assert_eq!(d("a=1-1").unwrap().constraint, Some(("=".into(), "1-1".into())));
+        assert_eq!(d("a>2").unwrap().constraint, Some((">".into(), "2".into())));
+        assert_eq!(d(""), None);
+        assert_eq!(d("<2"), None);
+        assert_eq!(d("a<"), None);
+    }
+
+    #[test]
+    fn glob_matching_like_fnmatch() {
+        assert!(glob_match("linux-cachyos*", "linux-cachyos"));
+        assert!(glob_match("linux-cachyos*", "linux-cachyos-headers"));
+        assert!(!glob_match("linux-cachyos*", "linux"));
+        assert!(glob_match("nvidia-utils", "nvidia-utils"));
+        assert!(!glob_match("nvidia-utils", "lib32-nvidia-utils"));
+        assert!(glob_match("*nvidia*", "lib32-nvidia-utils"));
+        assert!(glob_match("lib?2-*", "lib32-glibc"));
+        assert!(glob_match("[ab]x", "bx"));
+        assert!(!glob_match("[ab]x", "cx"));
+        assert!(glob_match("[!a]x", "bx"));
+        assert!(!glob_match("[^a]x", "ax"));
+        assert!(glob_match("[a-c]1", "b1"));
+        assert!(glob_match("a\\*", "a*"));
+        assert!(!glob_match("a\\*", "ab"));
+        assert!(glob_match("[x", "[x"));
+    }
+
+    #[test]
+    fn coreutils_replacement_is_surfaced_from_the_lower_repo() {
+        let sync = coreutils_sync();
+        let installed = coreutils_installed();
+        let reps = find_replacements(
+            "coreutils-uutils|0.12.0-1|minka|coreutils-hybrid\n",
+            &installed,
+            &sync,
+            &HashSet::new(),
+            &mut system_vercmp,
+        );
+        assert_eq!(reps.len(), 1);
+        let ups = merge_updates_with_cmp("", "", &installed, &sync, &reps, &mut system_vercmp);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        let u = &ups[0];
+        assert_eq!(u.name, "coreutils-uutils");
+        assert_eq!(u.old_version, "9.4_0.0.28-1");
+        assert_eq!(u.new_version, "0.12.0-1");
+        assert_eq!(u.candidate_repo, "minka");
+        assert_eq!(u.installed_repo, None);
+        assert_eq!(u.transition, Transition::UnknownSource);
+        // Plain -Syu performs it; no explicit target, no "later repo".
+        assert!(!u.explicit_target);
+        assert_eq!(u.first_repo, None);
+        assert_eq!(
+            u.replaces,
+            vec![Replaced { name: "coreutils-hybrid".into(), version: "9.4_0.0.28-1".into(), installed_repo: None }]
+        );
+    }
+
+    #[test]
+    fn versioned_replaces_must_hold_for_the_installed_version() {
+        // KDE5-era entries like kwallet5 'kwallet<5.111' name installed
+        // KF6 packages they no longer apply to.
+        let installed = HashMap::from([("kwallet".to_string(), pkg("6.31.0-1.1", Some("extra")))]);
+        let sync = alpm::parse_sync_list("extra kwallet5 5.116.0-6\nextra kwallet 6.31.0-1.1\n");
+        let none = find_replacements(
+            "kwallet5|5.116.0-6|extra|kwallet<5.111 kwallet-secrets\n",
+            &installed,
+            &sync,
+            &HashSet::new(),
+            &mut system_vercmp,
+        );
+        assert!(none.is_empty());
+        let old = HashMap::from([("kwallet".to_string(), pkg("5.110.0-1", Some("extra")))]);
+        let some = find_replacements(
+            "kwallet5|5.116.0-6|extra|kwallet<5.111\n",
+            &old,
+            &alpm::parse_sync_list("extra kwallet5 5.116.0-6\n"),
+            &HashSet::new(),
+            &mut system_vercmp,
+        );
+        assert_eq!(some.len(), 1);
+        assert_eq!(some[0].replaced[0].name, "kwallet");
+    }
+
+    #[test]
+    fn not_a_replacement_when_the_named_package_is_upgraded_ignored_or_shadowed() {
+        let installed = HashMap::from([
+            ("xx".to_string(), pkg("1-1", Some("lo"))),
+            ("yy".to_string(), pkg("1-1", Some("hi"))),
+        ]);
+        let sync = alpm::parse_sync_list("hi yy 2-1\nlo xx 2-1\n");
+        // yy is a target of its own: it is upgraded, not replaced.
+        let upgraded =
+            find_replacements("xx|2-1|lo|yy\nyy|2-1|hi|\n", &installed, &sync, &HashSet::new(), &mut system_vercmp);
+        assert!(upgraded.is_empty());
+        // yy held back by IgnorePkg: libalpm skips the replacement.
+        let ignored = HashSet::from(["yy".to_string()]);
+        let held = find_replacements("xx|2-1|lo|yy\n", &installed, &sync, &ignored, &mut system_vercmp);
+        assert!(held.is_empty());
+        // A higher repo carries yy by name (even at the installed
+        // version): libalpm stops there and never sees lo's replacer.
+        let same = alpm::parse_sync_list("hi yy 1-1\nlo xx 2-1\n");
+        let shadowed = find_replacements("xx|2-1|lo|yy\n", &installed, &same, &HashSet::new(), &mut system_vercmp);
+        assert!(shadowed.is_empty());
+        // In the replacer's own repo the replacer wins over the literal.
+        let own = alpm::parse_sync_list("lo xx 2-1\nlo yy 1-1\n");
+        let wins = find_replacements("xx|2-1|lo|yy\n", &installed, &own, &HashSet::new(), &mut system_vercmp);
+        assert_eq!(wins.len(), 1);
+    }
+
+    #[test]
+    fn replacer_rows_fold_and_replaced_rows_go() {
+        let sync = coreutils_sync();
+        let mut installed = coreutils_installed();
+        // The replacer already installed from [cachyos], with a -Qu
+        // literal update there that the cross-repo scan would promote.
+        installed.insert("coreutils-uutils".into(), pkg("0.2.1-1", Some("cachyos")));
+        let reps = vec![Replacement {
+            name: "coreutils-uutils".into(),
+            version: "0.12.0-1".into(),
+            repo: "minka".into(),
+            replaced: vec![Replaced { name: "coreutils-hybrid".into(), version: "9.4_0.0.28-1".into(), installed_repo: None }],
+        }];
+        // And the replaced package somehow has rows of its own (AUR).
+        let ups = merge_updates_with_cmp(
+            "coreutils-uutils 0.2.1-1 -> 0.2.2-3\n",
+            "coreutils-hybrid 9.4_0.0.28-1 -> 9.5-1\n",
+            &installed,
+            &sync,
+            &reps,
+            &mut system_vercmp,
+        );
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        let u = &ups[0];
+        assert_eq!(u.name, "coreutils-uutils");
+        assert_eq!(u.old_version, "0.2.1-1");
+        assert_eq!(u.new_version, "0.12.0-1");
+        assert_eq!(u.candidate_repo, "minka");
+        assert_eq!(u.installed_repo.as_deref(), Some("cachyos"));
+        assert_eq!(u.transition, Transition::Changed);
+        assert!(!u.explicit_target);
+        assert_eq!(u.first_repo, None);
+        assert_eq!(u.replaces.len(), 1);
+    }
+
+    #[test]
+    fn sysupgrade_lines_without_replaces_are_ignored() {
+        let installed = coreutils_installed();
+        let reps = find_replacements(
+            "nautilus|51.1-1.1|cachyos-extra-v4|\nbroken line\n|1|x|y\n",
+            &installed,
+            &coreutils_sync(),
+            &HashSet::new(),
+            &mut system_vercmp,
+        );
+        assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn state_without_replaces_still_loads() {
+        // A state.json written by MinkaSyu 0.5.0 has no `replaces` key.
+        let json = r#"{"schema":1,"checked_at":0,"repo_change_count":0,"last_notified_count":0,
+            "updates":[{"name":"a","old_version":"1","new_version":"2","installed_repo":null,
+            "candidate_repo":"extra","transition":"unknown_source"}]}"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        assert!(state.updates[0].replaces.is_empty());
     }
 }
 

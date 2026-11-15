@@ -41,6 +41,21 @@ pub struct Update {
     pub first_repo: Option<String>,
     #[serde(default)]
     pub first_version: Option<String>,
+    /// Installed packages this candidate replaces (its %REPLACES%):
+    /// libalpm removes them when `-Syu` installs it, so the row is the
+    /// replacer, named after it, and `old_version` / `installed_repo`
+    /// describe the first package it replaces unless the replacer is
+    /// itself installed. Empty for an ordinary update.
+    #[serde(default)]
+    pub replaces: Vec<Replaced>,
+}
+
+/// One installed package that a pending update replaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Replaced {
+    pub name: String,
+    pub version: String,
+    pub installed_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -412,6 +427,7 @@ fn merge_updates_with_cmp(
             explicit_target,
             first_repo,
             first_version,
+            replaces: Vec::new(),
         });
     }
 
@@ -450,6 +466,7 @@ fn merge_updates_with_cmp(
                 explicit_target: true,
                 first_repo: Some(first.repo.clone()),
                 first_version: Some(first.version.clone()),
+                replaces: Vec::new(),
             });
         }
     }

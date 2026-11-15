@@ -631,6 +631,7 @@ mod tests {
             explicit_target: explicit,
             first_repo: explicit.then(|| "cachyos-extra-v4".to_string()),
             first_version: explicit.then(|| "1-1".to_string()),
+            replaces: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -668,6 +669,7 @@ mod tests {
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            replaces: Vec::new(),
         };
         let state = State {
             schema: 1,

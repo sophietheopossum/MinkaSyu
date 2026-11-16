@@ -1120,12 +1120,16 @@ fn source_row(app: App, r: SourceRow) -> Div {
         .row_gap(1.0_f32);
     let moving = matches!(r.status.as_str(), "update" | "update-by-hand" | "watch");
     let version_line = if moving && !r.upstream.is_empty() {
-        let short = if r.commit.is_empty() {
-            String::new()
-        } else {
-            format!("@{}", &r.commit[..r.commit.len().min(7)])
-        };
-        format!("{} → {}{short}", r.pkgbuild, r.upstream)
+        // A new commit on the same version is a revision (pkgrel + 1), as
+        // Arch and CachyOS version a rebuild; the commit is only a note.
+        match next_revision(&r) {
+            Some(next) => format!(
+                "{} → {next} · new commit {}",
+                r.pkgbuild,
+                &r.commit[..r.commit.len().min(7)]
+            ),
+            None => format!("{} → {}", r.pkgbuild, r.upstream),
+        }
     } else {
         r.pkgbuild.clone()
     };
@@ -1193,9 +1197,16 @@ fn source_row(app: App, r: SourceRow) -> Div {
             move || app.toggle_source(&toggle_pkg),
         ))
         .child(column)
-        .child(text_button(action, TEXT_MUTED, move || {
-            app.set_tracked(pkg.to_string(), !tracked)
-        }))
+        .child(if r.kind.is_empty() {
+            // No upstream file: nothing for `minkarepo track` to switch.
+            div().flex_none().child(
+                ui_text("no upstream file", FONT_SIZE - 2.0_f32, TEXT_FAINT).whitespace_nowrap(),
+            )
+        } else {
+            text_button(action, TEXT_MUTED, move || {
+                app.set_tracked(pkg.to_string(), !tracked)
+            })
+        })
 }
 
 fn source_list(app: App, tracked: bool) -> impl IntoView {

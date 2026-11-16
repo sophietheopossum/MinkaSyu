@@ -529,6 +529,21 @@ pub fn source_default_ticks(rows: &[SourceRow]) -> BTreeSet<String> {
         .collect()
 }
 
+/// The version a revision bump builds as ("0.1.2-9" -> "0.1.2-10"), when
+/// the row's update is a new commit on the same version.
+pub fn next_revision(r: &SourceRow) -> Option<String> {
+    if r.commit.is_empty() {
+        return None;
+    }
+    let (version, rel) = r.pkgbuild.rsplit_once('-')?;
+    let bare = version.split_once(':').map_or(version, |(_, v)| v);
+    if bare != r.upstream {
+        return None;
+    }
+    let major: u64 = rel.split('.').next()?.parse().ok()?;
+    Some(format!("{version}-{}", major + 1))
+}
+
 /// A short phrase for a source row's state.
 pub fn source_status_text(r: &SourceRow) -> String {
     match r.status.as_str() {
@@ -722,5 +737,23 @@ mod tests {
         );
         assert!(source_actionable(&rows[1]));
         assert!(!source_actionable(&rows[3]));
+
+        let rev = |pkgbuild: &str, upstream: &str, commit: &str| SourceRow {
+            pkgbuild: pkgbuild.into(),
+            upstream: upstream.into(),
+            commit: commit.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            next_revision(&rev("0.1.2-9", "0.1.2", "351c111")).as_deref(),
+            Some("0.1.2-10")
+        );
+        assert_eq!(
+            next_revision(&rev("3:1.39.7-1.1", "1.39.7", "abc")).as_deref(),
+            Some("3:1.39.7-2")
+        );
+        // A new version is a version bump, not a revision.
+        assert_eq!(next_revision(&rev("0.6.0-1", "0.7.0", "abc")), None);
+        assert_eq!(next_revision(&rev("0.6.0-1", "0.6.0", "")), None);
     }
 }

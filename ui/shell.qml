@@ -162,26 +162,50 @@ ShellRoot {
                 detailRepoTarget = defaultDetailTarget();
         }
 
-        // A pending replacement (the update carries `replaces`) happens
+        // Why "Use for upgrade" cannot take this build, or "" when it can.
+        // A held update is skipped by -Syu whatever build is chosen. A
+        // pending replacement (the update carries `replaces`) happens
         // only with the build from its own candidate repo: a same-named
         // package from another repo has no replaces entry, so choosing
         // it would drop the removal and end in a conflict.
-        function replacementFor(option) {
+        function upgradeBlockedReason(option) {
             if (detailContext !== "updates" || !option)
-                return null;
+                return "";
             const u = updates.find(x => x.name === option.name);
-            return (u?.replaces ?? []).length > 0 ? u : null;
+            if (!u)
+                return "";
+            if (u.held === true)
+                return u.held_by === "usage"
+                    ? u.name + "'s newer build is only in a repository without Usage = Upgrade; -Syu skips it."
+                    : u.name + " is held back by IgnorePkg/IgnoreGroup in pacman.conf; -Syu skips it.";
+            if (superseded(u))
+                return u.name + " is replaced by " + u.superseded_by.join(", ")
+                    + " in this run. Untick that to keep it; the next check shows its own update.";
+            const locker = lockedBy(u);
+            if (locker !== "")
+                return locker + " replaces " + u.name + " in this run; untick " + locker + " first.";
+            // A later-repo row's build only discloses what ticking it would
+            // replace; choosing another build for it is an ordinary choice.
+            const replaced = u.replaces ?? [];
+            if (replaced.length > 0 && u.explicit_target !== true && option.repo !== u.candidate_repo)
+                return "Only " + u.candidate_repo + "/" + u.name + " replaces "
+                    + replaced.map(r => r.name).join(", ") + "; this build would not.";
+            return "";
         }
-        function replacementBlocked(option) {
-            const u = replacementFor(option);
-            return u !== null && option.repo !== u.candidate_repo;
+        // A repo choice that no longer applies: the update is held, or
+        // it has become a replacement that only its own repo performs
+        // (an override saved before a recheck must not route around
+        // that).
+        function overrideInvalid(u, ov) {
+            return u.held === true
+                || (u.explicit_target !== true && (u.replaces ?? []).length > 0 && ov.repo !== u.candidate_repo);
         }
 
         function chooseDetailRepo() {
             const option = detailSelectedOption;
             if (!option)
                 return;
-            if (replacementBlocked(option))
+            if (upgradeBlockedReason(option) !== "")
                 return;
             if (detailContext === "updates") {
                 const next = Object.assign({}, repoOverrides);
@@ -212,12 +236,15 @@ ShellRoot {
 
         function effectiveUpdate(u) {
             const ov = repoOverrides[u.name];
-            if (!ov)
+            if (!ov || overrideInvalid(u, ov))
                 return u;
             const copy = Object.assign({}, u);
             const defaultRepo = u.explicit_target ? (u.first_repo ?? u.candidate_repo) : u.candidate_repo;
             copy.new_version = ov.version;
             copy.candidate_repo = ov.repo;
+            // What a later build would replace does not carry over to another build.
+            if (ov.repo !== u.candidate_repo)
+                copy.replaces = [];
             copy.explicit_target = ov.repo !== defaultRepo;
             if (copy.explicit_target && !copy.first_repo) {
                 copy.first_repo = defaultRepo;
@@ -234,15 +261,38 @@ ShellRoot {
         readonly property var updates: Syu.state ? (Syu.state.updates ?? []) : []
         readonly property var effectiveUpdates: updates.map(u => win.effectiveUpdate(u))
         readonly property int checkedAt: Syu.state ? (Syu.state.checked_at ?? 0) : 0
-        readonly property int repoChanges: effectiveUpdates.filter(u => u.transition === "changed").length
+        // A package a replacement removes: its row is shown for
+        // information only. Unticking the replacement skips it, and what
+        // pacman then does to this package depends on the whole run, so
+        // the row never claims an outcome; the next check shows it.
+        function superseded(u) {
+            return (u.superseded_by ?? []).length > 0;
+        }
+        // A pending row that a ticked replacement removes (a replacer in a
+        // chain): unticking it would put it in --ignore, which also
+        // cancels the outer replacement, so it stays ticked until that is
+        // unticked. Returns the replacer's name, or "".
+        function lockedBy(u) {
+            const r = updates.find(r => r.name !== u.name && rowPending(r) && !ignoredUpdates[r.name]
+                && ((r.replaces ?? []).some(p => p.name === u.name) || (r.reinstalls ?? []).includes(u.name)));
+            return r ? r.name : "";
+        }
+        // Rows this run applies unless unticked: not held (pacman.conf
+        // holds them back and -Syu skips them on its own), not replaced.
+        function rowPending(u) {
+            return u.held !== true && !superseded(u);
+        }
+        readonly property int pendingCount: updates.filter(u => rowPending(u)).length
+        readonly property int heldCount: updates.filter(u => u.held === true).length
+        readonly property int repoChanges: effectiveUpdates.filter(u => rowPending(u) && u.transition === "changed").length
         readonly property var repoUpdates: effectiveUpdates.filter(u => u.candidate_repo !== "aur")
         readonly property var aurUpdates: effectiveUpdates.filter(u => u.candidate_repo === "aur")
-        readonly property var ignoredNames: updates.filter(u => ignoredUpdates[u.name]).map(u => u.name)
-        readonly property int selectedUpdateCount: updates.length - ignoredNames.length
+        readonly property var ignoredNames: updates.filter(u => rowPending(u) && ignoredUpdates[u.name] && lockedBy(u) === "").map(u => u.name)
+        readonly property int selectedUpdateCount: pendingCount - ignoredNames.length
         // Ticked candidates from a lower-ranked repo than pacman's
         // own: the core adds these as explicit repo/name targets.
         readonly property var explicitTargets: effectiveUpdates
-            .filter(u => u.explicit_target === true && !ignoredUpdates[u.name])
+            .filter(u => u.explicit_target === true && rowPending(u) && !ignoredUpdates[u.name])
             .map(u => u.candidate_repo + "/" + u.name)
 
         // Lower-repo candidates start UNTICKED (opt-in per package):
@@ -286,7 +336,7 @@ ShellRoot {
 
             const keepOverrides = {};
             for (const u of updates)
-                if (repoOverrides[u.name])
+                if (repoOverrides[u.name] && !overrideInvalid(u, repoOverrides[u.name]))
                     keepOverrides[u.name] = repoOverrides[u.name];
             if (Object.keys(keepOverrides).length !== Object.keys(repoOverrides).length)
                 repoOverrides = keepOverrides;
@@ -364,14 +414,15 @@ ShellRoot {
                                     : "not loaded yet";
                             if (Syu.checking)
                                 return "checking…";
-                            if (win.updates.length === 0)
-                                return win.checkedAt > 0 ? "everything is up to date" : "no check yet";
-                            let s = win.updates.length + " update" + (win.updates.length === 1 ? "" : "s") + " available";
+                            const held = win.heldCount > 0 ? " · " + win.heldCount + " held" : "";
+                            if (win.pendingCount === 0)
+                                return win.checkedAt > 0 ? "everything is up to date" + held : "no check yet";
+                            let s = win.pendingCount + " update" + (win.pendingCount === 1 ? "" : "s") + " available";
                             if (win.repoChanges > 0)
                                 s += " — " + win.repoChanges + " change" + (win.repoChanges === 1 ? "s" : "") + " repository";
                             if (win.ignoredNames.length > 0)
                                 s += " · " + win.ignoredNames.length + " unticked";
-                            return s;
+                            return s + held;
                         }
                         color: win.currentTab === 0 && win.repoChanges > 0 ? Theme.warnAmber : Theme.textMuted
                         font.family: Theme.fontFamily
@@ -464,7 +515,8 @@ ShellRoot {
                             }
                         }
                         Text {
-                            text: win.selectedUpdateCount + " of " + win.updates.length + " ticked — unticked are ignored for this run only"
+                            text: win.selectedUpdateCount + " of " + win.pendingCount + " ticked — unticked are ignored for this run only"
+                                + (win.heldCount > 0 ? "; held ones are skipped by pacman.conf" : "")
                             color: Theme.textFaint
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 2
@@ -498,6 +550,8 @@ ShellRoot {
                                     required property var modelData
                                     update: modelData
                                     selected: !win.ignoredUpdates[modelData.name]
+                                    superseded: win.superseded(modelData)
+                                    lockedBy: win.lockedBy(modelData)
                                     onToggled: win.toggleIn("ignoredUpdates", modelData.name)
                                     onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" }, "updates")
                                 }
@@ -518,6 +572,8 @@ ShellRoot {
                                     required property var modelData
                                     update: modelData
                                     selected: !win.ignoredUpdates[modelData.name]
+                                    superseded: win.superseded(modelData)
+                                    lockedBy: win.lockedBy(modelData)
                                     onToggled: win.toggleIn("ignoredUpdates", modelData.name)
                                     onNameClicked: win.openDetail(modelData.name, { version: modelData.new_version, repo: modelData.candidate_repo, description: "" }, "updates")
                                 }
@@ -1016,19 +1072,19 @@ ShellRoot {
 
                         Text {
                             id: selectedBuildText
-                            readonly property var replacement: win.replacementFor(win.detailSelectedOption)
-                            readonly property bool blocked: win.replacementBlocked(win.detailSelectedOption)
+                            readonly property string blockedReason: win.upgradeBlockedReason(win.detailSelectedOption)
+                            readonly property bool blocked: blockedReason.length > 0
                             Layout.fillWidth: true
-                            text: blocked
-                                ? "Only " + replacement.candidate_repo + "/" + replacement.name + " replaces "
-                                    + replacement.replaces.map(r => r.name).join(", ") + "; this build would not."
+                            text: blocked ? blockedReason
                                 : win.detailRepoTarget.length > 0
                                 ? "Selected build: " + win.detailRepoTarget
                                 : "No repository build selected."
                             color: blocked ? Theme.warnAmber : Theme.textFaint
                             font.family: Theme.monoFamily
                             font.pixelSize: Theme.fontSize - 2
-                            elide: Text.ElideRight
+                            // The reason must be read whole ("…would not" loses its point when cut).
+                            wrapMode: blocked ? Text.WordWrap : Text.NoWrap
+                            elide: blocked ? Text.ElideNone : Text.ElideRight
                         }
                         PushButton {
                             label: win.detailContext === "updates" ? "Use for upgrade"

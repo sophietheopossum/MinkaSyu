@@ -58,10 +58,31 @@ fn main() {
     }
 }
 
+/// Why pacman.conf holds an update back, in words.
+fn held_reason(u: &check::Update) -> &'static str {
+    match u.held_by.as_deref() {
+        Some("usage") => "no repository with Usage = Upgrade has it",
+        _ => "IgnorePkg/IgnoreGroup",
+    }
+}
+
 fn print_summary(state: &State) {
     for u in &state.updates {
         let from = u.installed_repo.as_deref().unwrap_or("unknown source");
-        if !u.replaces.is_empty() {
+        if u.held {
+            println!("{} {} -> {}  [{}] (held: {})", u.name, u.old_version, u.new_version, u.candidate_repo, held_reason(u));
+        } else if !u.superseded_by.is_empty() {
+            println!(
+                "{} {} -> {}  [{}] (replaced by {})",
+                u.name,
+                u.old_version,
+                u.new_version,
+                u.candidate_repo,
+                u.superseded_by.join(", ")
+            );
+        } else if u.new_install {
+            println!("{} {}  [{}] (new package)", u.name, u.new_version, u.candidate_repo);
+        } else if !u.replaces.is_empty() {
             let replaced: Vec<String> = u.replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
             println!("{} {}  [{}] replaces {}", u.name, u.new_version, u.candidate_repo, replaced.join(", "));
         } else if u.explicit_target {
@@ -81,12 +102,14 @@ fn print_summary(state: &State) {
             println!("{} {} -> {}  [{}]", u.name, u.old_version, u.new_version, u.candidate_repo);
         }
     }
+    let held = state.held();
     println!(
-        "{} update{} ({} change{} repository)",
+        "{} update{} ({} change{} repository){}",
         state.total(),
         if state.total() == 1 { "" } else { "s" },
         state.repo_change_count,
-        if state.repo_change_count == 1 { "s" } else { "" }
+        if state.repo_change_count == 1 { "s" } else { "" },
+        if held > 0 { format!(", {held} held") } else { String::new() }
     );
 }
 
@@ -134,7 +157,7 @@ fn explicit_targets(state: &State, ignore: &[String]) -> Vec<String> {
     state
         .updates
         .iter()
-        .filter(|u| u.explicit_target && !ignore.contains(&u.name))
+        .filter(|u| u.explicit_target && u.pending() && !ignore.contains(&u.name))
         .map(|u| format!("{}/{}", u.candidate_repo, u.name))
         .collect()
 }
@@ -212,10 +235,20 @@ fn resolve_apply_targets(
         let Some(update) = state.updates.iter().find(|u| u.name == name) else {
             return Err(format!("upgrade target is not a pending update: {t}"));
         };
+        if update.held {
+            return Err(format!("{name} is held back by pacman.conf ({}): {t}", held_reason(update)));
+        }
+        // A replaced package's own update happens only once every
+        // replacement that removes it is unticked (ignored).
+        if let Some(by) = update.superseded_by.iter().find(|r| !ignore.contains(r)) {
+            return Err(format!("{name} is replaced by {by} in this run: {t}"));
+        }
         // A replacement happens only with the build that carries the
         // replaces entry. Any other repo's package of that name drops
         // the removal and ends in a conflict with the installed one.
-        if !update.replaces.is_empty() && repo != update.candidate_repo {
+        // (A later-repo row's own build is merely what ticking it would
+        // replace; choosing another build for it is an ordinary choice.)
+        if !update.explicit_target && !update.replaces.is_empty() && repo != update.candidate_repo {
             return Err(format!(
                 "{name} replaces {} only from {}, not from {repo}",
                 update.replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", "),
@@ -632,6 +665,11 @@ mod tests {
             first_repo: explicit.then(|| "cachyos-extra-v4".to_string()),
             first_version: explicit.then(|| "1-1".to_string()),
             replaces: Vec::new(),
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -670,6 +708,11 @@ mod tests {
             first_repo: None,
             first_version: None,
             replaces: Vec::new(),
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -714,6 +757,11 @@ mod tests {
                 version: "9.4_0.0.28-1".into(),
                 installed_repo: None,
             }],
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -729,6 +777,37 @@ mod tests {
         assert!(resolve_apply_targets(&state, &[], Some(&["minka/coreutils-uutils".into()])).is_ok());
         let err = resolve_apply_targets(&state, &[], Some(&["cachyos/coreutils-uutils".into()])).unwrap_err();
         assert!(err.contains("only from minka"), "{err}");
+        // A held update is shown but never targeted.
+        let mut held_state = state.clone();
+        held_state.updates[0].replaces.clear();
+        held_state.updates[0].held = true;
+        held_state.updates[0].held_by = Some("ignore".into());
+        assert_eq!(held_state.total(), 0);
+        assert_eq!(held_state.held(), 1);
+        assert!(resolve_apply_targets(&held_state, &[], Some(&["minka/coreutils-uutils".into()])).is_err());
+        // The replaced package's own row: only once the replacer is ignored.
+        let mut both = state.clone();
+        both.updates.push(check::Update {
+            name: "coreutils-hybrid".into(),
+            old_version: "9.4_0.0.28-1".into(),
+            new_version: "9.5-1".into(),
+            installed_repo: None,
+            candidate_repo: "minka".into(),
+            transition: check::Transition::UnknownSource,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+            replaces: Vec::new(),
+            held: false,
+            held_by: None,
+            superseded_by: vec!["coreutils-uutils".into()],
+            new_install: false,
+            reinstalls: Vec::new(),
+        });
+        assert_eq!(both.total(), 1);
+        let hybrid = ["minka/coreutils-hybrid".to_string()];
+        assert!(resolve_apply_targets(&both, &[], Some(&hybrid)).is_err());
+        assert!(resolve_apply_targets(&both, &["coreutils-uutils".into()], Some(&hybrid)).is_ok());
         // Unticking it is an ordinary --ignore, which skips the replacement.
         let argv = upgrade_argv(&["coreutils-uutils".into()]);
         assert_eq!(&argv[2..], ["paru", "-Syu", "--sudoloop", "--ignore=coreutils-uutils"]);

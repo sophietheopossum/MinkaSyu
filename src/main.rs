@@ -11,7 +11,13 @@
 //!   installed          list installed packages with origin + install reason
 //!   install [--dry-run] <pkg...>   open the terminal on `paru -S <pkg...>`
 //!   remove [--dry-run] <pkg...>    open the terminal on `paru -Rns <pkg...>`
-//!   serve              NDJSON over stdio for the Quickshell UI
+//!   sources [--refresh]
+//!                      MinkaPKG packages vs upstream, through
+//!                      `minkarepo check` (JSON; cached unless --refresh)
+//!   ui                 open the window: the AntiWebUI front end
+//!                      (minka-syu-gui), or Quickshell when it is missing
+//!                      or MINKA_SYU_FRONTEND=quickshell
+//!   serve              NDJSON over stdio for the UI
 //!                      (MinkaLink's protocol, verbatim)
 //!
 //! Applying updates is paru's job, never this binary's: no libalpm
@@ -22,9 +28,11 @@ mod alpm;
 mod appstream;
 mod catalog;
 mod check;
+mod sources;
 
 use check::{load_state, maybe_notify, run_check, State};
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -41,13 +49,15 @@ fn main() {
         "appstream" => cmd_appstream(rest.first().copied().unwrap_or("")),
         "install" => cmd_packages(true, rest.contains(&"--dry-run"), &positional(&rest)),
         "remove" => cmd_packages(false, rest.contains(&"--dry-run"), &positional(&rest)),
+        "sources" => cmd_sources(rest.contains(&"--refresh")),
+        "ui" => cmd_ui(),
         "serve" => {
             serve();
             Ok(())
         }
         other => {
             eprintln!(
-                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|serve)"
+                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|sources|ui|serve)"
             );
             std::process::exit(2);
         }
@@ -311,10 +321,23 @@ fn launch(argv: &[String], dry_run: bool) -> Result<(), String> {
         println!("{}", argv.join(" "));
         return Ok(());
     }
-    Command::new(&argv[0])
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    // Its own process group, so nothing that stops the window (a toolkit
+    // tears down its children by process group) can take a running paru
+    // or makepkg with it. Stdout is the serve pipe: never the terminal's.
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawning terminal '{}': {e}", argv[0]))?;
+    // Reaped in the background, or every launch would leave a zombie
+    // behind for the life of `serve`.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -409,6 +432,57 @@ fn cmd_repos(package: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn cmd_sources(refresh: bool) -> Result<(), String> {
+    let s = sources::sources(refresh)?;
+    println!("{}", serde_json::to_string_pretty(&s).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
+/// The front end binary: $MINKA_SYU_GUI, `minka-syu-gui` beside this
+/// binary (installed, both are in /usr/bin; in a checkout, gui/target
+/// is searched too), then PATH.
+fn find_gui() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("MINKA_SYU_GUI").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+        let beside = dir.join("minka-syu-gui");
+        if beside.is_file() {
+            return Some(beside);
+        }
+        // target/<profile>/minka-syu -> gui/target/<profile>/minka-syu-gui
+        if let (Some(profile), Some(root)) = (dir.file_name(), dir.parent().and_then(|t| t.parent())) {
+            let dev = root.join("gui/target").join(profile).join("minka-syu-gui");
+            if dev.is_file() {
+                return Some(dev);
+            }
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join("minka-syu-gui"))
+        .find(|p| p.is_file())
+}
+
+/// Replaces this process with the window, so whoever launched it (the
+/// shell's updates pill, the .desktop entry) owns the window process.
+fn cmd_ui() -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let quickshell = std::env::var("MINKA_SYU_FRONTEND").is_ok_and(|v| v == "quickshell");
+    if !quickshell {
+        if let Some(gui) = find_gui() {
+            let err = Command::new(&gui).exec();
+            eprintln!("minka-syu: {}: {err}; falling back to Quickshell", gui.display());
+        }
+    }
+    let dir = std::env::var("MINKA_SYU_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/usr/share/minka-syu/ui".to_string());
+    let err = Command::new("qs").args(["-p", &dir]).exec();
+    Err(format!("starting qs -p {dir}: {err}"))
 }
 
 fn cmd_installed() -> Result<(), String> {
@@ -564,6 +638,37 @@ fn dispatch(
             cmd_packages(false, false, &packages).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
+        "sources" => {
+            let refresh = params.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
+            let found = sources::sources(refresh).map_err(Error::internal)?;
+            serde_json::to_value(found).map_err(|e| Error::internal(e.to_string()))
+        }
+        "sources_track" => {
+            let package = params
+                .get("package")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_code("sources_track needs a package".to_string()))?;
+            if !valid_package_name(package) {
+                return Err(error_code(format!("invalid package name: {package:?}")));
+            }
+            let tracked = params
+                .get("tracked")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| error_code("sources_track needs tracked: true|false".to_string()))?;
+            let found = sources::set_tracked(package, tracked).map_err(error_code)?;
+            serde_json::to_value(found).map_err(|e| Error::internal(e.to_string()))
+        }
+        "sources_update" => {
+            let packages = string_array(params, "packages");
+            if packages.is_empty() {
+                return Err(error_code("sources_update needs packages".to_string()));
+            }
+            validate_names(&packages, "sources_update").map_err(error_code)?;
+            let minkarepo = sources::find_minkarepo()
+                .ok_or_else(|| error_code("no minkarepo found".to_string()))?;
+            launch(&sources::update_argv(&terminal(), &minkarepo, &packages), false).map_err(error_code)?;
+            Ok(serde_json::Value::Null)
+        }
         other => Err(Error::unknown_method(other)),
     }
 }
@@ -602,6 +707,12 @@ fn handle_line(state: &mut State, line: &str, out: &mut impl Write) {
     let _ = out.flush();
 }
 
+/// Methods that only run minkarepo (network, tens of seconds) get a
+/// thread of their own, so a slow sources check never holds up the
+/// update list. Every other method stays in order on the main loop:
+/// check, search and the catalog share the throwaway sync databases.
+const THREADED: &[&str] = &["sources", "sources_track"];
+
 fn serve() {
     let mut state = state_or_empty();
     let stdin = std::io::stdin();
@@ -610,6 +721,21 @@ fn serve() {
         let Ok(line) = line else { break };
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        let method = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|m| m.get("method").and_then(|v| v.as_str()).map(str::to_string));
+        if method.as_deref().is_some_and(|m| THREADED.contains(&m)) {
+            // Stdout's write_fmt holds its lock for the whole reply line,
+            // so replies from threads never interleave mid-line.
+            let line = line.to_string();
+            std::thread::spawn(move || {
+                let mut scratch = state_or_empty();
+                let mut out = std::io::stdout();
+                handle_line(&mut scratch, &line, &mut out);
+                let _ = out.flush();
+            });
             continue;
         }
         handle_line(&mut state, line, &mut out);

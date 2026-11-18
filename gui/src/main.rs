@@ -23,17 +23,63 @@ fn start_options() -> (Option<app::Tab>, Option<String>) {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let tab = value("--tab").and_then(|t| match t.as_str() {
+    let tab = value("--tab").and_then(|t| tab_named(&t));
+    (tab, value("--detail"))
+}
+
+fn tab_named(name: &str) -> Option<app::Tab> {
+    match name {
         "updates" => Some(app::Tab::Updates),
         "browse" => Some(app::Tab::Browse),
         "installed" => Some(app::Tab::Installed),
         "sources" => Some(app::Tab::Sources),
         _ => None,
+    }
+}
+
+/// `--shot <tab> <file.png>` writes that tab to a picture and exits: no
+/// window, no core, only the core's last saved answers (its state
+/// directory). For checking the look of the window. With `--busy` after
+/// the file, the tab is drawn as it looks while the core is working.
+fn shot() -> Option<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let at = args.iter().position(|a| a == "--shot")?;
+    let (Some(tab), Some(file)) = (args.get(at + 1).and_then(|t| tab_named(t)), args.get(at + 2))
+    else {
+        eprintln!("usage: minka-syu-gui --shot updates|browse|installed|sources <file.png>");
+        return Some(2);
+    };
+    let busy = args.iter().any(|a| a == "--busy");
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state")))
+        .unwrap_or_default()
+        .join("minka-syu");
+    let drawn = anti_webui::app::headless::render_png(file, 1100, 875, 1.25, move || {
+        theme::install_widget_theme();
+        let app = app::App::new();
+        app.load_saved(&dir, tab);
+        if busy {
+            app.checking.set(true);
+            app.searching.set(true);
+            app.installed_loading.set(true);
+            app.sources_loading.set(true);
+        }
+        views::root(app)
     });
-    (tab, value("--detail"))
+    match drawn {
+        Ok(()) => Some(0),
+        Err(e) => {
+            eprintln!("minka-syu-gui: {e}");
+            Some(1)
+        }
+    }
 }
 
 fn main() {
+    if let Some(code) = shot() {
+        std::process::exit(code);
+    }
     if let instance::Claim::Duplicate = instance::claim() {
         // The running window raises itself on our probe.
         return;

@@ -191,6 +191,24 @@ impl App {
         }
     }
 
+    /// Fills the window from the core's saved answers in `dir` (its state
+    /// directory), without starting the core: what `--shot` draws. Reads
+    /// two files and asks nothing of anyone.
+    pub fn load_saved(self, dir: &std::path::Path, tab: Tab) {
+        let saved = |file: &str| {
+            std::fs::read_to_string(dir.join(file))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        };
+        if let Some(v) = saved("state.json") {
+            self.set_state(v);
+        }
+        if let Some(v) = saved("sources.json") {
+            self.set_sources(parse(v));
+        }
+        self.tab.set(tab);
+    }
+
     fn tick_clock(self) {
         set_timeout(Duration::from_secs(60), move || {
             if !self.now.is_alive() {

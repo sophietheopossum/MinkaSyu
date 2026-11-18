@@ -1,9 +1,15 @@
-//! Proustite tokens and the few controls the window draws itself. The
-//! values mirror the shared Proustite QML singleton (MinkaSyu's
+//! Proustite tokens, the Material 3 Expressive color scheme made from them,
+//! and the window's controls: AntiWebUI's md3e components in that scheme.
+//! The token values mirror the shared Proustite QML singleton (MinkaSyu's
 //! ui/services/Theme.qml facade); keep them in sync with
 //! ../../Proustite/Proustite.qml, as MinkaMon's and MinkaShell's theme.rs do.
 
 use anti_webui::prelude::*;
+use anti_webui_md3e::components::{
+    ButtonSize, ButtonStyle, CheckboxStyle, connected_button_group, filter_chip,
+    indeterminate_wavy_progress, styled_button, styled_checkbox,
+};
+use anti_webui_md3e::{ColorScheme, set_color_scheme};
 use std::rc::Rc;
 
 pub const GROUND: u32 = 0x0a0709;
@@ -21,7 +27,9 @@ pub const GAUGE_DIM: u32 = 0x3a1219;
 pub const OK_GREEN: u32 = 0x7dc98c;
 pub const WARN_AMBER: u32 = 0xe0a026;
 
-pub const FONT_FAMILY: &str = "Noto Sans";
+/// The md3e components set their own labels in this family (Roboto Flex,
+/// which comes with the crate), so the rest of the window uses it too.
+pub const FONT_FAMILY: &str = anti_webui_md3e::typography::FONT_FAMILY;
 pub const MONO_FAMILY: &str = "monospace";
 pub const FONT_SIZE: f32 = 13.0_f32;
 
@@ -33,8 +41,48 @@ pub fn color_alpha(hex: u32, alpha: f32) -> Color {
     Color::from_rgb(hex).with_alpha(alpha.clamp(0.0_f32, 1.0_f32))
 }
 
-/// The toolkit's own widgets (text fields) default to a light theme.
+/// Proustite's tokens in Material's color roles: what the md3e components
+/// draw with. The roles Proustite has no token for (the error ones and the
+/// scrim) are the ones Material grows from Proustite's red.
+pub fn proustite_scheme() -> ColorScheme {
+    ColorScheme {
+        primary: color(RED),
+        on_primary: color(GROUND),
+        primary_container: color(RED_DIM),
+        on_primary_container: color(TEXT),
+        secondary: color(PURPLE),
+        on_secondary: color(GROUND),
+        secondary_container: color(PURPLE_DIM),
+        on_secondary_container: color(TEXT),
+        tertiary: color(WARN_AMBER),
+        on_tertiary: color(GROUND),
+        tertiary_container: color(GAUGE_DIM),
+        on_tertiary_container: color(TEXT),
+        surface: color(GROUND),
+        surface_dim: color(GROUND),
+        surface_bright: color(LINE),
+        surface_variant: color(SURFACE_RAISED),
+        on_surface: color(TEXT),
+        on_surface_variant: color(TEXT_MUTED),
+        inverse_surface: color(TEXT),
+        inverse_on_surface: color(GROUND),
+        inverse_primary: color(RED_DIM),
+        surface_container_lowest: color(GROUND),
+        surface_container_low: color(SURFACE),
+        surface_container: color(SURFACE),
+        surface_container_high: color(SURFACE_RAISED),
+        surface_container_highest: color(LINE),
+        outline: color(TEXT_FAINT),
+        outline_variant: color(LINE),
+        ..ColorScheme::from_seed(color(RED), true)
+    }
+}
+
+/// The colors of both widget sets: the md3e components take the scheme, and
+/// the toolkit's own widgets (text fields), which default to a light theme,
+/// take the theme below.
 pub fn install_widget_theme() {
+    set_color_scheme(proustite_scheme());
     set_theme(Theme {
         page: color(GROUND),
         surface: color(SURFACE),
@@ -84,122 +132,95 @@ pub fn section_label(label: &str) -> Text {
     ui_text(label.to_string(), FONT_SIZE - 3.0_f32, TEXT_FAINT).bold()
 }
 
-/// The QML PushButton: quiet, toggled (purple), or primary (red).
+/// A button: outlined, or filled in the primary color for the main action.
+/// The smallest md3e size (32 px), since the window is dense.
 pub fn push_button(
     label: impl Fn() -> String + 'static,
     primary: bool,
-    toggled: impl Fn() -> bool + 'static,
     enabled: impl Fn() -> bool + 'static,
     on_click: impl Fn() + 'static,
 ) -> Div {
     let enabled = Rc::new(enabled);
-    let for_click = Rc::clone(&enabled);
-    let hovered = signal(false);
-    div()
-        .h(30.0_f32)
-        .px(13.0_f32)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .rounded(5.0_f32)
-        .border(1.0_f32)
-        .select_none()
-        .on_hover(move |on| hovered.set_if_changed(on))
-        .dyn_style(move |s| {
-            let on = enabled();
-            let hover = on && hovered.get();
-            let s = s.opacity(if on { 1.0_f32 } else { 0.4_f32 }).cursor(if on {
-                CursorIcon::Pointer
-            } else {
-                CursorIcon::Default
-            });
-            if !on {
-                s.bg(color(SURFACE))
-                    .border_color(color(if primary { RED } else { LINE }))
-            } else if primary {
-                s.bg(color(if hover { RED } else { RED_DIM }))
-                    .border_color(color(RED))
-            } else if toggled() {
-                s.bg(color(PURPLE_DIM)).border_color(color(PURPLE))
-            } else {
-                s.bg(color(if hover { SURFACE_RAISED } else { SURFACE }))
-                    .border_color(color(LINE))
-            }
-        })
-        .on_click(move |e: &PointerEvent| {
-            e.stop_propagation();
-            if for_click() {
-                on_click();
-            }
-        })
-        .child(ui_text(label, FONT_SIZE - 1.0_f32, TEXT).whitespace_nowrap())
+    let off = Rc::clone(&enabled);
+    let style = if primary {
+        ButtonStyle::filled()
+    } else {
+        ButtonStyle::outlined()
+    };
+    styled_button(
+        label,
+        style
+            .size(ButtonSize::ExtraSmall)
+            .disabled_when(move || !off()),
+    )
+    .flex_none()
+    .on_click(move |e: &PointerEvent| {
+        e.stop_propagation();
+        if enabled() {
+            on_click();
+        }
+    })
 }
 
-/// The QML CheckBox: 18 px box, purple when ticked, faded when disabled.
+/// Buttons that touch, of which the one that is on takes a shape of its own:
+/// the tabs. `is_on` and `pick` go by position.
+pub fn segmented(
+    labels: Vec<&'static str>,
+    is_on: impl Fn(usize) -> bool + 'static,
+    pick: impl Fn(usize) + 'static,
+) -> Div {
+    connected_button_group(
+        labels,
+        ButtonStyle::tonal().size(ButtonSize::ExtraSmall),
+        is_on,
+        pick,
+    )
+}
+
+/// A chip that is on or off: a filter over a list.
+pub fn filter_toggle(label: &'static str, on: Signal<bool>) -> Div {
+    filter_chip(label, on).flex_none()
+}
+
+/// The wavy line of something that takes as long as it takes, across the
+/// width it is given. It is drawn into the gap under it (the bottom margin
+/// takes its height back), so it costs the layout nothing and what is below
+/// does not move when it comes and goes.
+pub fn busy_strip(busy: impl Fn() -> bool + 'static) -> Div {
+    div()
+        .w_full()
+        .h(BUSY_H)
+        .mb(-BUSY_H)
+        .flex_none()
+        .child(show(busy, || indeterminate_wavy_progress().w_full()))
+}
+
+/// The height of md3e's wavy progress bar.
+const BUSY_H: f32 = 10.0_f32;
+
+/// md3e's checkbox keeps a 48 px box for touch, with its 20 px mark and its
+/// hover circle centred in it. A list row should stay as high as its text,
+/// so the whole 48 px box sits in a 26 px slot and hangs over it evenly:
+/// shrinking the box itself would leave the hover circle off-centre.
+const CHECK_TOUCH: f32 = 48.0_f32;
+const CHECK_SLOT: f32 = 26.0_f32;
 pub fn check_box(
     checked: impl Fn() -> bool + 'static,
     enabled: impl Fn() -> bool + 'static,
     on_toggle: impl Fn() + 'static,
 ) -> Div {
-    let checked = Rc::new(checked);
-    let for_mark = Rc::clone(&checked);
     let enabled = Rc::new(enabled);
-    let for_click = Rc::clone(&enabled);
-    let hovered = signal(false);
-    div()
-        .w(26.0_f32)
-        .h(26.0_f32)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .select_none()
-        .on_hover(move |on| hovered.set_if_changed(on))
-        .dyn_style(move |s| {
-            let on = enabled();
-            s.opacity(if on { 1.0_f32 } else { 0.35_f32 })
-                .cursor(if on {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                })
-        })
-        .on_click(move |e: &PointerEvent| {
-            e.stop_propagation();
-            if for_click() {
+    let off = Rc::clone(&enabled);
+    styled_checkbox(
+        Binding::new(checked, move |_| {
+            if enabled() {
                 on_toggle();
             }
-        })
-        .child(
-            div()
-                .w(18.0_f32)
-                .h(18.0_f32)
-                .rounded(4.0_f32)
-                .border(1.0_f32)
-                .flex()
-                .items_center()
-                .justify_center()
-                .dyn_style(move |s| {
-                    if checked() {
-                        s.bg(color(PURPLE_DIM)).border_color(color(PURPLE))
-                    } else {
-                        s.bg(color(SURFACE)).border_color(color(if hovered.get() {
-                            TEXT_MUTED
-                        } else {
-                            LINE
-                        }))
-                    }
-                })
-                .child(
-                    ui_text(
-                        move || if for_mark() { "✓" } else { "" },
-                        FONT_SIZE - 2.0_f32,
-                        TEXT,
-                    )
-                    .bold(),
-                ),
-        )
+        }),
+        CheckboxStyle::new().disabled_when(move || !off()),
+    )
+    .flex_none()
+    .m((CHECK_SLOT - CHECK_TOUCH) / 2.0_f32)
 }
 
 /// A filled marker: what in a list deserves attention at a glance.

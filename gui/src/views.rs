@@ -48,7 +48,24 @@ pub fn root(app: App) -> Div {
                 .flex()
                 .flex_col()
                 .gap(12.0_f32)
-                .child(header(app))
+                .child(
+                    // The busy line sits close under the header, as part of it.
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .gap(2.0_f32)
+                        .child(header(app))
+                        .child(busy_strip(move || match app.tab.get() {
+                            Tab::Updates => {
+                                app.checking.get() || app.state.with(|s| s.is_none())
+                            }
+                            Tab::Browse => app.searching.get(),
+                            Tab::Installed => app.installed_loading.get(),
+                            Tab::Sources => app.sources_loading.get(),
+                        })),
+                )
                 .child(error_bar(app))
                 .child(body),
         )
@@ -186,13 +203,24 @@ fn age_line(app: App) -> String {
     }
 }
 
-fn tab_button(app: App, label: &'static str, tab: Tab) -> Div {
-    push_button(
-        move || label.to_string(),
-        false,
-        move || app.tab.get() == tab,
-        || true,
-        move || {
+/// The tabs as one connected group. Sources is there only when the core
+/// found MinkaPKG's `minkarepo`.
+fn tab_switch(app: App, with_sources: bool) -> Div {
+    let mut tabs = vec![
+        ("Updates", Tab::Updates),
+        ("Browse", Tab::Browse),
+        ("Installed", Tab::Installed),
+    ];
+    if with_sources {
+        tabs.push(("Sources", Tab::Sources));
+    }
+    let order: Rc<[Tab]> = tabs.iter().map(|t| t.1).collect();
+    let shown = Rc::clone(&order);
+    segmented(
+        tabs.iter().map(|t| t.0).collect(),
+        move |i| app.tab.get() == shown[i],
+        move |i| {
+            let tab = order[i];
             app.tab.set(tab);
             if tab == Tab::Installed && !app.installed_loaded.get_untracked() {
                 app.load_installed();
@@ -202,6 +230,12 @@ fn tab_button(app: App, label: &'static str, tab: Tab) -> Div {
 }
 
 fn header(app: App) -> Div {
+    // A memo, so the tabs are built again only when Sources comes or goes,
+    // not on every answer about the sources.
+    let has_sources = memo(move || {
+        app.sources
+            .with(|s| s.as_ref().is_some_and(|s| s.available))
+    });
     div()
         .w_full()
         .flex()
@@ -243,16 +277,8 @@ fn header(app: App) -> Div {
                     TEXT_FAINT,
                 )),
         )
-        .child(tab_button(app, "Updates", Tab::Updates))
-        .child(tab_button(app, "Browse", Tab::Browse))
-        .child(tab_button(app, "Installed", Tab::Installed))
-        .child(show(
-            move || {
-                app.sources
-                    .with(|s| s.as_ref().is_some_and(|s| s.available))
-            },
-            move || tab_button(app, "Sources", Tab::Sources),
-        ))
+        // The tab's own button goes before the tabs, which then stay where
+        // they are (at the right edge) on every tab.
         .child(show(
             move || app.tab.get() == Tab::Updates,
             move || {
@@ -265,7 +291,6 @@ fn header(app: App) -> Div {
                         }
                     },
                     false,
-                    || false,
                     move || !app.checking.get(),
                     move || app.recheck(),
                 )
@@ -283,12 +308,15 @@ fn header(app: App) -> Div {
                         }
                     },
                     false,
-                    || false,
                     move || !app.sources_loading.get(),
                     move || app.load_sources(true),
                 )
             },
         ))
+        .child(dyn_view(move || {
+            let with_sources = has_sources.get();
+            untrack(|| tab_switch(app, with_sources))
+        }))
 }
 
 /// Failures keep the old data on screen, so the failure has to show
@@ -646,14 +674,12 @@ fn updates_tab(app: App) -> Div {
                 .child(push_button(
                     || "Tick all".into(),
                     false,
-                    || false,
                     || true,
                     move || app.tick_all(),
                 ))
                 .child(push_button(
                     || "Untick all".into(),
                     false,
-                    || false,
                     || true,
                     move || app.untick_all(),
                 ))
@@ -677,7 +703,6 @@ fn updates_tab(app: App) -> Div {
             vec![push_button(
                 || "Update…".into(),
                 true,
-                || false,
                 move || app.updates_view().selected > 0 && !app.checking.get(),
                 move || app.apply(),
             )],
@@ -890,7 +915,6 @@ fn browse_tab(app: App) -> Div {
                         }
                     },
                     false,
-                    || false,
                     move || !app.searching.get() && app.query.with(|q| !q.trim().is_empty()),
                     move || app.search(),
                 )),
@@ -924,14 +948,12 @@ fn browse_tab(app: App) -> Div {
                 push_button(
                     || "Clear".into(),
                     false,
-                    || false,
                     move || app.install_sel.with(|s| !s.is_empty()),
                     move || app.install_sel.set(Default::default()),
                 ),
                 push_button(
                     || "Install…".into(),
                     true,
-                    || false,
                     move || app.install_sel.with(|s| !s.is_empty()),
                     move || app.install(picked()),
                 ),
@@ -1003,13 +1025,7 @@ fn installed_tab(app: App) -> Div {
                         .flex_1()
                         .min_w(0.0_f32),
                 )
-                .child(push_button(
-                    || "Explicit only".into(),
-                    false,
-                    move || app.explicit_only.get(),
-                    || true,
-                    move || app.explicit_only.update(|e| *e = !*e),
-                ))
+                .child(filter_toggle("Explicit only", app.explicit_only))
                 .child(push_button(
                     move || {
                         if app.installed_loading.get() {
@@ -1019,7 +1035,6 @@ fn installed_tab(app: App) -> Div {
                         }
                     },
                     false,
-                    || false,
                     move || !app.installed_loading.get(),
                     move || app.load_installed(),
                 )),
@@ -1056,14 +1071,12 @@ fn installed_tab(app: App) -> Div {
                 push_button(
                     || "Clear".into(),
                     false,
-                    || false,
                     move || app.remove_sel.with(|s| !s.is_empty()),
                     move || app.remove_sel.set(Default::default()),
                 ),
                 push_button(
                     || "Remove…".into(),
                     true,
-                    || false,
                     move || app.remove_sel.with(|s| !s.is_empty()),
                     move || app.remove(picked()),
                 ),
@@ -1318,7 +1331,6 @@ fn sources_tab(app: App) -> Div {
                 .child(push_button(
                     || "Tick all with work".into(),
                     false,
-                    || false,
                     move || actionable_count() > 0,
                     move || {
                         let all = app.sources.with_untracked(|s| {
@@ -1338,7 +1350,6 @@ fn sources_tab(app: App) -> Div {
                 .child(push_button(
                     || "Untick all".into(),
                     false,
-                    || false,
                     move || app.source_sel.with(|s| !s.is_empty()),
                     move || app.source_sel.set(Default::default()),
                 ))
@@ -1363,7 +1374,6 @@ fn sources_tab(app: App) -> Div {
             vec![push_button(
                 || "Update & publish…".into(),
                 true,
-                || false,
                 move || app.source_sel.with(|s| !s.is_empty()),
                 move || app.update_sources(),
             )],
@@ -1525,7 +1535,6 @@ fn detail_overlay(app: App) -> Div {
         .child(push_button(
             || "Close".into(),
             false,
-            || false,
             || true,
             move || app.close_detail(),
         ));
@@ -1668,7 +1677,6 @@ fn detail_overlay(app: App) -> Div {
         .child(push_button(
             action_label,
             false,
-            || false,
             move || app.selected_option().is_some() && app.blocked_reason().is_none(),
             move || app.choose_detail_repo(),
         ));

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anti-webui = { git = "https://github.com/bea4dev/AntiWebUI", rev = "25e82a1d2a7a08658f0eede14cde47b34cce40a6", default-features = false, features = ["wayland", "svg"] }
+anti-webui-md3e = { git = "https://github.com/bea4dev/AntiWebUI", rev = "25e82a1d2a7a08658f0eede14cde47b34cce40a6" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

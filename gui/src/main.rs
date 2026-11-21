@@ -40,7 +40,9 @@ fn tab_named(name: &str) -> Option<app::Tab> {
 /// `--shot <tab> <file.png>` writes that tab to a picture and exits: no
 /// window, no core, only the core's last saved answers (its state
 /// directory). For checking the look of the window. With `--busy` after
-/// the file, the tab is drawn as it looks while the core is working.
+/// the file, the tab is drawn as it looks while the core is working; with
+/// `--run <result.json>` (once per card), with the card of that step's
+/// result.
 fn shot() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let at = args.iter().position(|a| a == "--shot")?;
@@ -50,6 +52,13 @@ fn shot() -> Option<i32> {
         return Some(2);
     };
     let busy = args.iter().any(|a| a == "--busy");
+    let runs: Vec<std::path::PathBuf> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--run")
+        .filter_map(|(i, _)| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+        .collect();
     let dir = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state")))
@@ -59,6 +68,9 @@ fn shot() -> Option<i32> {
         theme::install_widget_theme();
         let app = app::App::new();
         app.load_saved(&dir, tab);
+        for file in &runs {
+            app.load_run(file);
+        }
         if busy {
             app.checking.set(true);
             app.searching.set(true);

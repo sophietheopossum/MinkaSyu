@@ -559,6 +559,72 @@ pub fn source_status_text(r: &SourceRow) -> String {
     }
 }
 
+// ---- how a step in the terminal ended -------------------------------------
+
+/// The core's {event:"run"}: how an upgrade, install or removal that ran in
+/// the terminal ended (minka-syu's RunResult). The terminal may have closed
+/// by the time anyone reads this, so this may be all that is left of its
+/// output.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct RunReport {
+    /// Which step: its result file's stem. Two can run at once.
+    pub id: String,
+    pub step: String,
+    pub command: Vec<String>,
+    pub ok: bool,
+    /// Turned down at a question, or Ctrl+C: not ok, but her own doing.
+    pub cancelled: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub headline: String,
+    pub excerpt: Vec<String>,
+    pub tail: Vec<String>,
+    pub log: String,
+}
+
+impl RunReport {
+    /// Worth showing: a failure, or any outcome whose output has error
+    /// lines (a pacman hook that failed does not fail the transaction). A
+    /// cancel is not (the core's needs_attention).
+    pub fn worth_showing(&self) -> bool {
+        (!self.ok && !self.cancelled) || !self.excerpt.is_empty()
+    }
+
+    /// The output the report keeps, as one block: the error lines, then
+    /// what came after the last of them.
+    pub fn output_text(&self) -> String {
+        let mut out = self.excerpt.join("\n");
+        if !self.tail.is_empty() {
+            if !out.is_empty() {
+                out += "\n\n── after that ──\n";
+            }
+            out += &self.tail.join("\n");
+        }
+        if out.is_empty() {
+            out = "(no output was recorded)".into();
+        }
+        out
+    }
+}
+
+/// Files a step's report among the cards: newest first, one per step. A
+/// report only ever replaces its own step's card, so one step ending
+/// cleanly never takes away another's failure.
+pub fn record_run(cards: &mut Vec<RunReport>, report: RunReport) {
+    if !report.id.is_empty() {
+        cards.retain(|c| c.id != report.id);
+    }
+    if report.worth_showing() {
+        cards.insert(0, report);
+    }
+}
+
+/// Takes away the card of one report.
+pub fn dismiss_run(cards: &mut Vec<RunReport>, report: &RunReport) {
+    cards.retain(|c| c != report);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +821,78 @@ mod tests {
         // A new version is a version bump, not a revision.
         assert_eq!(next_revision(&rev("0.6.0-1", "0.7.0", "abc")), None);
         assert_eq!(next_revision(&rev("0.6.0-1", "0.6.0", "")), None);
+    }
+
+    #[test]
+    fn run_reports_show_failures_and_error_lines() {
+        let payload = serde_json::json!({
+            "step": "install",
+            "command": ["paru", "-S", "--sudoloop", "--", "foo"],
+            "ok": false,
+            "exit_code": 1,
+            "signal": null,
+            "headline": "Install failed: paru exited with status 1",
+            "excerpt": ["error: target not found: foo"],
+            "tail": [],
+            "log": "/s/runs/install-1.log"
+        });
+        let r: RunReport = serde_json::from_value(payload).unwrap();
+        assert!(r.worth_showing());
+        assert_eq!(r.output_text(), "error: target not found: foo");
+
+        // A clean success needs no card; one with error lines does.
+        let clean = RunReport { ok: true, ..Default::default() };
+        assert!(!clean.worth_showing());
+        let hooks = RunReport {
+            ok: true,
+            excerpt: vec!["error: command failed to execute correctly".into()],
+            tail: vec!["(4/4) Arming ConditionNeedsUpdate...".into()],
+            ..Default::default()
+        };
+        assert!(hooks.worth_showing());
+        assert_eq!(
+            hooks.output_text(),
+            "error: command failed to execute correctly\n\n── after that ──\n(4/4) Arming ConditionNeedsUpdate..."
+        );
+        // A cancel at a question is not.
+        let cancelled = RunReport { ok: false, cancelled: true, ..Default::default() };
+        assert!(!cancelled.worth_showing());
+        // A step that never reported still says something.
+        let lost = RunReport { ok: false, ..Default::default() };
+        assert!(lost.worth_showing());
+        assert_eq!(lost.output_text(), "(no output was recorded)");
+    }
+
+    #[test]
+    fn a_step_s_report_leaves_other_steps_cards_alone() {
+        let failed = RunReport {
+            id: "install-1".into(),
+            step: "install".into(),
+            exit_code: Some(1),
+            excerpt: vec!["error: failed to build 'foo-1-1':".into()],
+            ..Default::default()
+        };
+        let hooks = RunReport {
+            id: "apply-2".into(),
+            step: "apply".into(),
+            ok: true,
+            excerpt: vec!["Error! Bad return status for module build".into()],
+            ..Default::default()
+        };
+        let mut cards = Vec::new();
+        record_run(&mut cards, failed.clone());
+        record_run(&mut cards, hooks.clone());
+        assert_eq!(cards, [hooks.clone(), failed.clone()]);
+        // Another step that ended cleanly, or was cancelled, takes nothing away.
+        record_run(&mut cards, RunReport { id: "install-3".into(), ok: true, ..Default::default() });
+        record_run(&mut cards, RunReport { id: "remove-4".into(), cancelled: true, ..Default::default() });
+        assert_eq!(cards, [hooks.clone(), failed.clone()]);
+        // A step reported again replaces its own card only.
+        let again = RunReport { headline: "again".into(), ..failed.clone() };
+        record_run(&mut cards, again.clone());
+        assert_eq!(cards, [again.clone(), hooks.clone()]);
+        // Each card goes on its own.
+        dismiss_run(&mut cards, &hooks);
+        assert_eq!(cards, [again]);
     }
 }

@@ -7,7 +7,7 @@
 use anti_webui::prelude::*;
 use anti_webui_md3e::components::{
     ButtonSize, ButtonStyle, CheckboxStyle, connected_button_group, filter_chip,
-    indeterminate_wavy_progress, styled_button, styled_checkbox,
+    indeterminate_wavy_progress, outlined_card, styled_button, styled_checkbox,
 };
 use anti_webui_md3e::{ColorScheme, set_color_scheme};
 use std::rc::Rc;
@@ -221,6 +221,13 @@ pub fn check_box(
     )
     .flex_none()
     .m((CHECK_SLOT - CHECK_TOUCH) / 2.0_f32)
+}
+
+/// md3e's outlined card, its outline in `hex`: something to read before it
+/// is dismissed. The card sets its outline in a dyn_style of its own, which
+/// a plain style loses to, so the colour goes in one appended after it.
+pub fn outlined_card_in(hex: u32) -> Div {
+    outlined_card().dyn_style(move |s| s.border_color(color(hex)))
 }
 
 /// A filled marker: what in a list deserves attention at a glance.

@@ -19,15 +19,22 @@
 //!                      or MINKA_SYU_FRONTEND=quickshell
 //!   serve              NDJSON over stdio for the UI
 //!                      (MinkaLink's protocol, verbatim)
+//!   run --step <s> --result <f> -- <command...>
+//!                      what the terminal of apply/install/remove runs:
+//!                      the command, recorded, and how it ended (run.rs)
 //!
 //! Applying updates is paru's job, never this binary's: no libalpm
 //! transactions happen here, so a check can never leave partial-upgrade
-//! state behind.
+//! state behind. What this binary does see is how paru ended: apply,
+//! install and remove wait for it and report a failure (its status and
+//! its error lines) on stderr with a non-zero exit, and `serve` sends it
+//! to the window as {event:"run"}.
 
 mod alpm;
 mod appstream;
 mod catalog;
 mod check;
+mod run;
 mod sources;
 
 use check::{load_state, maybe_notify, run_check, State};
@@ -47,10 +54,14 @@ fn main() {
         "repos" => cmd_repos(rest.first().copied().unwrap_or("")),
         "installed" => cmd_installed(),
         "appstream" => cmd_appstream(rest.first().copied().unwrap_or("")),
-        "install" => cmd_packages(true, rest.contains(&"--dry-run"), &positional(&rest)),
-        "remove" => cmd_packages(false, rest.contains(&"--dry-run"), &positional(&rest)),
+        "install" => cmd_packages(true, rest.contains(&"--dry-run"), &positional(&rest), Report::Wait),
+        "remove" => cmd_packages(false, rest.contains(&"--dry-run"), &positional(&rest), Report::Wait),
         "sources" => cmd_sources(rest.contains(&"--refresh")),
         "ui" => cmd_ui(),
+        "run" => match run::run_verb(&rest) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        },
         "serve" => {
             serve();
             Ok(())
@@ -316,23 +327,29 @@ pub fn remove_argv(packages: &[String]) -> Vec<String> {
     argv
 }
 
-fn launch(argv: &[String], dry_run: bool) -> Result<(), String> {
-    if dry_run {
-        println!("{}", argv.join(" "));
-        return Ok(());
-    }
+fn spawn_terminal(argv: &[String]) -> Result<std::process::Child, String> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     // Its own process group, so nothing that stops the window (a toolkit
     // tears down its children by process group) can take a running paru
     // or makepkg with it. Stdout is the serve pipe: never the terminal's.
-    let mut child = Command::new(&argv[0])
+    Command::new(&argv[0])
         .args(&argv[1..])
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .spawn()
-        .map_err(|e| format!("spawning terminal '{}': {e}", argv[0]))?;
+        .map_err(|e| format!("spawning terminal '{}': {e}", argv[0]))
+}
+
+/// Opens a terminal nobody waits on (the MinkaPKG bump, which holds its
+/// own window open at the end).
+fn launch(argv: &[String], dry_run: bool) -> Result<(), String> {
+    if dry_run {
+        println!("{}", argv.join(" "));
+        return Ok(());
+    }
+    let mut child = spawn_terminal(argv)?;
     // Reaped in the background, or every launch would leave a zombie
     // behind for the life of `serve`.
     std::thread::spawn(move || {
@@ -341,8 +358,61 @@ fn launch(argv: &[String], dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Who hears how a step in the terminal ended.
+#[derive(Clone, Copy)]
+enum Report {
+    /// The CLI: wait for it; a failure goes to stderr and the exit status.
+    Wait,
+    /// `serve`: the window, as {event:"run"}, from a thread of its own.
+    Broadcast,
+}
+
+/// Opens the terminal on `argv` ([terminal, -e, paru…]) with paru run
+/// through `minka-syu run`, and reports how it ended.
+fn launch_step(argv: &[String], step: &str, dry_run: bool, report: Report) -> Result<(), String> {
+    if dry_run {
+        println!("{}", argv.join(" "));
+        return Ok(());
+    }
+    let result = run::new_run(&run::runs_dir(), step)
+        .map_err(|e| format!("cannot prepare {}: {e}", run::runs_dir().display()))?;
+    let wrapped = run::wrap(argv, &run::self_exe(), step, &result);
+    let mut child = spawn_terminal(&wrapped)?;
+    let command: Vec<String> = argv.iter().skip(2).cloned().collect();
+    let step = step.to_string();
+    match report {
+        Report::Wait => {
+            let r = run::await_result(&mut child, &result, &step, &command, &run::Waiting::default());
+            if !r.ok {
+                return Err(run::report_text(&r));
+            }
+            if !r.excerpt.is_empty() {
+                eprintln!("minka-syu: {}", run::report_text(&r));
+            }
+            // A failed step's window may still be open, held for Enter: it
+            // is not ours to wait on, and this process ends here anyway.
+            drop(child);
+            Ok(())
+        }
+        Report::Broadcast => {
+            std::thread::spawn(move || {
+                let r = run::await_result(&mut child, &result, &step, &command, &run::Waiting::default());
+                let event = serde_json::json!({ "event": "run", "payload": r });
+                // One locked write per line: replies from other threads
+                // never land in the middle of it.
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{event}");
+                let _ = out.flush();
+                drop(out);
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+    }
+}
+
 fn cmd_apply_state(dry_run: bool, ignore: &[String], state: &State) -> Result<(), String> {
-    cmd_apply_state_targets(dry_run, ignore, None, state)
+    cmd_apply_state_targets(dry_run, ignore, None, state, Report::Wait)
 }
 
 fn cmd_apply_state_targets(
@@ -350,26 +420,27 @@ fn cmd_apply_state_targets(
     ignore: &[String],
     requested: Option<&[String]>,
     state: &State,
+    report: Report,
 ) -> Result<(), String> {
     if !ignore.is_empty() {
         validate_names(ignore, "--ignore")?;
     }
     let targets = resolve_apply_targets(state, ignore, requested)?;
-    launch(&upgrade_argv_with_targets(ignore, &targets), dry_run)
+    launch_step(&upgrade_argv_with_targets(ignore, &targets), "apply", dry_run, report)
 }
 
 fn cmd_apply(dry_run: bool, ignore: &[String]) -> Result<(), String> {
     cmd_apply_state(dry_run, ignore, &state_or_empty())
 }
 
-fn cmd_packages(install: bool, dry_run: bool, packages: &[String]) -> Result<(), String> {
+fn cmd_packages(install: bool, dry_run: bool, packages: &[String], report: Report) -> Result<(), String> {
     if install {
         validate_install_targets(packages)?;
     } else {
         validate_names(packages, "remove")?;
     }
     let argv = if install { install_argv(packages) } else { remove_argv(packages) };
-    launch(&argv, dry_run)
+    launch_step(&argv, if install { "install" } else { "remove" }, dry_run, report)
 }
 
 fn cmd_search(query: &str) -> Result<(), String> {
@@ -589,7 +660,7 @@ fn dispatch(
             } else {
                 None
             };
-            cmd_apply_state_targets(false, &ignore, requested_ref, state).map_err(error_code)?;
+            cmd_apply_state_targets(false, &ignore, requested_ref, state, Report::Broadcast).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
         "search" => {
@@ -630,12 +701,12 @@ fn dispatch(
         }
         "install" => {
             let packages = string_array(params, "packages");
-            cmd_packages(true, false, &packages).map_err(error_code)?;
+            cmd_packages(true, false, &packages, Report::Broadcast).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
         "remove" => {
             let packages = string_array(params, "packages");
-            cmd_packages(false, false, &packages).map_err(error_code)?;
+            cmd_packages(false, false, &packages, Report::Broadcast).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
         "sources" => {

@@ -13,6 +13,24 @@ change of repository is displayed explicitly rather than silently.
 Not a pamac replacement: it browses, installs and removes through paru
 in a terminal, with no transaction logic of its own.
 
+How paru ended is not lost with its window. The terminal runs
+`minka-syu run …`, which runs paru under script(1) (everything it
+shows also goes to a log in the state dir's `runs/`), writes how it
+ended to a result file, and on a failure keeps the window open until
+Enter. The window shows a failure as a card above the list: the
+command, its exit status or signal (and which packages did not build),
+pacman's and paru's `error:` lines (with what pacman lists under them),
+each makepkg `==> ERROR:` with the build lines before it, what came
+after, and the log's path. A step that exits 0 but printed error lines
+that still matter (a failed pacman hook or scriptlet, dkms, mkinitcpio)
+gets an amber card and keeps its terminal open as well; a mirror that
+pacman gave up on for the next one does not count. A no at a question,
+Ctrl+C, or closing the window at a question is a cancel: no card. Each
+step has its own card until it is dismissed. From the CLI,
+`minka-syu apply|install|remove` wait for the terminal and print a
+failure to stderr with exit status 1. Only the newest 8 steps' files
+are kept, and a clean step's log is deleted.
+
 ## The window
 
 `minka-syu ui` opens it (the .desktop entry and MinkaShell's updates

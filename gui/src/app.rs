@@ -48,6 +48,10 @@ pub struct App {
     pub state_gen: Signal<u64>,
     pub checking: Signal<bool>,
     pub error: Signal<String>,
+    /// How upgrades, installs and removals ended, when that is worth a
+    /// card (it failed, or its output had error lines that matter): one
+    /// card per step, newest first, each there until dismissed.
+    pub run_reports: Signal<Vec<RunReport>>,
     pub sel: Signal<UpdateSelection>,
 
     pub query: Signal<String>,
@@ -106,6 +110,7 @@ impl App {
             state_gen: signal(0),
             checking: signal(false),
             error: signal(String::new()),
+            run_reports: signal(Vec::new()),
             sel: signal(UpdateSelection::default()),
             query: signal(String::new()),
             searching: signal(false),
@@ -156,6 +161,11 @@ impl App {
                 if event == "state" {
                     self.set_state(payload);
                     self.checking.set(false);
+                } else if event == "run" {
+                    // Two steps can run at once: each report files only
+                    // its own step's card.
+                    let report: RunReport = parse(payload);
+                    self.run_reports.update(|cards| record_run(cards, report));
                 }
             },
             move |status| match status {
@@ -207,6 +217,17 @@ impl App {
             self.set_sources(parse(v));
         }
         self.tab.set(tab);
+    }
+
+    /// For `--shot … --run <result.json>`: draws the card of a step's result
+    /// file (the core's $XDG_STATE_HOME/minka-syu/runs/*.json).
+    pub fn load_run(self, file: &std::path::Path) {
+        let report: Option<RunReport> = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        if let Some(report) = report {
+            self.run_reports.update(|cards| record_run(cards, report));
+        }
     }
 
     fn tick_clock(self) {

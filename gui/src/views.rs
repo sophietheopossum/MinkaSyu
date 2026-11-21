@@ -67,6 +67,7 @@ pub fn root(app: App) -> Div {
                         })),
                 )
                 .child(error_bar(app))
+                .child(run_card(app))
                 .child(body),
         )
         .child(show(
@@ -349,6 +350,103 @@ fn error_bar(app: App) -> impl IntoView {
                 ))
         },
     )
+}
+
+/// How upgrades, installs and removals ended, when one failed or its
+/// output had error lines that matter: a card per step, newest first. Its
+/// terminal may have closed by now, so its error lines are kept here,
+/// selectable, with the path of the full log.
+fn run_card(app: App) -> impl IntoView {
+    show(
+        move || app.run_reports.with(|r| !r.is_empty()),
+        move || {
+            dyn_view(move || {
+                let mut cards = div().w_full().flex().flex_col().flex_none().gap(6.0_f32);
+                for (i, report) in app.run_reports.get().into_iter().enumerate() {
+                    // Older cards stay shorter, so the list stays in view.
+                    let max_h = if i == 0 { RUN_OUTPUT_MAX_H } else { RUN_OUTPUT_OLDER_MAX_H };
+                    cards = cards.child(run_report_card(app, report, max_h));
+                }
+                cards
+            })
+        },
+    )
+}
+
+/// How high the output may grow before it scrolls: the list below stays in view.
+const RUN_OUTPUT_MAX_H: f32 = 220.0_f32;
+/// The same for the cards under the newest one: about six lines.
+const RUN_OUTPUT_OLDER_MAX_H: f32 = 96.0_f32;
+
+fn run_report_card(app: App, r: RunReport, output_max_h: f32) -> Div {
+    // Red for a failure; amber for a step that finished but printed errors.
+    let (tone, outline) = if r.ok { (WARN_AMBER, WARN_AMBER) } else { (RED, RED_DIM) };
+    let mut card = outlined_card_in(outline)
+        .w_full()
+        .flex_none()
+        .gap(6.0_f32)
+        .px(10.0_f32)
+        .py(8.0_f32)
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(10.0_f32)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(0.0_f32)
+                        .child(
+                            ui_text(
+                                if r.headline.is_empty() {
+                                    "The last step failed, and no details came back".to_string()
+                                } else {
+                                    r.headline.clone()
+                                },
+                                FONT_SIZE,
+                                tone,
+                            )
+                            .bold(),
+                        ),
+                )
+                .child({
+                    let this = r.clone();
+                    push_button(
+                        || "Dismiss".to_string(),
+                        false,
+                        || true,
+                        move || app.run_reports.update(|cards| dismiss_run(cards, &this)),
+                    )
+                }),
+        );
+    if !r.command.is_empty() {
+        card = card.child(mono_text(r.command.join(" "), FONT_SIZE - 2.0_f32, TEXT_FAINT));
+    }
+    card = card.child(
+        // The text block is the scroller's direct child (the toolkit measures
+        // scroll extent from those), padded clear of its 12 px scrollbar zone.
+        div()
+            .w_full()
+            .max_h(output_max_h)
+            .overflow_y_scroll()
+            .rounded(4.0_f32)
+            .bg(color(GROUND))
+            .selection_color(color_alpha(RED_DIM, 0.6_f32))
+            .child(
+                div()
+                    .w_full()
+                    .py(6.0_f32)
+                    .pl(8.0_f32)
+                    .pr(14.0_f32)
+                    .child(mono_text(r.output_text(), FONT_SIZE - 2.0_f32, TEXT)),
+            ),
+    );
+    if !r.log.is_empty() {
+        card = card.child(faint_note(format!("Full log: {}", r.log)));
+    }
+    card
 }
 
 fn faint_note(source: impl IntoTextSource) -> Text {

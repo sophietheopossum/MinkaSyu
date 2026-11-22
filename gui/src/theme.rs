@@ -5,9 +5,11 @@
 //! ../../Proustite/Proustite.qml, as MinkaMon's and MinkaShell's theme.rs do.
 
 use anti_webui::prelude::*;
+pub use anti_webui_md3e::components::CheckState;
 use anti_webui_md3e::components::{
     ButtonSize, ButtonStyle, CheckboxStyle, connected_button_group, filter_chip,
     indeterminate_wavy_progress, outlined_card, styled_button, styled_checkbox,
+    styled_tri_state_checkbox,
 };
 use anti_webui_md3e::{ColorScheme, set_color_scheme};
 use std::rc::Rc;
@@ -218,6 +220,18 @@ pub fn check_box(
             }
         }),
         CheckboxStyle::new().disabled_when(move || !off()),
+    )
+    .flex_none()
+    .m((CHECK_SLOT - CHECK_TOUCH) / 2.0_f32)
+}
+
+/// check_box for something that can be partly on (a group): md3e's
+/// tri-state box, in the same 26 px slot. A press on a mix or on off turns
+/// it on, on on turns it off: `set` gets which.
+pub fn tri_check_box(state: impl Fn() -> CheckState + 'static, set: impl Fn(bool) + 'static) -> Div {
+    styled_tri_state_checkbox(
+        Binding::new(state, move |next: CheckState| set(next == CheckState::On)),
+        CheckboxStyle::new(),
     )
     .flex_none()
     .m((CHECK_SLOT - CHECK_TOUCH) / 2.0_f32)

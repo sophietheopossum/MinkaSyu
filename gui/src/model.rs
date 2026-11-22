@@ -34,6 +34,54 @@ pub struct Update {
     pub superseded_by: Vec<String>,
     pub new_install: bool,
     pub reinstalls: Vec<String>,
+    /// Same version, another repository's build: the installed build is in
+    /// no repository. Also an explicit target; unticked, it is only left
+    /// out, never passed to --ignore.
+    pub switch_build: bool,
+    /// Not empty only on the origin group's row: packages with no recorded
+    /// repository whose build a repository has, reinstalled from it as
+    /// repo/name targets. One row, one update, however many there are.
+    pub origin_group: Vec<OriginMember>,
+}
+
+impl Update {
+    pub fn is_origin_group(&self) -> bool {
+        !self.origin_group.is_empty()
+    }
+}
+
+/// One package of the origin group (the core's OriginMember).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct OriginMember {
+    pub name: String,
+    pub version: String,
+    /// The repository whose copy is the installed build: its target.
+    pub repo: String,
+    pub explicit: bool,
+}
+
+impl OriginMember {
+    pub fn target(&self) -> String {
+        format!("{}/{}", self.repo, self.name)
+    }
+}
+
+/// An installed package nothing tracks (the core's Untracked).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Untracked {
+    pub name: String,
+    pub version: String,
+    pub explicit: bool,
+    pub required_by: Vec<String>,
+    pub optional_for: Vec<String>,
+    pub installed_repo: Option<String>,
+    /// "no_source" | "other_build"
+    pub kind: String,
+    pub repo_versions: Vec<String>,
+    pub aur_version: Option<String>,
+    pub hint: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -42,6 +90,68 @@ pub struct State {
     pub checked_at: i64,
     pub updates: Vec<Update>,
     pub repo_change_count: usize,
+    pub untracked: Vec<Untracked>,
+    /// Why no package in no repository was checked against the AUR.
+    pub aur_unreachable: Option<String>,
+}
+
+/// What the local DB says of one package (the core's LocalPackage): the
+/// detail view's install reason.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct LocalPackage {
+    pub name: String,
+    pub installed: bool,
+    pub version: String,
+    pub explicit: bool,
+    pub required_by: Vec<String>,
+    /// What optionally depends on it: then `pacman -Qdt` skips it as a
+    /// dependency, and `-Qdtt` lists it.
+    pub optional_for: Vec<String>,
+}
+
+/// What changing a package's install reason would mean, in one line, or
+/// None when it means nothing worth saying.
+pub fn reason_consequence(p: &LocalPackage) -> Option<String> {
+    if !p.installed || !p.required_by.is_empty() {
+        return None;
+    }
+    if !p.optional_for.is_empty() {
+        let names = name_list(&p.optional_for, 4);
+        return Some(if p.explicit {
+            format!("Nothing requires it, only optional for {names}: as a dependency, pacman -Qdtt would list it, -Qdt would not.")
+        } else {
+            format!("Nothing requires it, only optional for {names}: pacman -Qdt skips it, -Qdtt lists it.")
+        });
+    }
+    Some(if p.explicit {
+        "Nothing requires it: as a dependency it would be an orphan (pacman -Qdt lists those).".into()
+    } else {
+        "Nothing requires it: it is an orphan (pacman -Qdt lists it).".into()
+    })
+}
+
+/// "a, b, c and 3 more", with at most `max` names.
+fn name_list(names: &[String], max: usize) -> String {
+    let shown: Vec<&str> = names.iter().take(max).map(String::as_str).collect();
+    let more = names.len().saturating_sub(max);
+    format!("{}{}", shown.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() })
+}
+
+/// "Required by a, b, c" with at most `max` names.
+pub fn required_by_text(names: &[String], max: usize) -> String {
+    if names.is_empty() {
+        return "Required by nothing".into();
+    }
+    format!("Required by {}", name_list(names, max))
+}
+
+/// "Optional for a, b" with at most `max` names; empty for none.
+pub fn optional_for_text(names: &[String], max: usize) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!("Optional for {}", name_list(names, max))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -197,8 +307,10 @@ pub fn effective_update(u: &Update, overrides: &BTreeMap<String, Override>) -> U
     if ov.repo != u.candidate_repo {
         copy.replaces.clear();
     }
-    copy.explicit_target = ov.repo != default_repo;
-    if copy.explicit_target && copy.first_repo.is_none() {
+    // -Syu never touches a switch's package: whichever build is chosen, it
+    // is installed only as a repo/name target.
+    copy.explicit_target = u.switch_build || ov.repo != default_repo;
+    if copy.explicit_target && copy.first_repo.is_none() && !u.switch_build {
         copy.first_repo = Some(default_repo.clone());
         copy.first_version = Some(u.new_version.clone());
     }
@@ -214,13 +326,46 @@ pub fn effective_update(u: &Update, overrides: &BTreeMap<String, Override>) -> U
     copy
 }
 
+/// What a row is, as far as its tick goes: an untick means something else
+/// for each (Plain: --ignore; the others: only left out of the targets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Plain,
+    /// A later-repo build: a repo/name target.
+    Explicit,
+    Switch,
+    Group,
+}
+
+impl RowKind {
+    pub fn of(u: &Update) -> RowKind {
+        if u.is_origin_group() {
+            RowKind::Group
+        } else if u.switch_build {
+            RowKind::Switch
+        } else if u.explicit_target {
+            RowKind::Explicit
+        } else {
+            RowKind::Plain
+        }
+    }
+}
+
 /// The updates tab's selections. Unticked = ignored this run only.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UpdateSelection {
+    /// Unticked rows, by row name.
     pub ignored: BTreeSet<String>,
+    /// The origin group's members left out, by package name: a set of
+    /// their own, so leaving a reinstall out never becomes the --ignore of
+    /// a row the package gets later.
+    pub left_out: BTreeSet<String>,
     /// Later-repo rows already given their initial untick, so a manual
     /// re-tick survives the next state refresh.
     pub seeded_explicit: BTreeSet<String>,
+    /// Each row's kind in the last state: a row whose kind changes starts
+    /// afresh, its untick and its seeding dropped.
+    pub kinds: BTreeMap<String, RowKind>,
     pub overrides: BTreeMap<String, Override>,
 }
 
@@ -228,24 +373,38 @@ impl UpdateSelection {
     /// After a new state: later-repo candidates start unticked (opt-in:
     /// the newest build may trade a v4-optimised one for a plain one),
     /// and names that vanished are pruned so they never ride into a
-    /// later --ignore.
+    /// later --ignore. Neither does an untick whose row changed kind (a
+    /// switch that became a real upgrade starts ticked, as any update),
+    /// nor a member left out of the origin group that is no member now.
     pub fn reconcile(&mut self, updates: &[Update]) {
         let mut keep = BTreeSet::new();
         let mut seeded = BTreeSet::new();
+        let mut kinds = BTreeMap::new();
+        let mut left_out = BTreeSet::new();
         for u in updates {
-            if self.ignored.contains(&u.name) {
+            let kind = RowKind::of(u);
+            let same_kind = self.kinds.get(&u.name).is_none_or(|k| *k == kind);
+            if same_kind && self.ignored.contains(&u.name) {
                 keep.insert(u.name.clone());
             }
-            if self.seeded_explicit.contains(&u.name) {
+            if same_kind && self.seeded_explicit.contains(&u.name) {
                 seeded.insert(u.name.clone());
             }
             if u.explicit_target && !seeded.contains(&u.name) {
                 seeded.insert(u.name.clone());
                 keep.insert(u.name.clone());
             }
+            for m in &u.origin_group {
+                if self.left_out.contains(&m.name) {
+                    left_out.insert(m.name.clone());
+                }
+            }
+            kinds.insert(u.name.clone(), kind);
         }
         self.ignored = keep;
         self.seeded_explicit = seeded;
+        self.kinds = kinds;
+        self.left_out = left_out;
         self.overrides.retain(|name, ov| {
             updates
                 .iter()
@@ -259,6 +418,87 @@ impl UpdateSelection {
             self.ignored.insert(name.to_string());
         }
     }
+
+    /// The origin group's own tick, as md3e's tri-state box sets it: on
+    /// ticks every member, off none.
+    pub fn set_group(&mut self, group: &Update, on: bool) {
+        if on {
+            self.ignored.remove(&group.name);
+        } else {
+            self.ignored.insert(group.name.clone());
+        }
+        for m in &group.origin_group {
+            self.left_out.remove(&m.name);
+        }
+    }
+
+    /// One member's own tick. With the group off, ticking a member turns
+    /// the group on with that member alone; leaving the last one out
+    /// turns it off by itself.
+    pub fn toggle_member(&mut self, group: &Update, name: &str) {
+        if group_ticked(group, self) {
+            if !self.left_out.remove(name) {
+                self.left_out.insert(name.to_string());
+            }
+            return;
+        }
+        self.ignored.remove(&group.name);
+        for m in &group.origin_group {
+            if m.name != name {
+                self.left_out.insert(m.name.clone());
+            }
+        }
+        self.left_out.remove(name);
+    }
+
+    /// Every row ticked, every member with them.
+    pub fn tick_all(&mut self) {
+        self.ignored.clear();
+        self.left_out.clear();
+    }
+
+    /// Every row unticked (`names`: the state's rows).
+    pub fn untick_all(&mut self, names: BTreeSet<String>) {
+        self.ignored = names;
+        self.left_out.clear();
+    }
+}
+
+/// Whether the origin group runs: its row ticked, and a member with it.
+pub fn group_ticked(group: &Update, sel: &UpdateSelection) -> bool {
+    !sel.ignored.contains(&group.name) && group.origin_group.iter().any(|m| !sel.left_out.contains(&m.name))
+}
+
+/// Whether a member is reinstalled: the group runs, and it is not left out.
+pub fn member_ticked(group: &Update, sel: &UpdateSelection, name: &str) -> bool {
+    group_ticked(group, sel) && !sel.left_out.contains(name)
+}
+
+/// How many members are left out of a group that runs (none of one that
+/// does not: they are all out, which its box says).
+pub fn members_left_out(group: &Update, sel: &UpdateSelection) -> usize {
+    if !group_ticked(group, sel) {
+        return 0;
+    }
+    group.origin_group.iter().filter(|m| sel.left_out.contains(&m.name)).count()
+}
+
+/// The group box: on with every member, mixed with some left out, off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupTick {
+    Off,
+    Mixed,
+    On,
+}
+
+pub fn group_tick(group: &Update, sel: &UpdateSelection) -> GroupTick {
+    if !group_ticked(group, sel) {
+        GroupTick::Off
+    } else if members_left_out(group, sel) > 0 {
+        GroupTick::Mixed
+    } else {
+        GroupTick::On
+    }
 }
 
 /// Everything the updates tab derives from the state and the selection.
@@ -268,11 +508,14 @@ pub struct UpdatesView {
     pub pending: usize,
     pub held: usize,
     pub repo_changes: usize,
-    /// Pending, unticked, not locked: the --ignore list.
+    /// Pending, unticked, not locked, not a switch: the --ignore list.
     pub ignored_names: Vec<String>,
     pub selected: usize,
     /// Ticked later-repo candidates, as repo/name targets.
     pub explicit_targets: Vec<String>,
+    /// The origin group's ticked members, as repo/name targets: sent with
+    /// the others, shown apart (there can be many).
+    pub origin_targets: Vec<String>,
 }
 
 pub fn updates_view(updates: &[Update], sel: &UpdateSelection) -> UpdatesView {
@@ -286,28 +529,47 @@ pub fn updates_view(updates: &[Update], sel: &UpdateSelection) -> UpdatesView {
         .iter()
         .filter(|u| row_pending(u) && u.transition == "changed")
         .count();
-    let ignored_names: Vec<String> = updates
+    let unticked: Vec<&Update> = updates
         .iter()
         .filter(|u| {
-            row_pending(u)
-                && sel.ignored.contains(&u.name)
-                && locked_by(updates, &sel.ignored, u).is_none()
+            let off = if u.is_origin_group() {
+                !group_ticked(u, sel)
+            } else {
+                sel.ignored.contains(&u.name)
+            };
+            row_pending(u) && off && locked_by(updates, &sel.ignored, u).is_none()
         })
+        .collect();
+    // An unticked switch or origin group is only left out of the targets:
+    // there is no upgrade of it to hold back.
+    let ignored_names: Vec<String> = unticked
+        .iter()
+        .filter(|u| !u.switch_build && !u.is_origin_group())
         .map(|u| u.name.clone())
         .collect();
     let explicit_targets = effective
         .iter()
-        .filter(|u| u.explicit_target && row_pending(u) && !sel.ignored.contains(&u.name))
+        .filter(|u| {
+            u.explicit_target && row_pending(u) && !u.is_origin_group() && !sel.ignored.contains(&u.name)
+        })
         .map(|u| format!("{}/{}", u.candidate_repo, u.name))
         .collect();
+    let origin_targets = updates
+        .iter()
+        .filter(|u| u.is_origin_group() && row_pending(u) && group_ticked(u, sel))
+        .flat_map(|u| u.origin_group.iter())
+        .filter(|m| !sel.left_out.contains(&m.name))
+        .map(OriginMember::target)
+        .collect();
     UpdatesView {
-        selected: pending - ignored_names.len(),
+        selected: pending - unticked.len(),
         effective,
         pending,
         held,
         repo_changes,
         ignored_names,
         explicit_targets,
+        origin_targets,
     }
 }
 
@@ -378,10 +640,21 @@ pub fn badge_label(u: &Update, superseded: bool) -> Option<&'static str> {
         Some("replaces")
     } else if u.transition == "changed" {
         Some("repo change")
+    } else if u.switch_build {
+        Some("switch")
     } else if u.explicit_target {
         Some("later repo")
     } else {
         None
+    }
+}
+
+/// What a switch row does, in words (the core's Update::switch_note).
+pub fn switch_note(u: &Update) -> String {
+    if u.installed_repo.as_deref() == Some(u.candidate_repo.as_str()) {
+        format!("reinstall {}'s current build", u.candidate_repo)
+    } else {
+        format!("switch to {}'s build", u.candidate_repo)
     }
 }
 
@@ -625,6 +898,23 @@ pub fn dismiss_run(cards: &mut Vec<RunReport>, report: &RunReport) {
     cards.retain(|c| c != report);
 }
 
+/// Takes away the cards of earlier install reason changes of `package`
+/// (their command's last word): a new outcome tells the story.
+pub fn drop_reason_cards(cards: &mut Vec<RunReport>, package: Option<&String>) {
+    let Some(package) = package else { return };
+    cards.retain(|c| !(c.step == "reason" && c.command.last() == Some(package)));
+}
+
+/// The headline of the failed install reason change of `package` that a
+/// card still shows (dismissing the card ends it here too).
+pub fn reason_failure(cards: &[RunReport], package: &str) -> Option<String> {
+    cards
+        .iter()
+        .find(|r| r.step == "reason" && r.command.last().is_some_and(|p| p == package))
+        .filter(|r| !r.ok && !r.cancelled)
+        .map(|r| r.headline.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +1037,282 @@ mod tests {
         assert!(
             upgrade_blocked_reason(Context::Updates, Some(&own), &[u], &BTreeSet::new()).is_none()
         );
+    }
+
+    fn switch(name: &str, from: Option<&str>, to: &str) -> Update {
+        Update {
+            name: name.into(),
+            old_version: "0.99.beta20-2".into(),
+            new_version: "0.99.beta20-2".into(),
+            installed_repo: from.map(String::from),
+            candidate_repo: to.into(),
+            transition: if from.is_some() { "changed" } else { "unknown_source" }.into(),
+            explicit_target: true,
+            switch_build: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn switch_rows_start_unticked_and_are_never_ignored() {
+        let updates = vec![switch("lib32-libcaca", Some("multilib"), "minka"), up("mesa")];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&updates);
+        // Opt-in, like a later-repo row: unticked, and not in --ignore.
+        assert!(sel.ignored.contains("lib32-libcaca"));
+        let v = updates_view(&updates, &sel);
+        assert_eq!((v.pending, v.selected, v.repo_changes), (2, 1, 1));
+        assert!(v.ignored_names.is_empty(), "{:?}", v.ignored_names);
+        assert!(v.explicit_targets.is_empty());
+        // Ticked: its repo/name target.
+        sel.toggle("lib32-libcaca");
+        let v = updates_view(&updates, &sel);
+        assert_eq!(v.selected, 2);
+        assert_eq!(v.explicit_targets, ["minka/lib32-libcaca"]);
+        // Unticking everything ignores only the real upgrade.
+        sel.toggle("lib32-libcaca");
+        sel.toggle("mesa");
+        let v = updates_view(&updates, &sel);
+        assert_eq!((v.selected, v.ignored_names.clone()), (0, vec!["mesa".to_string()]));
+        // A held switch is shown only.
+        let mut held = switch("held", Some("multilib"), "minka");
+        held.held = true;
+        let v = updates_view(&[held], &UpdateSelection::default());
+        assert_eq!((v.pending, v.held, v.selected), (0, 1, 0));
+        assert!(v.explicit_targets.is_empty() && v.ignored_names.is_empty());
+    }
+
+    #[test]
+    fn a_switch_stays_a_target_whatever_build_is_chosen() {
+        let u = switch("lib32-libcaca", Some("multilib"), "minka");
+        let ov = |repo: &str| {
+            BTreeMap::from([(
+                u.name.clone(),
+                Override {
+                    repo: repo.into(),
+                    version: "0.99.beta20-2".into(),
+                    target: format!("{repo}/lib32-libcaca"),
+                },
+            )])
+        };
+        for repo in ["minka", "cachyos"] {
+            let e = effective_update(&u, &ov(repo));
+            assert!(e.explicit_target && e.switch_build, "{repo}");
+            assert_eq!(e.first_repo, None);
+            let sel = UpdateSelection { overrides: ov(repo), ..Default::default() };
+            assert_eq!(updates_view(std::slice::from_ref(&u), &sel).explicit_targets, [format!("{repo}/lib32-libcaca")]);
+        }
+    }
+
+    #[test]
+    fn switch_labels() {
+        let u = switch("lib32-libcaca", Some("multilib"), "minka");
+        assert_eq!(badge_label(&u, false), Some("repo change"));
+        assert_eq!(switch_note(&u), "switch to minka's build");
+        assert_eq!(version_text(&u), "0.99.beta20-2 → 0.99.beta20-2");
+        let foreign = switch("python-pkg_resources", None, "cachyos");
+        assert_eq!(badge_label(&foreign, false), Some("switch"));
+        let same = switch("x", Some("minka"), "minka");
+        assert_eq!(switch_note(&same), "reinstall minka's current build");
+        // The core's state file carries it as switch_build.
+        let parsed: Update = serde_json::from_value(serde_json::json!({
+            "name": "lib32-libcaca", "switch_build": true, "explicit_target": true
+        }))
+        .unwrap();
+        assert!(parsed.switch_build);
+    }
+
+    fn origin(members: &[&str]) -> Update {
+        Update {
+            name: "(no recorded repository)".into(),
+            old_version: format!("{} packages", members.len()),
+            new_version: "same builds".into(),
+            candidate_repo: "extra".into(),
+            transition: "unknown_source".into(),
+            explicit_target: true,
+            origin_group: members
+                .iter()
+                .map(|n| OriginMember { name: n.to_string(), version: "1-1".into(), repo: "extra".into(), explicit: false })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_origin_group_is_one_row_ticked_as_a_whole_or_by_member() {
+        let group = origin(&["zstd", "perl-clone", "simdutf"]);
+        let updates = vec![group.clone(), up("mesa")];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&updates);
+        // Opt-in, like a switch row: unticked, and never in --ignore. Its
+        // members are unticked with it: their boxes say what runs.
+        let v = updates_view(&updates, &sel);
+        assert_eq!((v.pending, v.selected), (2, 1));
+        assert!(v.ignored_names.is_empty() && v.origin_targets.is_empty() && v.explicit_targets.is_empty(), "{v:?}");
+        assert!(group.origin_group.iter().all(|m| !member_ticked(&group, &sel, &m.name)));
+        assert_eq!((group_tick(&group, &sel), members_left_out(&group, &sel)), (GroupTick::Off, 0));
+        // Ticked: every member's own target, and still one update.
+        sel.set_group(&group, true);
+        let v = updates_view(&updates, &sel);
+        assert_eq!(v.selected, 2);
+        assert_eq!(v.origin_targets, ["extra/zstd", "extra/perl-clone", "extra/simdutf"]);
+        assert!(v.explicit_targets.is_empty(), "the row is no target of its own");
+        assert_eq!(group_tick(&group, &sel), GroupTick::On);
+        // One member left out: the rest go, nothing is --ignored, the box
+        // is mixed.
+        sel.toggle_member(&group, "perl-clone");
+        let v = updates_view(&updates, &sel);
+        assert_eq!(v.origin_targets, ["extra/zstd", "extra/simdutf"]);
+        assert!(v.ignored_names.is_empty() && !sel.ignored.contains("perl-clone"));
+        assert_eq!((group_tick(&group, &sel), members_left_out(&group, &sel)), (GroupTick::Mixed, 1));
+        // Member ticks survive a new state.
+        sel.reconcile(&updates);
+        assert!(sel.left_out.contains("perl-clone"));
+        // Every member left out: the group is off; ticking it brings them all.
+        sel.toggle_member(&group, "zstd");
+        sel.toggle_member(&group, "simdutf");
+        let v = updates_view(&updates, &sel);
+        assert_eq!((v.selected, v.origin_targets.len()), (1, 0));
+        assert_eq!((group_tick(&group, &sel), members_left_out(&group, &sel)), (GroupTick::Off, 0));
+        sel.set_group(&group, true);
+        assert_eq!(updates_view(&updates, &sel).origin_targets.len(), 3);
+        sel.set_group(&group, false);
+        assert!(updates_view(&updates, &sel).origin_targets.is_empty());
+        // With the group off, ticking a member turns it on with that one.
+        sel.toggle_member(&group, "zstd");
+        let v = updates_view(&updates, &sel);
+        assert_eq!(v.origin_targets, ["extra/zstd"]);
+        assert_eq!((group_tick(&group, &sel), members_left_out(&group, &sel)), (GroupTick::Mixed, 2));
+        // Untick all, tick all: members follow.
+        let names = updates.iter().map(|u| u.name.clone()).collect();
+        sel.untick_all(names);
+        assert!(group.origin_group.iter().all(|m| !member_ticked(&group, &sel, &m.name)));
+        sel.tick_all();
+        assert_eq!(updates_view(&updates, &sel).origin_targets.len(), 3);
+        // A member that left the group is pruned.
+        sel.toggle_member(&group, "zstd");
+        sel.reconcile(&[origin(&["perl-clone", "simdutf"]), up("mesa")]);
+        assert!(!sel.left_out.contains("zstd") && !sel.ignored.contains("zstd"));
+    }
+
+    #[test]
+    fn a_member_left_out_then_upgraded_is_never_ignored() {
+        // 22/11/2026 review: zstd left out of the reinstall, then a check
+        // finds a real upgrade of it. Leaving it out meant "no reinstall",
+        // not --ignore=zstd.
+        let group = origin(&["zstd", "perl-clone", "simdutf"]);
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&[group.clone(), up("mesa")]);
+        sel.set_group(&group, true);
+        sel.toggle_member(&group, "zstd");
+        let later = vec![origin(&["perl-clone", "simdutf"]), up("zstd"), up("mesa")];
+        sel.reconcile(&later);
+        let v = updates_view(&later, &sel);
+        assert!(v.ignored_names.is_empty(), "{:?}", v.ignored_names);
+        assert_eq!(v.selected, 3, "the upgrade starts ticked, as any update");
+        assert!(!sel.left_out.contains("zstd"));
+    }
+
+    #[test]
+    fn a_row_that_changes_kind_starts_afresh() {
+        // A switch row is seeded unticked; when the repository ships a newer
+        // version it becomes a plain upgrade, which starts ticked.
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&[switch("lib32-libcaca", Some("multilib"), "minka"), up("mesa")]);
+        assert!(sel.ignored.contains("lib32-libcaca"));
+        let later = vec![up("lib32-libcaca"), up("mesa")];
+        sel.reconcile(&later);
+        let v = updates_view(&later, &sel);
+        assert!(v.ignored_names.is_empty(), "{:?}", v.ignored_names);
+        assert_eq!(v.selected, 2);
+        // A plain row she unticked stays unticked while it stays plain ...
+        sel.toggle("mesa");
+        sel.reconcile(&later);
+        assert_eq!(updates_view(&later, &sel).ignored_names, ["mesa"]);
+        // ... and a row that turns into a later-repo one is seeded again.
+        let mut explicit = up("mesa");
+        explicit.explicit_target = true;
+        sel.toggle("mesa");
+        let again = vec![up("lib32-libcaca"), explicit];
+        sel.reconcile(&again);
+        assert!(sel.ignored.contains("mesa") && sel.seeded_explicit.contains("mesa"));
+        // A re-tick of it survives the next state.
+        sel.toggle("mesa");
+        sel.reconcile(&again);
+        assert!(!sel.ignored.contains("mesa"));
+    }
+
+    #[test]
+    fn state_carries_the_group_and_the_untracked() {
+        let state: State = serde_json::from_value(serde_json::json!({
+            "updates": [{"name": "(no recorded repository)", "explicit_target": true,
+                "origin_group": [{"name": "zstd", "version": "1-1", "repo": "extra", "explicit": false}]}],
+            "untracked": [{"name": "gitcomet", "version": "0.2.5-1", "explicit": true, "required_by": [],
+                "kind": "no_source", "hint": "find its source"}],
+            "aur_unreachable": null
+        }))
+        .unwrap();
+        assert!(state.updates[0].is_origin_group());
+        assert_eq!(state.updates[0].origin_group[0].target(), "extra/zstd");
+        assert_eq!(state.untracked[0].name, "gitcomet");
+        // And an older state, with neither.
+        let old: State = serde_json::from_value(serde_json::json!({"updates": [{"name": "a"}]})).unwrap();
+        assert!(old.untracked.is_empty() && old.aur_unreachable.is_none() && !old.updates[0].is_origin_group());
+    }
+
+    #[test]
+    fn reason_lines() {
+        let mut p = LocalPackage { name: "libwpe".into(), installed: true, explicit: true, ..Default::default() };
+        assert!(reason_consequence(&p).unwrap().contains("would be an orphan"));
+        p.explicit = false;
+        assert!(reason_consequence(&p).unwrap().contains("it is an orphan"));
+        // Only optional dependencies name it: -Qdt skips it, -Qdtt lists it.
+        p.optional_for = vec!["yt-dlp".into(), "aria2p".into()];
+        let line = reason_consequence(&p).unwrap();
+        assert!(line.contains("only optional for yt-dlp, aria2p") && line.contains("-Qdtt lists it"), "{line}");
+        assert!(!line.contains("pacman -Qdt lists it"), "{line}");
+        p.explicit = true;
+        assert!(reason_consequence(&p).unwrap().contains("-Qdtt would list it, -Qdt would not"));
+        assert_eq!(optional_for_text(&p.optional_for, 1), "Optional for yt-dlp and 1 more");
+        assert_eq!(optional_for_text(&[], 1), "");
+        p.required_by = vec!["wpebackend-fdo".into()];
+        assert_eq!(reason_consequence(&p), None);
+        assert_eq!(required_by_text(&p.required_by, 6), "Required by wpebackend-fdo");
+        let many: Vec<String> = (0..9).map(|i| format!("p{i}")).collect();
+        assert_eq!(required_by_text(&many, 2), "Required by p0, p1 and 7 more");
+        assert_eq!(required_by_text(&[], 2), "Required by nothing");
+    }
+
+    #[test]
+    fn a_failed_reason_change_is_told_until_its_card_goes() {
+        let report = |pkg: &str, ok: bool, id: &str| RunReport {
+            id: id.into(),
+            step: "reason".into(),
+            command: ["sudo", "pacman", "-D", "--asexplicit", "--", pkg].iter().map(|a| a.to_string()).collect(),
+            ok,
+            headline: if ok { "done".into() } else { format!("Install reason change failed: {pkg}") },
+            ..Default::default()
+        };
+        let mut cards = Vec::new();
+        record_run(&mut cards, report("libwpe", false, "a"));
+        record_run(&mut cards, report("aria2", false, "b"));
+        assert_eq!(reason_failure(&cards, "libwpe").as_deref(), Some("Install reason change failed: libwpe"));
+        assert_eq!(reason_failure(&cards, "zstd"), None);
+        // A later outcome of the same package replaces its card; a clean one
+        // leaves none, and the line goes.
+        let ok = report("libwpe", true, "c");
+        drop_reason_cards(&mut cards, ok.command.last());
+        record_run(&mut cards, ok);
+        assert_eq!(reason_failure(&cards, "libwpe"), None);
+        assert!(reason_failure(&cards, "aria2").is_some(), "another package's card stays");
+        // A cancel is no failure to tell.
+        let mut cancelled = report("aria2", false, "d");
+        cancelled.cancelled = true;
+        assert_eq!(reason_failure(&[cancelled], "aria2"), None);
+        // Dismissed: gone here too.
+        let card = cards[0].clone();
+        dismiss_run(&mut cards, &card);
+        assert_eq!(reason_failure(&cards, "aria2"), None);
     }
 
     #[test]

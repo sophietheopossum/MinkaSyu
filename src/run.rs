@@ -28,7 +28,7 @@ pub struct RunResult {
     /// Which step this is: its result file's stem ("apply-<secs>-<pid>-<n>").
     /// Two steps can run at once, and their reports must not be confused.
     pub id: String,
-    /// "apply", "install" or "remove".
+    /// "apply", "install", "remove" or "reason" (pacman -D).
     pub step: String,
     /// What ran in the terminal: paru and its arguments.
     pub command: Vec<String>,
@@ -63,6 +63,7 @@ pub fn step_label(step: &str) -> &str {
         "apply" => "Upgrade",
         "install" => "Install",
         "remove" => "Removal",
+        "reason" => "Install reason change",
         other => other,
     }
 }

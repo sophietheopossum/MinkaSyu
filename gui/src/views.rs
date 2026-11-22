@@ -178,8 +178,11 @@ fn subtitle(app: App) -> String {
                 };
                 s += &format!(" — {} {verb} repository", v.repo_changes);
             }
-            if !v.ignored_names.is_empty() {
-                s += &format!(" · {} unticked", v.ignored_names.len());
+            // Unticked switches are not in ignored_names (they are only left
+            // out), so the count comes from the ticks.
+            let unticked = v.pending - v.selected;
+            if unticked > 0 {
+                s += &format!(" · {unticked} unticked");
             }
             s + &held
         }
@@ -570,7 +573,13 @@ fn update_row(app: App, u: Update) -> Div {
                 .whitespace_nowrap(),
         );
     }
-    if u.explicit_target {
+    if u.switch_build {
+        // Where a later-repo row says what it is newer than: the version is
+        // the same, the build is the other repository's.
+        details = details.child(
+            mono_text(switch_note(&u), FONT_SIZE - 2.0_f32, PURPLE).whitespace_nowrap(),
+        );
+    } else if u.explicit_target {
         details = details.child(
             mono_text(
                 format!(
@@ -680,12 +689,16 @@ fn update_list(app: App, aur: bool) -> impl IntoView {
     for_each(
         move || {
             let generation = app.state_gen.get();
-            app.updates_view()
+            let mut rows: Vec<(u64, Update)> = app
+                .updates_view()
                 .effective
                 .into_iter()
                 .filter(|u| (u.candidate_repo == "aur") == aur)
                 .map(|u| (generation, u))
-                .collect::<Vec<_>>()
+                .collect();
+            // The origin group is bookkeeping, not an update: after them.
+            rows.sort_by_key(|(_, u)| u.is_origin_group());
+            rows
         },
         |(generation, u)| {
             (
@@ -695,8 +708,320 @@ fn update_list(app: App, aur: bool) -> impl IntoView {
                 u.new_version.clone(),
             )
         },
-        move |(_, u)| untrack(|| update_row(app, u)),
+        move |(_, u)| {
+            untrack(|| {
+                if u.is_origin_group() {
+                    origin_group_row(app, u)
+                } else {
+                    update_row(app, u)
+                }
+            })
+        },
     )
+}
+
+/// The origin group: one row for every package with no recorded
+/// repository whose build a repository has. Its box ticks them all, and
+/// shows a mix when some are left out; its names, shown on demand under
+/// their repositories, can be left out one by one.
+fn origin_group_row(app: App, u: Update) -> Div {
+    let n = u.origin_group.len();
+    let one = n == 1;
+    let group = Rc::new(u.clone());
+    let ticked = {
+        let g = Rc::clone(&group);
+        move || app.sel.with(|s| group_ticked(&g, s))
+    };
+    let tick = {
+        let g = Rc::clone(&group);
+        move || app.sel.with(|s| group_tick(&g, s))
+    };
+    // The members by repository, in pacman.conf order (the row's own list,
+    // then any repository it lacks).
+    let mut repos: Vec<&str> = u.candidate_repo.split(", ").filter(|r| !r.is_empty()).collect();
+    for m in &u.origin_group {
+        if !repos.contains(&m.repo.as_str()) {
+            repos.push(&m.repo);
+        }
+    }
+    let by_repo: Vec<(String, Vec<OriginMember>)> = repos
+        .iter()
+        .map(|repo| (repo.to_string(), u.origin_group.iter().filter(|m| m.repo == *repo).cloned().collect::<Vec<_>>()))
+        .filter(|(_, members)| !members.is_empty())
+        .collect();
+    let counts: Vec<String> = by_repo.iter().map(|(repo, members)| format!("{repo} {}", members.len())).collect();
+    let explicit = u.origin_group.iter().filter(|m| m.explicit).count();
+    let reasons = match (explicit, n) {
+        (0, 1) => "a dependency".to_string(),
+        (1, 1) => "explicit".to_string(),
+        (0, _) => "all dependencies".to_string(),
+        (e, _) if e == n => "all explicit".to_string(),
+        (e, _) => format!("{} dependenc{}, {e} explicit", n - e, if n - e == 1 { "y" } else { "ies" }),
+    };
+
+    let title = format!("{} {} no recorded repository", plural(n, "package"), if one { "has" } else { "have" });
+    let explanation = if one {
+        "pacman records none for packages it pulls in as dependencies or replacements. \
+         Its build is the repository's own: reinstalling it from there records it (so does its next upgrade), \
+         and keeps its install reason."
+    } else {
+        "pacman records none for packages it pulls in as dependencies or replacements. \
+         Their builds are the repositories' own: reinstalling them from there records it (so does their next upgrade), \
+         and keeps each install reason."
+    };
+    let mut column = div()
+        .flex_1()
+        .min_w(0.0_f32)
+        .flex()
+        .flex_col()
+        .gap(1.0_f32)
+        .dyn_style({
+            let ticked = ticked.clone();
+            move |s| s.opacity(if ticked() { 1.0_f32 } else { 0.45_f32 })
+        })
+        .child(ui_text(title, FONT_SIZE, TEXT))
+        .child(ui_text(explanation, FONT_SIZE - 2.0_f32, TEXT_MUTED))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .column_gap(6.0_f32)
+                .row_gap(1.0_f32)
+                .child(mono_text(format!("{} · {reasons}", counts.join(" · ")), FONT_SIZE - 2.0_f32, TEXT_FAINT))
+                .child(faint_note({
+                    let g = Rc::clone(&group);
+                    move || match app.sel.with(|s| members_left_out(&g, s)) {
+                        0 => String::new(),
+                        k => format!("{k} of {n} left out"),
+                    }
+                })),
+        )
+        .child(div().pt(2.0_f32).child(text_button(
+            move || match (app.origin_open.get(), one) {
+                (true, true) => "hide the name".into(),
+                (true, false) => "hide the names".into(),
+                (false, true) => "show its name".into(),
+                (false, false) => format!("show the {n} names"),
+            },
+            PURPLE,
+            move || app.origin_open.update(|o| *o = !*o),
+        )));
+    column = column.child(show(
+        move || app.origin_open.get(),
+        move || {
+            // A faint heading per repository: the repository is never cut off
+            // an item, and the items size to their own text.
+            let mut list = div().w_full().pt(4.0_f32).flex().flex_col().gap(2.0_f32);
+            for (repo, members) in &by_repo {
+                list = list.child(mono_text(format!("{repo} {}", members.len()), FONT_SIZE - 3.0_f32, TEXT_FAINT));
+                let mut grid = div().w_full().flex().flex_row().flex_wrap().row_gap(0.0_f32).column_gap(8.0_f32);
+                for m in members.iter().cloned() {
+                    grid = grid.child(origin_member_item(app, Rc::clone(&group), m));
+                }
+                list = list.child(grid);
+            }
+            list
+        },
+    ));
+
+    div()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(10.0_f32)
+        .child(tri_check_box(
+            move || match tick() {
+                GroupTick::Off => CheckState::Off,
+                GroupTick::Mixed => CheckState::Mixed,
+                GroupTick::On => CheckState::On,
+            },
+            move |on| app.set_group(on),
+        ))
+        .child(column)
+        .child(chip("reinstall", PURPLE_DIM, TEXT))
+}
+
+/// One name of the origin group: its own tick (on only while the group
+/// runs), the name (opens the detail view, where its install reason can be
+/// changed), its version.
+fn origin_member_item(app: App, group: Rc<Update>, m: OriginMember) -> Div {
+    let name: Rc<str> = Rc::from(m.name.as_str());
+    let selected = {
+        let (n, g) = (Rc::clone(&name), Rc::clone(&group));
+        move || app.sel.with(|s| member_ticked(&g, s, &n))
+    };
+    // Its own dimming: the column already dims a group that is off.
+    let kept = {
+        let n = Rc::clone(&name);
+        move || !app.sel.with(|s| s.left_out.contains(&*n))
+    };
+    let shown = m.name.clone();
+    let (detail_name, version) = (Rc::clone(&name), m.version.clone());
+    let mut item = div()
+        .flex_none()
+        .min_w(232.0_f32)
+        .max_w(pct(100.0_f32))
+        .h(26.0_f32)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(6.0_f32)
+        .overflow_hidden()
+        .child(check_box(selected, || true, {
+            let n = Rc::clone(&name);
+            move || app.toggle_member(&n)
+        }))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(6.0_f32)
+                .dyn_style(move |s| s.opacity(if kept() { 1.0_f32 } else { 0.45_f32 }))
+                .child(name_link(
+                    move || shown.clone(),
+                    FONT_SIZE - 1.0_f32,
+                    move || {
+                        app.open_detail(Detail {
+                            name: detail_name.to_string(),
+                            context: Context::Installed,
+                            version: version.clone(),
+                            repo: String::new(),
+                            description: String::new(),
+                        })
+                    },
+                ))
+                .child(mono_text(m.version.clone(), FONT_SIZE - 3.0_f32, TEXT_FAINT).whitespace_nowrap()),
+        );
+    if m.explicit {
+        item = item.child(mono_text("explicit", FONT_SIZE - 3.0_f32, OK_GREEN).whitespace_nowrap());
+    }
+    item
+}
+
+/// Packages nothing tracks: an error to fix, in a card of its own above the
+/// list, until dismissed (it comes back when the list changes). When the
+/// AUR could not be asked, an amber card says so instead.
+fn untracked_card(app: App) -> impl IntoView {
+    let shown = move || {
+        !app.untracked_dismissed.get()
+            && app.state.with(|s| s.as_ref().is_some_and(|s| !s.untracked.is_empty() || s.aur_unreachable.is_some()))
+    };
+    show(shown, move || {
+        dyn_view(move || {
+            let (list, note) = app
+                .state
+                .with(|s| s.as_ref().map(|s| (s.untracked.clone(), s.aur_unreachable.clone())))
+                .unwrap_or_default();
+            untrack(|| untracked_card_body(app, list, note))
+        })
+    })
+}
+
+/// How high the untracked list may grow before it scrolls.
+const UNTRACKED_MAX_H: f32 = 150.0_f32;
+
+fn untracked_card_body(app: App, list: Vec<Untracked>, note: Option<String>) -> Div {
+    let n = list.len();
+    let (tone, outline) = if n > 0 { (RED, RED_DIM) } else { (WARN_AMBER, WARN_AMBER) };
+    let headline = if n > 0 {
+        format!(
+            "{} nothing tracks: no repository has {} build, and no AUR package paru checks",
+            plural(n, "installed package"),
+            if n == 1 { "its" } else { "their" }
+        )
+    } else {
+        "The AUR could not be asked which packages it has".to_string()
+    };
+    let mut card = outlined_card_in(outline)
+        .w_full()
+        .flex_none()
+        .gap(6.0_f32)
+        .px(10.0_f32)
+        .py(8.0_f32)
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(10.0_f32)
+                .child(div().flex_1().min_w(0.0_f32).child(ui_text(headline, FONT_SIZE, tone).bold()))
+                .child(push_button(
+                    || "Dismiss".to_string(),
+                    false,
+                    || true,
+                    move || app.untracked_dismissed.set(true),
+                )),
+        );
+    if n > 0 {
+        card = card.child(faint_note(if n == 1 {
+            "Nothing updates it. Worth fixing: remove it, or install a tracked build."
+        } else {
+            "Nothing updates them. Each one is worth fixing: remove it, or install a tracked build."
+        }));
+        let mut rows = div().w_full().flex().flex_col().gap(5.0_f32).py(2.0_f32).pr(14.0_f32);
+        for t in list {
+            rows = rows.child(untracked_row(app, t));
+        }
+        // The rows are the scroller's direct child (scroll extent).
+        card = card.child(div().w_full().max_h(UNTRACKED_MAX_H).overflow_y_scroll().child(rows));
+    }
+    if let Some(note) = note {
+        card = card.child(ui_text(note, FONT_SIZE - 2.0_f32, WARN_AMBER));
+    }
+    card
+}
+
+fn untracked_row(app: App, t: Untracked) -> Div {
+    let mut needed = if t.required_by.is_empty() {
+        "nothing requires it".to_string()
+    } else {
+        required_by_text(&t.required_by, 4).replacen("Required", "required", 1)
+    };
+    if !t.optional_for.is_empty() {
+        needed += &format!(" · {}", optional_for_text(&t.optional_for, 4).replacen("Optional", "optional", 1));
+    }
+    let (name, version) = (t.name.clone(), t.version.clone());
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(1.0_f32)
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .column_gap(8.0_f32)
+                .row_gap(1.0_f32)
+                .child(name_link(
+                    {
+                        let shown = t.name.clone();
+                        move || shown.clone()
+                    },
+                    FONT_SIZE - 1.0_f32,
+                    move || {
+                        app.open_detail(Detail {
+                            name: name.clone(),
+                            context: Context::Installed,
+                            version: version.clone(),
+                            repo: String::new(),
+                            description: String::new(),
+                        })
+                    },
+                ))
+                .child(mono_text(t.version.clone(), FONT_SIZE - 2.0_f32, TEXT_MUTED).whitespace_nowrap())
+                .child(chip(if t.explicit { "explicit" } else { "dependency" }, LINE, TEXT))
+                .child(ui_text(needed, FONT_SIZE - 2.0_f32, TEXT_FAINT)),
+        )
+        .child(ui_text(t.hint, FONT_SIZE - 2.0_f32, TEXT_MUTED))
 }
 
 fn updates_tab(app: App) -> Div {
@@ -740,7 +1065,7 @@ fn updates_tab(app: App) -> Div {
 
     let footer_note = move || {
         let v = app.updates_view();
-        if v.ignored_names.is_empty() && v.explicit_targets.is_empty() {
+        if v.ignored_names.is_empty() && v.explicit_targets.is_empty() && v.origin_targets.is_empty() {
             return "Opens rio running paru -Syu --sudoloop — review and confirm there.".into();
         }
         let mut s = "Opens rio: paru -Syu --sudoloop".to_string();
@@ -752,6 +1077,10 @@ fn updates_tab(app: App) -> Div {
         if !v.explicit_targets.is_empty() {
             s += &format!(" {}", v.explicit_targets.join(" "));
         }
+        // There can be many: counted here, all of them in the terminal.
+        if !v.origin_targets.is_empty() {
+            s += &format!(" + {} reinstall target{}", v.origin_targets.len(), if v.origin_targets.len() == 1 { "" } else { "s" });
+        }
         s
     };
 
@@ -762,6 +1091,7 @@ fn updates_tab(app: App) -> Div {
         .flex()
         .flex_col()
         .gap(10.0_f32)
+        .child(untracked_card(app))
         .child(show(has_rows, move || {
             div()
                 .w_full()
@@ -784,7 +1114,7 @@ fn updates_tab(app: App) -> Div {
                 .child(div().flex_1().min_w(0.0_f32).child(faint_note(move || {
                     let v = app.updates_view();
                     format!(
-                        "{} of {} ticked — unticked are ignored for this run only{}",
+                        "{} of {} ticked — unticked are left out, for this run only{}",
                         v.selected,
                         v.pending,
                         if v.held > 0 {
@@ -1558,6 +1888,118 @@ fn repo_option_row(app: App, o: RepoOption) -> Div {
     row
 }
 
+/// An installed package's install reason, which a press changes (in a
+/// terminal: `sudo pacman -D`). The buttons show what the local DB says,
+/// read again once that step reports back; nothing flips before. How the
+/// last change of it ended, when it failed, shows here too: its card is
+/// under this view.
+fn reason_section(app: App) -> Div {
+    let local = move || app.local.with(|l| l.data.clone()).unwrap_or_default();
+    // A change of this package's reason in flight.
+    let busy = move || {
+        let name = local().name;
+        app.reason_busy.with(|b| b.as_deref() == Some(name.as_str()))
+    };
+    // Another package's: a press here waits for it (set_reason).
+    let other = move || {
+        let name = local().name;
+        app.reason_busy.with(|b| b.as_deref().filter(|b| *b != name).map(str::to_string))
+    };
+    let failed = move || {
+        let name = local().name;
+        app.run_reports.with(|cards| reason_failure(cards, &name))
+    };
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(6.0_f32)
+        .child(section_label("INSTALL REASON"))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(12.0_f32)
+                .child(segmented(
+                    vec!["Dependency", "Explicit"],
+                    move |i| local().explicit == (i == 1),
+                    move |i| app.set_reason(i == 1),
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(0.0_f32)
+                        .flex()
+                        .flex_col()
+                        .gap(1.0_f32)
+                        .child(ui_text(
+                            move || {
+                                let p = local();
+                                let reason = if p.explicit { "Explicitly installed" } else { "Installed as a dependency" };
+                                // Nothing requiring it is the consequence line's to say.
+                                let mut s = reason.to_string();
+                                if !p.required_by.is_empty() {
+                                    s += &format!(" · {}", required_by_text(&p.required_by, 6));
+                                    if !p.optional_for.is_empty() {
+                                        s += &format!(" · {}", optional_for_text(&p.optional_for, 4));
+                                    }
+                                }
+                                s
+                            },
+                            FONT_SIZE - 1.0_f32,
+                            TEXT_MUTED,
+                        ))
+                        .child(show(
+                            move || !busy() && reason_consequence(&local()).is_some(),
+                            move || {
+                                ui_text(
+                                    move || reason_consequence(&local()).unwrap_or_default(),
+                                    FONT_SIZE - 2.0_f32,
+                                    WARN_AMBER,
+                                )
+                            },
+                        ))
+                        .child(show(
+                            move || !busy() && failed().is_some(),
+                            move || {
+                                ui_text(
+                                    move || format!("{} · its card is under this view", failed().unwrap_or_default()),
+                                    FONT_SIZE - 2.0_f32,
+                                    RED,
+                                )
+                            },
+                        ))
+                        .child(show(busy, move || {
+                            mono_text(
+                                move || {
+                                    let p = local();
+                                    format!(
+                                        "Waiting for the terminal: sudo pacman -D {} {}",
+                                        if p.explicit { "--asdeps" } else { "--asexplicit" },
+                                        p.name
+                                    )
+                                },
+                                FONT_SIZE - 2.0_f32,
+                                TEXT_FAINT,
+                            )
+                        }))
+                        .child(show(
+                            move || other().is_some(),
+                            move || {
+                                faint_note(move || {
+                                    format!(
+                                        "Waiting for another install reason change ({}) to finish in its terminal",
+                                        other().unwrap_or_default()
+                                    )
+                                })
+                            },
+                        )),
+                ),
+        )
+}
+
 fn detail_overlay(app: App) -> Div {
     let d = move || {
         app.detail.get().unwrap_or(Detail {
@@ -1651,6 +2093,10 @@ fn detail_overlay(app: App) -> Div {
             ),
             None => div(),
         }))
+        .child(show(
+            move || app.local.with(|l| l.data.as_ref().is_some_and(|p| p.installed)),
+            move || untrack(|| reason_section(app)),
+        ))
         .child(show(
             move || repos_loading() || app.repos.with(|r| !r.data.is_empty()),
             || section_label("AVAILABLE REPOSITORIES"),

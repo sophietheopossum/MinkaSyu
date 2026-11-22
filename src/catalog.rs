@@ -63,6 +63,45 @@ pub struct InstalledEntry {
     pub size_bytes: u64,
 }
 
+/// What the local DB says of one package: what the detail view's install
+/// reason shows, and what marking it a dependency would leave behind.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct LocalPackage {
+    pub name: String,
+    pub installed: bool,
+    pub version: String,
+    /// %REASON%: explicitly installed, or a dependency.
+    pub explicit: bool,
+    /// The installed packages that depend on it (pacman's "Required By").
+    pub required_by: Vec<String>,
+    /// The installed packages that optionally depend on it ("Optional
+    /// For"). Only with both lists empty does `pacman -Qdt` list it as an
+    /// orphan (when it is a dependency); with only this one, `-Qdtt` does.
+    pub optional_for: Vec<String>,
+}
+
+/// LocalPackage of `name`, from an installed map (not installed: only the
+/// name, `installed` false).
+pub fn local_package(name: &str, installed: &HashMap<String, alpm::InstalledPkg>) -> LocalPackage {
+    let mut cmp = check::memo_vercmp();
+    match installed.get(name) {
+        Some(pkg) => LocalPackage {
+            name: name.to_string(),
+            installed: true,
+            version: pkg.version.clone(),
+            explicit: pkg.explicit,
+            required_by: alpm::required_by(name, installed, &mut cmp),
+            optional_for: alpm::optional_for(name, installed, &mut cmp),
+        },
+        None => LocalPackage { name: name.to_string(), ..Default::default() },
+    }
+}
+
+/// LocalPackage of `name`, read from the local DB now.
+pub fn run_local_package(name: &str) -> LocalPackage {
+    local_package(name, &alpm::read_installed(Path::new("/var/lib/pacman/local")))
+}
+
 const AUR_CAP: usize = 100;
 const TOTAL_CAP: usize = 250;
 
@@ -123,8 +162,13 @@ pub fn parse_search_output(
 /// Capture stdout, treating exit 1 as "no matches" (pacman's search
 /// convention). Any other failure is an error.
 fn capture_search(program: &str, args: &[String]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
+    capture(Command::new(program).args(args))
+}
+
+/// capture_search for a command already set up (environment and all).
+fn capture(cmd: &mut Command) -> Result<String, String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let output = cmd
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("running {program}: {e}"))?;
@@ -217,40 +261,45 @@ pub fn run_installed() -> Vec<InstalledEntry> {
     out
 }
 
-/// Parse `pacman -Si` output into (repo, name) -> (architecture,
-/// description). Blocks are `Key : value` lines separated by blanks;
-/// only the fields we show are kept.
-pub fn parse_sync_info(text: &str) -> HashMap<(String, String), (String, String)> {
+/// What `pacman -Si` says of one repository's build, for the picker: the
+/// fields shown, and what tells two builds of one version apart.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SyncInfo {
+    pub architecture: String,
+    pub description: String,
+    /// Empty when unrecorded (-Si prints "None").
+    pub packager: String,
+    /// Unix seconds; None when unknown ("None", or a date in another form
+    /// than check::parse_c_date reads).
+    pub build_date: Option<i64>,
+}
+
+/// Parse `pacman -Si` output (C locale, UTC: see sync_info) into
+/// (repo, name) -> SyncInfo. Blocks are `Key : value` lines separated by
+/// blanks; only the fields we use are kept.
+pub fn parse_sync_info(text: &str) -> HashMap<(String, String), SyncInfo> {
     let mut out = HashMap::new();
-    let mut repo = String::new();
-    let mut name = String::new();
-    let mut arch = String::new();
-    let mut desc = String::new();
-    let flush = |repo: &str, name: &str, arch: &str, desc: &str, out: &mut HashMap<(String, String), (String, String)>| {
-        if !repo.is_empty() && !name.is_empty() {
-            out.insert((repo.to_string(), name.to_string()), (arch.to_string(), desc.to_string()));
-        }
-    };
-    for line in text.lines() {
+    let mut block: (String, String, SyncInfo) = Default::default();
+    for line in text.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
-            flush(&repo, &name, &arch, &desc, &mut out);
-            repo.clear();
-            name.clear();
-            arch.clear();
-            desc.clear();
+            let (repo, name, info) = std::mem::take(&mut block);
+            if !repo.is_empty() && !name.is_empty() {
+                out.insert((repo, name), info);
+            }
             continue;
         }
         let Some((key, value)) = line.split_once(':') else { continue };
         let value = value.trim();
         match key.trim() {
-            "Repository" => repo = value.to_string(),
-            "Name" => name = value.to_string(),
-            "Architecture" => arch = value.to_string(),
-            "Description" => desc = value.to_string(),
+            "Repository" => block.0 = value.to_string(),
+            "Name" => block.1 = value.to_string(),
+            "Architecture" => block.2.architecture = value.to_string(),
+            "Description" => block.2.description = value.to_string(),
+            "Packager" if value != "None" => block.2.packager = value.to_string(),
+            "Build Date" => block.2.build_date = check::parse_build_date(value),
             _ => {}
         }
     }
-    flush(&repo, &name, &arch, &desc, &mut out);
     out
 }
 
@@ -275,48 +324,60 @@ fn mark_newest(options: &mut [RepoOption], cmp: &dyn Fn(&str, &str) -> Ordering)
 pub fn build_repo_options(
     package: &str,
     sync: &[alpm::SyncEntry],
-    info: &HashMap<(String, String), (String, String)>,
+    info: &HashMap<(String, String), SyncInfo>,
     aur_hits: &[SearchResult],
     installed: &HashMap<String, alpm::InstalledPkg>,
     cmp: &dyn Fn(&str, &str) -> Ordering,
 ) -> Vec<RepoOption> {
     let installed_pkg = installed.get(package);
-    let is_installed = |repo: &str, version: &str| -> bool {
+    let is_installed = |repo: &str, version: &str, build: Option<&SyncInfo>| -> bool {
         let Some(pkg) = installed_pkg else { return false };
         if pkg.version != version {
             return false;
         }
-        match &pkg.repo {
+        let same_origin = match &pkg.repo {
             Some(origin) => origin == repo,
             // No recorded origin and not offered by any sync repo:
-            // it can only have come from the AUR / a local build.
-            None => repo == "aur" && !sync.iter().any(|e| e.name == package),
-        }
+            // it can only have come from the AUR / a local build. Offered
+            // by one whose copy is the very build (date and packager known
+            // and equal): that repository's package, which pacman pulled in
+            // without recording it (the check's origin group).
+            None => {
+                (repo == "aur" && !sync.iter().any(|e| e.name == package))
+                    || build.is_some_and(|b| b.build_date.is_some() && b.build_date == pkg.build_date && b.packager == pkg.packager)
+            }
+        };
+        // A repository can rebuild a version in place. With both build
+        // dates known, the build must be the installed one too: same date
+        // and packager, as the check compares builds. Otherwise the
+        // version and origin decide.
+        let same_build = build.is_none_or(|b| match (pkg.build_date, b.build_date) {
+            (Some(mine), Some(theirs)) => mine == theirs && b.packager == pkg.packager,
+            _ => true,
+        });
+        same_origin && same_build
     };
 
     let mut out: Vec<RepoOption> = Vec::new();
     for (idx, entry) in sync.iter().filter(|e| e.name == package).enumerate() {
-        let (arch, desc) = info
-            .get(&(entry.repo.clone(), entry.name.clone()))
-            .cloned()
-            .unwrap_or_default();
+        let build = info.get(&(entry.repo.clone(), entry.name.clone()));
         out.push(RepoOption {
             target: format!("{}/{}", entry.repo, entry.name),
             is_default: idx == 0,
-            is_installed: is_installed(&entry.repo, &entry.version),
+            is_installed: is_installed(&entry.repo, &entry.version, build),
             is_newest: false,
             repo: entry.repo.clone(),
             name: entry.name.clone(),
             version: entry.version.clone(),
-            architecture: arch,
-            description: desc,
+            architecture: build.map(|b| b.architecture.clone()).unwrap_or_default(),
+            description: build.map(|b| b.description.clone()).unwrap_or_default(),
         });
     }
     for hit in aur_hits.iter().filter(|h| h.name == package && h.repo == "aur") {
         out.push(RepoOption {
             target: format!("aur/{}", hit.name),
             is_default: false,
-            is_installed: is_installed("aur", &hit.version),
+            is_installed: is_installed("aur", &hit.version, None),
             is_newest: false,
             repo: "aur".to_string(),
             name: hit.name.clone(),
@@ -329,10 +390,10 @@ pub fn build_repo_options(
     out
 }
 
-/// Architecture + description for a handful of repo/name targets via
-/// one `pacman -Si` call; empty on any failure (the picker still
-/// works from the sync list alone).
-fn sync_info(targets: &[String]) -> HashMap<(String, String), (String, String)> {
+/// Architecture, description and build (date, packager) for a handful
+/// of repo/name targets via one `pacman -Si` call; empty on any failure
+/// (the picker still works from the sync list alone).
+fn sync_info(targets: &[String]) -> HashMap<(String, String), SyncInfo> {
     if targets.is_empty() {
         return HashMap::new();
     }
@@ -346,7 +407,11 @@ fn sync_info(targets: &[String]) -> HashMap<(String, String), (String, String)> 
     }
     args.push("--".into());
     args.extend(targets.iter().cloned());
-    capture_search("pacman", &args).map(|t| parse_sync_info(&t)).unwrap_or_default()
+    // The C locale and UTC: English field names, which the parser
+    // matches, and the Build Date in check::parse_c_date's form.
+    capture(Command::new("pacman").args(&args).env("LC_ALL", "C").env("TZ", "UTC0"))
+        .map(|t| parse_sync_info(&t))
+        .unwrap_or_default()
 }
 
 /// Every build of one package the repos (+ AUR) currently offer, in
@@ -400,6 +465,7 @@ mod tests {
                 description: String::new(),
                 size_bytes: 0,
                 explicit: true,
+                ..Default::default()
             },
         )])
     }
@@ -428,9 +494,20 @@ cachyos-extra-v4/fastfetch 2.70.0-1.1 [0 B 2.01 MiB] [installed]\n    A fast sys
              extra bcachefs-dkms 3:1.39.7-1\n\
              minka bcachefs-dkms 3:1.39.7-2\n",
         );
+        // -Si as sync_info runs it (C locale, UTC); the installed build is
+        // cachyos-extra-v4's, the same date and packager.
         let info = parse_sync_info(
-            "Repository      : minka\nName            : bcachefs-dkms\nArchitecture    : x86_64\nDescription     : bcachefs DKMS\n\n",
+            "Repository      : cachyos-extra-v4\nName            : bcachefs-dkms\n\
+             Architecture    : x86_64_v4\nPackager        : CachyOS <admin@cachyos.org>\n\
+             Build Date      : Thu Aug 27 12:25:22 2026\n\n\
+             Repository      : minka\nName            : bcachefs-dkms\nArchitecture    : x86_64\n\
+             Description     : bcachefs DKMS\nOptional Deps   : linux-headers: build the module\n\
+             \x20                 dkms: rebuild it\nPackager        : None\nBuild Date      : None\n",
         );
+        let cachy = &info[&("cachyos-extra-v4".to_string(), "bcachefs-dkms".to_string())];
+        assert_eq!((cachy.build_date, cachy.packager.as_str()), (Some(1787833522), "CachyOS <admin@cachyos.org>"));
+        let own = &info[&("minka".to_string(), "bcachefs-dkms".to_string())];
+        assert_eq!((own.build_date, own.packager.as_str(), own.description.as_str()), (None, "", "bcachefs DKMS"));
         let installed = HashMap::from([(
             "bcachefs-dkms".to_string(),
             alpm::InstalledPkg {
@@ -439,15 +516,118 @@ cachyos-extra-v4/fastfetch 2.70.0-1.1 [0 B 2.01 MiB] [installed]\n    A fast sys
                 description: String::new(),
                 size_bytes: 0,
                 explicit: true,
+                build_date: Some(1787833522),
+                packager: "CachyOS <admin@cachyos.org>".into(),
+                ..Default::default()
             },
         )]);
         let opts = build_repo_options("bcachefs-dkms", &sync, &info, &[], &installed, &|a, b| a.cmp(b));
         assert_eq!(opts.len(), 3);
         assert!(opts[0].is_default && opts[0].is_installed && !opts[0].is_newest);
         assert_eq!(opts[0].target, "cachyos-extra-v4/bcachefs-dkms");
+        assert_eq!(opts[0].architecture, "x86_64_v4");
         assert!(opts[2].is_newest && !opts[2].is_default);
         assert_eq!(opts[2].architecture, "x86_64");
         assert_eq!(opts[2].target, "minka/bcachefs-dkms");
+    }
+
+    #[test]
+    fn a_build_rebuilt_in_place_is_not_the_installed_one() {
+        // Installed from [minka]; [minka] has since rebuilt that version
+        // without a pkgrel bump (the same-repo switch row's case).
+        let sync = alpm::parse_sync_list("cachyos yy 2.0-1\nminka yy 2.0-1\n");
+        let si = |repo: &str, date: &str| {
+            format!("Repository      : {repo}\nName            : yy\nPackager        : P <p@example.org>\nBuild Date      : {date}\n\n")
+        };
+        let built = |date: i64| {
+            HashMap::from([(
+                "yy".to_string(),
+                alpm::InstalledPkg {
+                    version: "2.0-1".into(),
+                    repo: Some("minka".into()),
+                    build_date: Some(date),
+                    packager: "P <p@example.org>".into(),
+                    ..Default::default()
+                },
+            )])
+        };
+        let info = parse_sync_info(&format!("{}{}", si("cachyos", "Sun Nov  1 10:00:00 2026"), si("minka", "Sat Nov 22 01:48:00 2026")));
+        let opts = build_repo_options("yy", &sync, &info, &[], &built(1725703316), &|a, b| a.cmp(b));
+        assert!(opts.iter().all(|o| !o.is_installed), "{opts:#?}");
+        // The same build: installed. Without -Si's details: the version
+        // and origin decide, as before.
+        let opts = build_repo_options("yy", &sync, &info, &[], &built(1795312080), &|a, b| a.cmp(b));
+        assert!(!opts[0].is_installed && opts[1].is_installed, "{opts:#?}");
+        let opts = build_repo_options("yy", &sync, &HashMap::new(), &[], &built(1725703316), &|a, b| a.cmp(b));
+        assert!(!opts[0].is_installed && opts[1].is_installed, "{opts:#?}");
+        // Another packager on the same date is another build.
+        let other = si("minka", "Sat Nov 22 01:48:00 2026").replace("P <p@", "Q <q@");
+        let opts = build_repo_options("yy", &sync, &parse_sync_info(&other), &[], &built(1795312080), &|a, b| a.cmp(b));
+        assert!(!opts[1].is_installed, "{opts:#?}");
+    }
+
+    #[test]
+    fn an_unrecorded_repo_build_is_installed_from_that_repo() {
+        // No %INSTALLED_DB% (pulled in as a dependency): the copy that is
+        // the very build is the installed one; another build is not.
+        let sync = alpm::parse_sync_list("cachyos zstd 1.5.7-2\nextra zstd 1.5.7-2\n");
+        let si = |repo: &str, date: &str| {
+            format!("Repository      : {repo}\nName            : zstd\nPackager        : P <p@example.org>\nBuild Date      : {date}\n\n")
+        };
+        let info = parse_sync_info(&format!("{}{}", si("cachyos", "Sun Nov  1 10:00:00 2026"), si("extra", "Tue Aug 12 12:00:00 2025")));
+        let installed = HashMap::from([(
+            "zstd".to_string(),
+            alpm::InstalledPkg {
+                version: "1.5.7-2".into(),
+                build_date: Some(1755000000),
+                packager: "P <p@example.org>".into(),
+                ..Default::default()
+            },
+        )]);
+        let opts = build_repo_options("zstd", &sync, &info, &[], &installed, &|a, b| a.cmp(b));
+        assert!(!opts[0].is_installed && opts[1].is_installed, "{opts:#?}");
+        // Without -Si's details nothing can say which it is.
+        let opts = build_repo_options("zstd", &sync, &HashMap::new(), &[], &installed, &|a, b| a.cmp(b));
+        assert!(opts.iter().all(|o| !o.is_installed), "{opts:#?}");
+    }
+
+    #[test]
+    fn local_package_reports_reason_and_dependents() {
+        let installed = HashMap::from([
+            (
+                "libwpe".to_string(),
+                alpm::InstalledPkg {
+                    version: "1.16.3-1.1".into(),
+                    provides: check::parse_depstring("libwpe-1.0.so=1-64").into_iter().collect(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "wpebackend-fdo".to_string(),
+                alpm::InstalledPkg {
+                    version: "1.16.1-1.1".into(),
+                    depends: check::parse_depstring("libwpe-1.0.so=1-64").into_iter().collect(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "app".to_string(),
+                alpm::InstalledPkg {
+                    version: "1-1".into(),
+                    optdepends: check::parse_depstring("wpebackend-fdo").into_iter().collect(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let l = local_package("libwpe", &installed);
+        assert!(l.installed && !l.explicit);
+        assert_eq!((l.version.as_str(), l.required_by.as_slice()), ("1.16.3-1.1", &["wpebackend-fdo".to_string()][..]));
+        assert!(l.optional_for.is_empty());
+        let fdo = local_package("wpebackend-fdo", &installed);
+        assert!(fdo.required_by.is_empty());
+        assert_eq!(fdo.optional_for, ["app"]);
+        let absent = local_package("nope", &installed);
+        assert!(!absent.installed && absent.name == "nope");
     }
 
     #[test]

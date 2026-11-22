@@ -75,6 +75,45 @@ pub struct Update {
     /// keeps them ticked while this row is.
     #[serde(default)]
     pub reinstalls: Vec<String>,
+    /// A switch: nothing newer anywhere, but no repository carries the
+    /// installed build, while `candidate_repo` carries the same version
+    /// as a build of its own (the installed one came from the AUR or a
+    /// file, or from a repository that dropped or rebuilt it). Also an
+    /// `explicit_target`, with no `first_repo`: -Syu never touches the
+    /// package, and the `repo/name` target makes pacman reinstall it
+    /// from there. Unticked, it is simply not targeted: never --ignore.
+    #[serde(default)]
+    pub switch_build: bool,
+    /// Not empty only on the origin group's row (named ORIGIN_GROUP): the
+    /// installed packages with no %INSTALLED_DB% whose very build a
+    /// repository carries, each reinstalled from that repository as a
+    /// `repo/name` target, which records it. One row, so they count as one
+    /// update (State::total, the notification, MinkaShell's pill), however
+    /// many there are. Its `candidate_repo` lists their repositories and is
+    /// no target itself: explicit_targets expands the row.
+    #[serde(default)]
+    pub origin_group: Vec<OriginMember>,
+}
+
+/// The origin group's row name. Not a package name (they have no spaces),
+/// so it never meets a real package; never passed to paru either.
+pub const ORIGIN_GROUP: &str = "(no recorded repository)";
+
+/// One package of the origin group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OriginMember {
+    pub name: String,
+    pub version: String,
+    /// The repository whose copy is the installed build (the first in
+    /// pacman.conf order, when several are): its reinstall target.
+    pub repo: String,
+    pub explicit: bool,
+}
+
+impl OriginMember {
+    pub fn target(&self) -> String {
+        format!("{}/{}", self.repo, self.name)
+    }
 }
 
 impl Update {
@@ -82,6 +121,20 @@ impl Update {
     /// standing for a package that a replacement removes.
     pub fn pending(&self) -> bool {
         !self.held && self.superseded_by.is_empty()
+    }
+
+    /// Whether this is the origin group's row.
+    pub fn is_origin_group(&self) -> bool {
+        !self.origin_group.is_empty()
+    }
+
+    /// What a switch row does, in words.
+    pub fn switch_note(&self) -> String {
+        if self.installed_repo.as_deref() == Some(self.candidate_repo.as_str()) {
+            format!("reinstall {}'s current build", self.candidate_repo)
+        } else {
+            format!("switch to {}'s build", self.candidate_repo)
+        }
     }
 }
 
@@ -93,7 +146,7 @@ pub struct Replaced {
     pub installed_repo: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub schema: u32,
     /// Unix seconds of the last successful check.
@@ -103,6 +156,46 @@ pub struct State {
     /// Total update count at last notification; notification fires only
     /// when the count grows past this.
     pub last_notified_count: usize,
+    /// Installed packages nothing tracks: no repository has their build,
+    /// and neither does the AUR, or paru never asks it (see
+    /// untracked_candidates). An error to fix, not an update: never counted.
+    #[serde(default)]
+    pub untracked: Vec<Untracked>,
+    /// Set when the AUR could not be asked which candidates it has: then no
+    /// package in no repository is flagged (the AUR's would be), and this
+    /// says so.
+    #[serde(default)]
+    pub aur_unreachable: Option<String>,
+}
+
+/// An installed package nothing tracks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Untracked {
+    pub name: String,
+    pub version: String,
+    pub explicit: bool,
+    /// The installed packages that depend on it (alpm::required_by).
+    pub required_by: Vec<String>,
+    /// The installed packages that optionally depend on it
+    /// (alpm::optional_for).
+    #[serde(default)]
+    pub optional_for: Vec<String>,
+    /// %INSTALLED_DB%, when one was recorded (that repository dropped it).
+    pub installed_repo: Option<String>,
+    /// "no_source": in no repository and not in the AUR. "other_build":
+    /// repositories have the name, but none this version, no repository
+    /// was recorded, and it was installed from a file with no signature
+    /// (%VALIDATION% none).
+    pub kind: String,
+    /// The repositories' versions of that name, "repo version", for
+    /// "other_build".
+    pub repo_versions: Vec<String>,
+    /// The AUR's version of that name, for "other_build": paru never asks
+    /// the AUR about a name a repository has, so it tracks nothing.
+    #[serde(default)]
+    pub aur_version: Option<String>,
+    /// What to do about it, in one line.
+    pub hint: String,
 }
 
 impl State {
@@ -203,6 +296,36 @@ fn satisfies(
     }
 }
 
+/// Whether a package (its name, version and provides) satisfies a
+/// depstring, as libalpm's _alpm_depcmp decides it: by name, its version
+/// checked against the constraint, or by a provide of that name, whose
+/// version must then be an `=` one that satisfies it (an unversioned
+/// provide only satisfies an unversioned depstring). The same rule serves
+/// dependencies, optional ones and conflicts.
+pub(crate) fn dep_matches(
+    dep: &DepSpec,
+    name: &str,
+    version: &str,
+    provides: &[DepSpec],
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> bool {
+    (dep.name == name && satisfies(version, &dep.constraint, cmp))
+        || provides.iter().any(|p| {
+            p.name == dep.name
+                && match (&dep.constraint, &p.constraint) {
+                    (None, _) => true,
+                    (Some(_), Some((op, v))) if op == "=" => satisfies(v, &dep.constraint, cmp),
+                    (Some(_), _) => false,
+                }
+        })
+}
+
+/// system_vercmp, each pair of versions asked only once.
+pub(crate) fn memo_vercmp() -> impl FnMut(&str, &str) -> Ordering {
+    let mut cache: HashMap<(String, String), Ordering> = HashMap::new();
+    move |a, b| *cache.entry((a.to_string(), b.to_string())).or_insert_with(|| system_vercmp(a, b))
+}
+
 /// IgnorePkg / IgnoreGroup matching exactly as libalpm does it
 /// (_alpm_fnmatch: glibc's fnmatch(3) with no flags), so character
 /// classes, ranges, escapes and malformed patterns all behave the same.
@@ -224,8 +347,10 @@ pub struct Conf {
     /// Repos `-Su` upgrades from (`Usage` includes Upgrade, or All).
     /// None when pacman-conf could not say: then every repo counts.
     pub upgrade_repos: Option<HashSet<String>>,
-    /// Repos an explicit `repo/name` target can install from (`Usage`
-    /// includes Install, or All). None as above.
+    /// Repos pacman.conf lets plain `-S` installs use (`Usage` includes
+    /// Install, or All). None as above. An explicit `repo/name` target
+    /// can use any repository whatever its Usage (pacman adds Install for
+    /// it), so this is the user's choice of repos to offer, not a limit.
     pub install_repos: Option<HashSet<String>>,
     pub pkg_patterns: Vec<String>,
     pub group_patterns: Vec<String>,
@@ -273,17 +398,7 @@ impl SupTarget {
     /// other package (constraint against its version) or something it
     /// provides (constraint against the provided version, if any).
     fn conflicts_with(&self, other: &SupTarget, cmp: &mut dyn FnMut(&str, &str) -> Ordering) -> bool {
-        self.conflicts.iter().any(|c| {
-            (c.name == other.name && satisfies(&other.version, &c.constraint, cmp))
-                || other.provides.iter().any(|p| {
-                    p.name == c.name
-                        && match (&c.constraint, &p.constraint) {
-                            (None, _) => true,
-                            (Some(_), Some((op, v))) if op == "=" => satisfies(v, &c.constraint, cmp),
-                            (Some(_), _) => false,
-                        }
-                })
-        })
+        self.conflicts.iter().any(|c| dep_matches(c, &other.name, &other.version, &other.provides, cmp))
     }
 }
 
@@ -510,12 +625,7 @@ pub struct Inputs<'a> {
 /// rows are never promoted. Everything except the injected version
 /// comparison is pure.
 pub fn merge_updates(inputs: &Inputs) -> Vec<Update> {
-    let mut cache: HashMap<(String, String), Ordering> = HashMap::new();
-    merge_updates_with_cmp(inputs, &mut |a, b| {
-        *cache
-            .entry((a.to_string(), b.to_string()))
-            .or_insert_with(|| system_vercmp(a, b))
-    })
+    merge_updates_with_cmp(inputs, &mut memo_vercmp())
 }
 
 fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Ordering) -> Vec<Update> {
@@ -567,7 +677,7 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
     }
 
     let in_sync: HashSet<&str> = sync_entries.iter().map(|e| e.name.as_str()).collect();
-    // Explicit candidates: only repos an explicit target can install from.
+    // Explicit candidates: only repos pacman.conf lets installs use.
     let mut sync_by_name: HashMap<&str, Vec<&alpm::SyncEntry>> = HashMap::new();
     for entry in sync_entries.iter().filter(|e| conf.installs_from(&e.repo)) {
         sync_by_name.entry(entry.name.as_str()).or_default().push(entry);
@@ -667,6 +777,8 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
             superseded_by: Vec::new(),
             new_install: false,
             reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
         });
     }
 
@@ -716,6 +828,8 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
                 superseded_by: Vec::new(),
                 new_install: false,
                 reinstalls: Vec::new(),
+                switch_build: false,
+                origin_group: Vec::new(),
             });
         }
     }
@@ -748,6 +862,8 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
             superseded_by: Vec::new(),
             new_install: false,
             reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
         });
     }
 
@@ -792,6 +908,8 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
                 superseded_by: Vec::new(),
                 new_install,
                 reinstalls: reinstalls.get(&r.name).cloned().unwrap_or_default(),
+                switch_build: false,
+                origin_group: Vec::new(),
             });
         }
     }
@@ -811,31 +929,36 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
     updates
 }
 
-/// Groups and replaces of an explicit candidate's build: -Su's target
-/// set cannot speak for builds a plain -Syu never selects.
+/// Groups, replaces and conflicts of an explicit candidate's build: -Su's
+/// target set cannot speak for builds a plain -Syu never selects.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CandidateInfo {
     pub groups: Vec<String>,
     pub replaces: Vec<DepSpec>,
+    pub conflicts: Vec<DepSpec>,
 }
 
+/// (repo, name) -> that explicit row's build.
+pub type CandidateInfos = HashMap<(String, String), CandidateInfo>;
+
 /// The print format of explicit-build queries: name, repo, groups,
-/// replaces. Print mode never wraps lines or translates field names,
-/// which `pacman -Si` does.
-const BUILD_FORMAT: &str = "%n|%r|%G|%R";
+/// replaces, conflicts. Print mode never wraps lines or translates field
+/// names, which `pacman -Si` does.
+const BUILD_FORMAT: &str = "%n|%r|%G|%R|%H";
 
 /// Parse `pacman -Sp ... --print-format BUILD_FORMAT` lines.
 pub fn parse_candidate_info(text: &str) -> HashMap<(String, String), CandidateInfo> {
     text.lines()
         .filter_map(|line| {
-            let mut f = line.splitn(4, '|');
+            let mut f = line.splitn(5, '|');
             let (name, repo) = (f.next()?, f.next()?);
             if name.is_empty() || repo.is_empty() {
                 return None;
             }
             let groups = f.next().unwrap_or("").split_whitespace().map(String::from).collect();
             let replaces = f.next().unwrap_or("").split_whitespace().filter_map(parse_depstring).collect();
-            Some(((repo.to_string(), name.to_string()), CandidateInfo { groups, replaces }))
+            let conflicts = f.next().unwrap_or("").split_whitespace().filter_map(parse_depstring).collect();
+            Some(((repo.to_string(), name.to_string()), CandidateInfo { groups, replaces, conflicts }))
         })
         .collect()
 }
@@ -926,6 +1049,571 @@ pub fn annotate_explicit(
             });
         }
     }
+}
+
+/// One sync repository's build of a package, from a build lookup: with
+/// the version, what tells two builds of one version apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncBuild {
+    pub version: String,
+    pub build_date: Option<i64>,
+    pub packager: String,
+}
+
+/// (repo, name) -> that repository's build.
+pub type SyncBuilds = HashMap<(String, String), SyncBuild>;
+
+/// The print format of build lookups: name, repo, version, build date,
+/// packager. pacman prints the date with strftime's %c, so the lookup
+/// runs with LC_ALL=C and TZ=UTC0 for one fixed form (parse_c_date).
+const SWITCH_FORMAT: &str = "%n|%r|%v|%b|%p";
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+/// days_from_civil).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// strftime's %c in the C locale, read as UTC ("Thu Aug 27 12:25:22
+/// 2026", the day space-padded): Unix seconds, or None for anything else.
+/// pacman prints the epoch ("Thu Jan  1 00:00:00 1970") for a build
+/// without a date, which this reads as 0 (parse_build_date drops it), and
+/// leaves a literal "%b" for a date of -1, which this refuses.
+pub fn parse_c_date(text: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let f: Vec<&str> = text.split_whitespace().collect();
+    let [_weekday, month, day, time, year] = f.as_slice() else {
+        return None;
+    };
+    let month = MONTHS.iter().position(|m| m == month)? as i64 + 1;
+    let day: i64 = day.parse().ok()?;
+    let year: i64 = year.parse().ok()?;
+    let hms: Vec<i64> = time.split(':').map(|v| v.parse().ok()).collect::<Option<_>>()?;
+    let [h, m, s] = hms.as_slice() else {
+        return None;
+    };
+    if !(1..=31).contains(&day) || !(0..24).contains(h) || !(0..60).contains(m) || !(0..=60).contains(s) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86400 + h * 3600 + m * 60 + s)
+}
+
+/// A sync build's date as pacman prints it (%b, or -Si's "Build Date"),
+/// None when unknown. The epoch is pacman's form of "no date": libalpm
+/// never writes a local %BUILDDATE% of 0, so a 0 here could never match
+/// an installed build anyway.
+pub(crate) fn parse_build_date(text: &str) -> Option<i64> {
+    parse_c_date(text).filter(|d| *d != 0)
+}
+
+/// Parse `pacman -Sp ... --print-format SWITCH_FORMAT` lines.
+pub fn parse_sync_builds(text: &str) -> SyncBuilds {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.splitn(5, '|');
+            let (name, repo, version, date, packager) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+            if name.is_empty() || repo.is_empty() || version.is_empty() {
+                return None;
+            }
+            let build = SyncBuild {
+                version: version.to_string(),
+                build_date: parse_build_date(date),
+                packager: packager.to_string(),
+            };
+            Some(((repo.to_string(), name.to_string()), build))
+        })
+        .collect()
+}
+
+/// Whether a repository's build is the installed one: same version,
+/// build date and packager (what the local DB keeps of a build).
+fn is_installed_build(pkg: &alpm::InstalledPkg, build: &SyncBuild) -> bool {
+    build.version == pkg.version
+        && build.build_date.is_some()
+        && build.build_date == pkg.build_date
+        && build.packager == pkg.packager
+}
+
+/// An installed package that may be a switch: no row touches it, and some
+/// repository carries its exact version.
+struct SwitchSuspect<'a> {
+    name: &'a str,
+    pkg: &'a alpm::InstalledPkg,
+    /// The repositories carrying that version, in pacman.conf order.
+    copies: Vec<&'a str>,
+}
+
+fn switch_suspects<'a>(
+    updates: &[Update],
+    installed: &'a HashMap<String, alpm::InstalledPkg>,
+    sync_entries: &'a [alpm::SyncEntry],
+) -> Vec<SwitchSuspect<'a>> {
+    // A package with a row of its own (an upgrade, held or not, a later
+    // repo, the AUR, a replacement) or one a replacement removes or
+    // installs again is the list's already.
+    let mut touched: HashSet<&str> = HashSet::new();
+    for u in updates {
+        touched.insert(u.name.as_str());
+        touched.extend(u.replaces.iter().map(|r| r.name.as_str()));
+        touched.extend(u.reinstalls.iter().map(String::as_str));
+    }
+    let mut by_name: HashMap<&str, Vec<&alpm::SyncEntry>> = HashMap::new();
+    for e in sync_entries {
+        by_name.entry(e.name.as_str()).or_default().push(e);
+    }
+    let mut out: Vec<SwitchSuspect> = installed
+        .iter()
+        .filter(|(name, pkg)| !touched.contains(name.as_str()) && pkg.build_date.is_some())
+        .filter_map(|(name, pkg)| {
+            let copies: Vec<&str> = by_name
+                .get(name.as_str())?
+                .iter()
+                .filter(|e| e.version == pkg.version)
+                .map(|e| e.repo.as_str())
+                .collect();
+            (!copies.is_empty()).then_some(SwitchSuspect { name, pkg, copies })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(b.name));
+    out
+}
+
+/// The next builds to look up for switch_rows, at most one per package
+/// (pacman refuses a name twice in one transaction): for each suspect no
+/// looked-up copy has matched yet, its next copy not yet `tried`. Every
+/// copy is looked up, whatever its repository's Usage: a `repo/name`
+/// lookup works in any repository, and switch_rows needs every copy's
+/// build. Suspects with no copy in a repository pacman.conf lets installs
+/// use are skipped, since switch_rows has no target for them. The
+/// installed origin's copy goes first, as the one most likely to be the
+/// installed build, so one round mostly settles everything; then
+/// pacman.conf order. Empty once nothing is left to learn.
+pub fn switch_lookups(
+    updates: &[Update],
+    inputs: &Inputs,
+    builds: &SyncBuilds,
+    tried: &HashSet<(String, String)>,
+) -> Vec<(String, String)> {
+    let Inputs { installed, sync_entries, conf, .. } = *inputs;
+    let key = |repo: &str, name: &str| (repo.to_string(), name.to_string());
+    switch_suspects(updates, installed, sync_entries)
+        .into_iter()
+        .filter(|s| s.copies.iter().any(|r| conf.installs_from(r)))
+        .filter_map(|s| {
+            let matched = s
+                .copies
+                .iter()
+                .any(|r| builds.get(&key(r, s.name)).is_some_and(|b| is_installed_build(s.pkg, b)));
+            if matched {
+                return None;
+            }
+            let origin = s.pkg.repo.as_deref().filter(|o| s.copies.contains(o));
+            origin
+                .into_iter()
+                .chain(s.copies.iter().copied().filter(|r| Some(*r) != origin))
+                .map(|r| key(r, s.name))
+                .find(|k| !tried.contains(k))
+        })
+        .collect()
+}
+
+/// Same-version switches. A row for each installed package that no row
+/// touches, that some repository carries at exactly the installed
+/// version, and whose build (date and packager) is none of those copies:
+/// it came from the AUR or a file, or from a repository that dropped the
+/// package or rebuilt it. -Syu never touches it, since nothing is newer.
+/// The row offers the first repository in pacman.conf order (of those
+/// pacman.conf lets installs use) with that version, as an explicit
+/// `repo/name` target; pacman reinstalls the package from there, since
+/// MinkaSyu never passes --needed. Every copy's build must be known: one
+/// not looked up settles nothing, so no row. IgnorePkg/IgnoreGroup on the
+/// installed package hold it, like every other row (IgnoreGroup on the
+/// new build: annotate_explicit). A switch that something the run may
+/// install conflicts with is dropped afterwards (add_build_rows).
+pub fn switch_rows(updates: &[Update], inputs: &Inputs, builds: &SyncBuilds) -> Vec<Update> {
+    let Inputs { installed, sync_entries, conf, .. } = *inputs;
+    switch_suspects(updates, installed, sync_entries)
+        .into_iter()
+        .filter_map(|s| {
+            for repo in &s.copies {
+                let build = builds.get(&(repo.to_string(), s.name.to_string()))?;
+                if build.version != s.pkg.version || build.build_date.is_none() || is_installed_build(s.pkg, build) {
+                    return None;
+                }
+            }
+            let target = *s.copies.iter().find(|r| conf.installs_from(r))?;
+            let held = conf.ignored.contains(s.name);
+            let installed_repo = s.pkg.repo.clone();
+            Some(Update {
+                transition: transition(&installed_repo, target),
+                name: s.name.to_string(),
+                old_version: s.pkg.version.clone(),
+                new_version: s.pkg.version.clone(),
+                installed_repo,
+                candidate_repo: target.to_string(),
+                explicit_target: true,
+                first_repo: None,
+                first_version: None,
+                replaces: Vec::new(),
+                held,
+                held_by: held.then(|| "ignore".to_string()),
+                superseded_by: Vec::new(),
+                new_install: false,
+                reinstalls: Vec::new(),
+                switch_build: true,
+                origin_group: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// What a run may install, each with what it conflicts with: -Su's
+/// target set (the run without -dd when there was one), and the builds of
+/// every explicit row, ticked or not (the check cannot know which will
+/// be).
+pub type RunInstalls = Vec<(String, Vec<DepSpec>)>;
+
+pub fn run_installs(inputs: &Inputs, updates: &[Update], info: &CandidateInfos) -> RunInstalls {
+    let targets = inputs.final_targets.or(inputs.sysupgrade).unwrap_or_default();
+    let mut out: RunInstalls = targets.iter().map(|t| (t.name.clone(), t.conflicts.clone())).collect();
+    for u in updates.iter().filter(|u| u.explicit_target && u.pending()) {
+        if let Some(build) = info.get(&(u.candidate_repo.clone(), u.name.clone())) {
+            out.push((u.name.clone(), build.conflicts.clone()));
+        }
+    }
+    out
+}
+
+/// Whether something the run may install conflicts with the installed
+/// package `name`: a conflicts entry it satisfies (dep_matches, against
+/// its version and provides). A `repo/name` target of that package would
+/// then make pacman abort the whole transaction ("unresolvable package
+/// conflicts"), where without the target it asks to remove the package.
+fn conflicted(
+    installs: &RunInstalls,
+    name: &str,
+    pkg: &alpm::InstalledPkg,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> bool {
+    installs
+        .iter()
+        .any(|(by, conflicts)| by != name && conflicts.iter().any(|c| dep_matches(c, name, &pkg.version, &pkg.provides, cmp)))
+}
+
+/// The rows the build lookup adds to the merge's, in the order they need:
+/// - the switches first: they are explicit targets, so annotate_explicit
+///   reads their builds (`info_for`) for IgnoreGroup and replaces too;
+/// - then any switch that something the run may install conflicts with
+///   goes (`conflicted`), and another build may then list its package as
+///   replaced;
+/// - the origin group last, so the replaces annotate_explicit adds keep
+///   their packages out of it, and so does a conflict.
+pub fn add_build_rows(
+    updates: &mut Vec<Update>,
+    inputs: &Inputs,
+    builds: &SyncBuilds,
+    info_for: &mut dyn FnMut(&[Update]) -> CandidateInfos,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) {
+    let switches = switch_rows(updates, inputs, builds);
+    updates.extend(switches);
+    updates.sort_by(|a, b| a.name.cmp(&b.name));
+    let info = info_for(updates);
+    annotate_explicit(updates, &info, inputs, cmp);
+    let installs = run_installs(inputs, updates, &info);
+    let before = updates.len();
+    updates.retain(|u| {
+        !u.switch_build || !inputs.installed.get(&u.name).is_some_and(|pkg| conflicted(&installs, &u.name, pkg, cmp))
+    });
+    if updates.len() != before {
+        // A dropped switch's package is no explicit row now, which kept
+        // another build from listing it as replaced. A second pass only
+        // adds what the first skipped for that.
+        annotate_explicit(updates, &info, inputs, cmp);
+    }
+    let members = origin_members(updates, inputs, builds, &installs, cmp);
+    updates.extend(origin_group_row(members, inputs.sync_entries));
+    updates.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+/// The origin group's packages: installed with no %INSTALLED_DB%, no row
+/// touching them, and a repository carrying their very build (version,
+/// build date and packager), found by the same lookup as the switches.
+/// libalpm records the repository only for a named target or a plain
+/// sysupgrade candidate, so a package pulled in as a dependency, or as a
+/// replacement, has none until its next upgrade; nothing is wrong with
+/// the package itself. Reinstalling it from that repository, as a
+/// `repo/name` target, records it. When several copies are the build, the
+/// first in pacman.conf order (the lookup's order) is the target. Left
+/// out:
+/// - a package IgnorePkg/IgnoreGroup holds back: an explicit target of it
+///   makes pacman ask to install it anyway;
+/// - a package something the run may install conflicts with (`installs`,
+///   see conflicted): its target would abort the whole -Syu.
+///
+/// Not seen: conflicts of dependencies new to the run (the -dd query
+/// leaves them out), and a member's own %CONFLICTS%.
+pub fn origin_members(
+    updates: &[Update],
+    inputs: &Inputs,
+    builds: &SyncBuilds,
+    installs: &RunInstalls,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Vec<OriginMember> {
+    let Inputs { installed, sync_entries, conf, .. } = *inputs;
+    switch_suspects(updates, installed, sync_entries)
+        .into_iter()
+        .filter(|s| s.pkg.repo.is_none() && !conf.ignored.contains(s.name))
+        .filter(|s| !conflicted(installs, s.name, s.pkg, cmp))
+        .filter_map(|s| {
+            let repo = s
+                .copies
+                .iter()
+                .find(|r| builds.get(&(r.to_string(), s.name.to_string())).is_some_and(|b| is_installed_build(s.pkg, b)))?;
+            Some(OriginMember {
+                name: s.name.to_string(),
+                version: s.pkg.version.clone(),
+                repo: repo.to_string(),
+                explicit: s.pkg.explicit,
+            })
+        })
+        .collect()
+}
+
+/// The one row standing for the origin group, or None without members.
+/// Its `candidate_repo` names the members' repositories in pacman.conf
+/// order, for reading only; `old_version` and `new_version` say what the
+/// row does, for front ends that show any row as "old → new" (the QML
+/// one). A plain explicit target otherwise: unticked it is only left out,
+/// never --ignore (main.rs paru_ignore). A sync reinstall keeps each
+/// package's install reason (libalpm copies %REASON% from the installed
+/// package), so dependencies stay dependencies with no -D afterwards.
+pub fn origin_group_row(members: Vec<OriginMember>, sync_entries: &[alpm::SyncEntry]) -> Option<Update> {
+    if members.is_empty() {
+        return None;
+    }
+    let mut repos: Vec<&str> = Vec::new();
+    for e in sync_entries {
+        if !repos.contains(&e.repo.as_str()) && members.iter().any(|m| m.repo == e.repo) {
+            repos.push(&e.repo);
+        }
+    }
+    let n = members.len();
+    Some(Update {
+        name: ORIGIN_GROUP.to_string(),
+        old_version: format!("{n} package{}", if n == 1 { "" } else { "s" }),
+        new_version: "same builds".to_string(),
+        installed_repo: None,
+        candidate_repo: repos.join(", "),
+        transition: Transition::UnknownSource,
+        explicit_target: true,
+        first_repo: None,
+        first_version: None,
+        replaces: Vec::new(),
+        held: false,
+        held_by: None,
+        superseded_by: Vec::new(),
+        new_install: false,
+        reinstalls: Vec::new(),
+        switch_build: false,
+        origin_group: members,
+    })
+}
+
+/// Installed packages that may be untracked, before the AUR is asked
+/// about them (flag_untracked). No row may touch them (an update, a
+/// replacement, an AUR update: those are tracked, or about to change).
+/// Two kinds:
+/// - "no_source": no repository has a package of that name, whatever was
+///   recorded (a recorded repository that dropped it tracks nothing now).
+///   paru checks such "foreign" packages against the AUR, so an AUR
+///   package of that name tracks it;
+/// - "other_build": repositories have the name, but not this version, no
+///   repository was recorded, and libalpm validated the file with nothing
+///   (%VALIDATION% none): installed with -U from a file with no signature,
+///   often an AUR build. paru splits installed packages by whether a sync
+///   repository has the name (util.rs repo_aur_pkgs), so it never asks the
+///   AUR about these, and the AUR's package tracks nothing.
+///
+/// A missing %INSTALLED_DB% alone says nothing: libalpm records none for
+/// a package pulled in as a dependency or a replacement. One with a
+/// checksum or a signature came from a repository (or a signed file), and
+/// pacman tracks it by name, as it does one whose recorded repository
+/// moved past it or back (-Syu warns about a newer local version): a
+/// v4 repository's "1.68-1.1" that it dropped, while [extra] has
+/// "1.68-1", is no error, and installing the lower build no advice.
+///
+/// The same version with another build is a switch or the origin group,
+/// never this.
+pub fn untracked_candidates(updates: &[Update], inputs: &Inputs) -> Vec<Untracked> {
+    let Inputs { installed, sync_entries, .. } = *inputs;
+    let mut cmp = memo_vercmp();
+    let mut touched: HashSet<&str> = HashSet::new();
+    for u in updates {
+        touched.insert(u.name.as_str());
+        touched.extend(u.replaces.iter().map(|r| r.name.as_str()));
+        touched.extend(u.reinstalls.iter().map(String::as_str));
+        touched.extend(u.origin_group.iter().map(|m| m.name.as_str()));
+    }
+    let mut copies: HashMap<&str, Vec<&alpm::SyncEntry>> = HashMap::new();
+    for e in sync_entries {
+        copies.entry(e.name.as_str()).or_default().push(e);
+    }
+    let mut out: Vec<Untracked> = installed
+        .iter()
+        .filter(|(name, _)| !touched.contains(name.as_str()))
+        .filter_map(|(name, pkg)| {
+            let (kind, repo_versions, hint) = match copies.get(name.as_str()) {
+                None => {
+                    let hint = match &pkg.repo {
+                        Some(repo) => format!(
+                            "{repo} no longer has it, and no other repository or the AUR does: remove it if nothing needs it, or find its source"
+                        ),
+                        None => "no repository or AUR package provides it: remove it if nothing needs it, or find its source"
+                            .to_string(),
+                    };
+                    ("no_source", Vec::new(), hint)
+                }
+                Some(list)
+                    if pkg.repo.is_none() && pkg.unsigned_file() && list.iter().all(|e| e.version != pkg.version) =>
+                {
+                    let first = list[0];
+                    let versions = list.iter().map(|e| format!("{} {}", e.repo, e.version)).collect();
+                    let hint = format!(
+                        "{} has {}, not this build, which was installed from a file with no signature: install {}'s to track it, or find where this one came from",
+                        first.repo, first.version, first.repo
+                    );
+                    ("other_build", versions, hint)
+                }
+                Some(_) => return None,
+            };
+            Some(Untracked {
+                name: name.clone(),
+                version: pkg.version.clone(),
+                explicit: pkg.explicit,
+                required_by: alpm::required_by(name, installed, &mut cmp),
+                optional_for: alpm::optional_for(name, installed, &mut cmp),
+                installed_repo: pkg.repo.clone(),
+                kind: kind.to_string(),
+                repo_versions,
+                aur_version: None,
+                hint,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The untracked packages among the candidates, given the AUR's answer
+/// (name -> version), or why it could not be asked:
+/// - "no_source": flagged when the AUR has no package of that name.
+///   Without an answer none is flagged (most are AUR packages, which paru
+///   tracks), and the second value says the AUR was unreachable;
+/// - "other_build": always flagged, since paru never asks the AUR about
+///   them (untracked_candidates); the answer only names the AUR's version.
+pub fn flag_untracked(
+    candidates: Vec<Untracked>,
+    aur: Result<&HashMap<String, String>, &str>,
+) -> (Vec<Untracked>, Option<String>) {
+    let unchecked = candidates.iter().filter(|c| c.kind == "no_source").count();
+    let mut out = Vec::new();
+    for mut c in candidates {
+        let aur_version = aur.ok().and_then(|has| has.get(&c.name));
+        if c.kind == "no_source" {
+            if aur.is_ok() && aur_version.is_none() {
+                out.push(c);
+            }
+            continue;
+        }
+        if let (Some(v), Some((repo, version))) = (aur_version, c.repo_versions.first().and_then(|r| r.split_once(' '))) {
+            c.hint = format!(
+                "{repo} has {version}, not this build; the AUR has {v}, but paru never checks the AUR for a name a repository has: install {repo}'s to track it, or remove it if nothing needs it"
+            );
+            c.aur_version = Some(v.clone());
+        }
+        out.push(c);
+    }
+    let note = match aur {
+        Err(e) if unchecked > 0 => Some(format!(
+            "AUR unreachable ({e}): {unchecked} package{} in no repository {} not checked",
+            if unchecked == 1 { "" } else { "s" },
+            if unchecked == 1 { "was" } else { "were" }
+        )),
+        _ => None,
+    };
+    (out, note)
+}
+
+/// The AUR's RPC (v5) info endpoint; $MINKA_SYU_AUR_RPC overrides it.
+const AUR_INFO_URL: &str = "https://aur.archlinux.org/rpc/v5/info";
+
+/// The packages in an AUR RPC info answer (name -> version), or what went
+/// wrong.
+pub fn parse_aur_info(text: &str) -> Result<HashMap<String, String>, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("unreadable answer: {e}"))?;
+    if v.get("type").and_then(|t| t.as_str()) == Some("error") {
+        let what = v.get("error").and_then(|e| e.as_str()).unwrap_or("an error");
+        return Err(format!("the AUR answered: {what}"));
+    }
+    let results = v.get("results").and_then(|r| r.as_array()).ok_or("an answer without results")?;
+    Ok(results
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("Name").and_then(|n| n.as_str())?;
+            let version = r.get("Version").and_then(|v| v.as_str()).unwrap_or_default();
+            Some((name.to_string(), version.to_string()))
+        })
+        .collect())
+}
+
+/// `arg[]=a&arg[]=b`, form-encoded: the names an info request asks about.
+pub fn aur_info_form(names: &[String]) -> String {
+    let encode = |name: &str| {
+        name.bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' => (b as char).to_string(),
+                other => format!("%{other:02X}"),
+            })
+            .collect::<String>()
+    };
+    names.iter().map(|n| format!("arg%5B%5D={}", encode(n))).collect::<Vec<_>>().join("&")
+}
+
+/// Which of `names` the AUR has, with its versions: one RPC info request,
+/// POSTed so any number of names fits (what paru asks for its foreign
+/// packages anyway), through curl, as the window fetches screenshots.
+fn aur_versions(names: &[String]) -> Result<HashMap<String, String>, String> {
+    use std::io::Write;
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let url = std::env::var("MINKA_SYU_AUR_RPC").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| AUR_INFO_URL.to_string());
+    let mut child = Command::new("curl")
+        // It answers in well under a second; a host that never answers
+        // costs 5 s, not the 30 of a plain --max-time.
+        .args(["-sS", "--fail", "--connect-timeout", "5", "--max-time", "15", "-A", "minka-syu", "--data-binary", "@-", "--"])
+        .arg(&url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running curl: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(aur_info_form(names).as_bytes()).map_err(|e| format!("writing to curl: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("running curl: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("curl failed").trim().to_string());
+    }
+    parse_aur_info(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn home_dir() -> PathBuf {
@@ -1126,7 +1814,7 @@ fn read_conf(installed: &HashMap<String, alpm::InstalledPkg>) -> Conf {
 fn explicit_candidate_info(db: &str, updates: &[Update]) -> HashMap<(String, String), CandidateInfo> {
     let targets: Vec<String> = updates
         .iter()
-        .filter(|u| u.explicit_target && !u.held)
+        .filter(|u| u.explicit_target && !u.held && !u.is_origin_group())
         .map(|u| format!("{}/{}", u.candidate_repo, u.name))
         .collect();
     if targets.is_empty() {
@@ -1152,6 +1840,46 @@ fn explicit_candidate_info(db: &str, updates: &[Update]) -> HashMap<(String, Str
             HashMap::new()
         }
     }
+}
+
+/// The builds switch_rows needs, by print-mode `pacman -Sp -dd` of
+/// repo/name targets on the private DB: one call per round of
+/// switch_lookups (mostly a single one) until nothing is left to learn. A
+/// failed call ends the lookup; what stays unknown makes no rows.
+fn switch_builds(db: &str, updates: &[Update], inputs: &Inputs) -> SyncBuilds {
+    let mut builds = SyncBuilds::new();
+    let mut tried: HashSet<(String, String)> = HashSet::new();
+    loop {
+        let round = switch_lookups(updates, inputs, &builds, &tried);
+        if round.is_empty() {
+            break;
+        }
+        let targets: Vec<String> = round.iter().map(|(repo, name)| format!("{repo}/{name}")).collect();
+        tried.extend(round);
+        match Command::new("pacman")
+            .args(["-Sp", "-dd", "--dbpath", db, "--logfile", "/dev/null", "--print-format", SWITCH_FORMAT])
+            .args(&targets)
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC0")
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => builds.extend(parse_sync_builds(&String::from_utf8_lossy(&out.stdout))),
+            Ok(out) => {
+                eprintln!(
+                    "minka-syu: pacman -Sp for same-version builds failed ({}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                );
+                break;
+            }
+            Err(e) => {
+                eprintln!("minka-syu: pacman -Sp for same-version builds failed: {e}");
+                break;
+            }
+        }
+    }
+    builds
 }
 
 /// Run a full check. On success returns the new state (also saved).
@@ -1213,9 +1941,28 @@ pub fn run_check() -> Result<State, String> {
         conf: &conf,
     };
     let mut updates = merge_updates(&inputs);
-    let info = explicit_candidate_info(db_str, &updates);
-    annotate_explicit(&mut updates, &info, &inputs, &mut system_vercmp);
+    // Same-version switches, and the origin group: a package with no
+    // recorded repository whose build a repository has. One build lookup
+    // finds both (add_build_rows says in which order they join).
+    let builds = switch_builds(db_str, &updates, &inputs);
+    add_build_rows(
+        &mut updates,
+        &inputs,
+        &builds,
+        &mut |rows| explicit_candidate_info(db_str, rows),
+        &mut memo_vercmp(),
+    );
     let repo_change_count = updates.iter().filter(|u| u.pending() && u.transition == Transition::Changed).count();
+
+    // Packages nothing tracks. Most candidates are AUR packages, so the
+    // AUR is asked once about all of them.
+    let candidates = untracked_candidates(&updates, &inputs);
+    let names: Vec<String> = candidates.iter().map(|c| c.name.clone()).collect();
+    let aur = aur_versions(&names);
+    if let Err(e) = &aur {
+        eprintln!("minka-syu: could not ask the AUR which packages it has: {e}");
+    }
+    let (untracked, aur_unreachable) = flag_untracked(candidates, aur.as_ref().map_err(String::as_str));
 
     let previous = load_state();
     let state = State {
@@ -1224,6 +1971,8 @@ pub fn run_check() -> Result<State, String> {
         updates,
         repo_change_count,
         last_notified_count: previous.map(|p| p.last_notified_count).unwrap_or(0),
+        untracked,
+        aur_unreachable,
     };
     save_state(&state)?;
     Ok(state)
@@ -1261,10 +2010,14 @@ mod tests {
         alpm::InstalledPkg {
             version: version.into(),
             repo: repo.map(String::from),
-            description: String::new(),
-            size_bytes: 0,
             explicit: true,
+            ..Default::default()
         }
+    }
+
+    /// Depstrings, parsed.
+    fn deps(list: &[&str]) -> Vec<DepSpec> {
+        list.iter().filter_map(|d| parse_depstring(d)).collect()
     }
 
     fn installed_map() -> HashMap<String, alpm::InstalledPkg> {
@@ -1521,7 +2274,7 @@ mod tests {
         assert_eq!(u.transition, Transition::Changed);
         assert!(!u.explicit_target);
         assert_eq!(u.replaces.len(), 1);
-        let state = State { schema: 1, checked_at: 0, updates: ups, repo_change_count: 0, last_notified_count: 0 };
+        let state = State { schema: 1, checked_at: 0, updates: ups, repo_change_count: 0, last_notified_count: 0, ..Default::default() };
         assert_eq!(state.total(), 1);
     }
 
@@ -1610,7 +2363,7 @@ mod tests {
         let conf = Conf { ignored: HashSet::from(["foo".to_string()]), ..Conf::default() };
         let ups = merge("foo 1-1 -> 2-1 [ignored]\n", "", &installed, &sync, Some(""), &conf);
         assert_eq!(ups[0].held_by.as_deref(), Some("ignore"));
-        let state = State { schema: 1, checked_at: 0, updates: ups, repo_change_count: 0, last_notified_count: 0 };
+        let state = State { schema: 1, checked_at: 0, updates: ups, repo_change_count: 0, last_notified_count: 0, ..Default::default() };
         assert_eq!((state.total(), state.held()), (0, 1));
     }
 
@@ -1853,6 +2606,340 @@ mod tests {
         assert_eq!(t[1].replaces.len(), 2);
     }
 
+    // ---- same-version switches ---------------------------------------------
+
+    /// An installed package with a recorded build.
+    fn built(version: &str, repo: Option<&str>, date: i64, packager: &str) -> alpm::InstalledPkg {
+        alpm::InstalledPkg { build_date: Some(date), packager: packager.into(), ..pkg(version, repo) }
+    }
+
+    /// What pacman -Sp prints for one repo's build, in SWITCH_FORMAT, the
+    /// date as %c in the C locale (UTC).
+    fn sp_line(repo: &str, name: &str, version: &str, date: &str, packager: &str) -> String {
+        format!("{name}|{repo}|{version}|{date}|{packager}\n")
+    }
+
+    /// lib32-libcaca on 22/11/2026: Arch's [multilib] build, installed;
+    /// multilib no longer has it, [minka] has a rebuild of that version.
+    const ARCH_LIBCACA: (&str, i64, &str) = ("0.99.beta20-2", 1725703316, "Antonio Rojas <arojas@archlinux.org>");
+    const MINKA_LIBCACA: &str = "Sat Nov 22 01:48:00 2026";
+
+    /// The check's switch pipeline: merge, lookup rounds answered from
+    /// `printed` (all the builds pacman -Sp could print), switch rows,
+    /// then annotate_explicit with `info`. Also how many rounds it took.
+    fn switch_case(
+        repo_lines: &str,
+        installed: &HashMap<String, alpm::InstalledPkg>,
+        sync: &[alpm::SyncEntry],
+        conf: &Conf,
+        printed: &str,
+        info: &str,
+    ) -> (Vec<Update>, usize) {
+        let inputs = Inputs {
+            repo_lines,
+            aur_lines: "",
+            installed,
+            sync_entries: sync,
+            sysupgrade: Some(&[]),
+            final_targets: None,
+            conf,
+        };
+        let mut ups = merge_updates_with_cmp(&inputs, &mut system_vercmp);
+        let all = parse_sync_builds(printed);
+        let (mut builds, mut tried, mut rounds) = (SyncBuilds::new(), HashSet::new(), 0);
+        loop {
+            let round = switch_lookups(&ups, &inputs, &builds, &tried);
+            if round.is_empty() {
+                break;
+            }
+            rounds += 1;
+            let names: HashSet<&str> = round.iter().map(|(_, n)| n.as_str()).collect();
+            assert_eq!(names.len(), round.len(), "a name twice in one call: {round:?}");
+            for k in round {
+                if let Some(b) = all.get(&k) {
+                    builds.insert(k.clone(), b.clone());
+                }
+                tried.insert(k);
+            }
+        }
+        add_build_rows(&mut ups, &inputs, &builds, &mut |_| parse_candidate_info(info), &mut system_vercmp);
+        // The origin group has tests of its own.
+        ups.retain(|u| !u.is_origin_group());
+        (ups, rounds)
+    }
+
+    fn libcaca_installed() -> HashMap<String, alpm::InstalledPkg> {
+        let (v, date, by) = ARCH_LIBCACA;
+        HashMap::from([("lib32-libcaca".to_string(), built(v, Some("multilib"), date, by))])
+    }
+
+    #[test]
+    fn a_dropped_origin_with_another_build_is_a_switch() {
+        let sync = alpm::parse_sync_list("extra libcaca 0.99.beta20-6\nminka lib32-libcaca 0.99.beta20-2\n");
+        let printed = sp_line("minka", "lib32-libcaca", "0.99.beta20-2", MINKA_LIBCACA, "Sophie <s@example.org>");
+        let (ups, rounds) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert_eq!(rounds, 1);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        let u = &ups[0];
+        assert!(u.switch_build && u.explicit_target && u.pending(), "{u:#?}");
+        assert_eq!((u.old_version.as_str(), u.new_version.as_str()), ("0.99.beta20-2", "0.99.beta20-2"));
+        assert_eq!(u.installed_repo.as_deref(), Some("multilib"));
+        assert_eq!(u.candidate_repo, "minka");
+        assert_eq!(u.transition, Transition::Changed);
+        assert_eq!((u.first_repo.as_ref(), u.first_version.as_ref()), (None, None));
+        let state = State { schema: 1, checked_at: 0, updates: ups, repo_change_count: 0, last_notified_count: 0, ..Default::default() };
+        assert_eq!((state.total(), state.held()), (1, 0));
+
+        // Several other builds of that version: the first in pacman.conf
+        // order is the target, once every copy is known to differ.
+        let sync = alpm::parse_sync_list("cachyos lib32-libcaca 0.99.beta20-2\nminka lib32-libcaca 0.99.beta20-2\n");
+        let printed = format!(
+            "{}{}",
+            sp_line("cachyos", "lib32-libcaca", "0.99.beta20-2", "Sun Nov  1 10:00:00 2026", "CachyOS <admin@cachyos.org>"),
+            sp_line("minka", "lib32-libcaca", "0.99.beta20-2", MINKA_LIBCACA, "Sophie <s@example.org>")
+        );
+        let (ups, rounds) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert_eq!(rounds, 2, "one copy per call");
+        assert_eq!(ups[0].candidate_repo, "cachyos");
+        // A foreign package (no %INSTALLED_DB%) with another build: a switch
+        // from an unknown source.
+        let foreign = HashMap::from([("lib32-libcaca".to_string(), built("0.99.beta20-2", None, 1, "Sophie <s@example.org>"))]);
+        let (ups, _) = switch_case("", &foreign, &sync, &Conf::default(), &printed, "");
+        assert!(ups[0].switch_build);
+        assert_eq!(ups[0].transition, Transition::UnknownSource);
+    }
+
+    #[test]
+    fn a_repo_build_without_installed_db_is_no_switch() {
+        // Installed before libalpm recorded %INSTALLED_DB%, or with -U of
+        // the repo's own file: build date and packager equal [extra]'s.
+        let installed =
+            HashMap::from([("zstd".to_string(), built("1.5.7-2", None, 1755000000, "Levente Polyák <anthraxx@archlinux.org>"))]);
+        let sync = alpm::parse_sync_list("cachyos zstd 1.5.7-2\nextra zstd 1.5.7-2\n");
+        let printed = format!(
+            "{}{}",
+            sp_line("cachyos", "zstd", "1.5.7-2", "Sun Nov  1 10:00:00 2026", "CachyOS <admin@cachyos.org>"),
+            sp_line("extra", "zstd", "1.5.7-2", "Tue Aug 12 12:00:00 2025", "Levente Polyák <anthraxx@archlinux.org>")
+        );
+        let (ups, rounds) = switch_case("", &installed, &sync, &Conf::default(), &printed, "");
+        assert!(ups.is_empty(), "{ups:#?}");
+        assert_eq!(rounds, 2, "cachyos's copy differs, so extra's is looked up too");
+    }
+
+    #[test]
+    fn an_origin_still_carrying_the_build_is_no_switch() {
+        let installed =
+            HashMap::from([("ripgrep".to_string(), built("15.1.0-1", Some("extra"), 1755000000, "Arch <a@archlinux.org>"))]);
+        let sync = alpm::parse_sync_list("cachyos ripgrep 15.1.0-1\nextra ripgrep 15.1.0-1\n");
+        let printed = format!(
+            "{}{}",
+            sp_line("cachyos", "ripgrep", "15.1.0-1", "Sun Nov  1 10:00:00 2026", "CachyOS <admin@cachyos.org>"),
+            sp_line("extra", "ripgrep", "15.1.0-1", "Tue Aug 12 12:00:00 2025", "Arch <a@archlinux.org>")
+        );
+        let (ups, rounds) = switch_case("", &installed, &sync, &Conf::default(), &printed, "");
+        assert!(ups.is_empty(), "{ups:#?}");
+        assert_eq!(rounds, 1, "the origin's copy is looked up first and settles it");
+    }
+
+    #[test]
+    fn a_newer_version_is_an_update_not_a_switch() {
+        // [cachyos] (first) has a newer build: -Qu's ordinary update.
+        let sync = alpm::parse_sync_list("cachyos lib32-libcaca 0.99.beta20-3\nminka lib32-libcaca 0.99.beta20-2\n");
+        let printed = sp_line("minka", "lib32-libcaca", "0.99.beta20-2", MINKA_LIBCACA, "Sophie <s@example.org>");
+        let (ups, rounds) = switch_case(
+            "lib32-libcaca 0.99.beta20-2 -> 0.99.beta20-3\n",
+            &libcaca_installed(),
+            &sync,
+            &Conf::default(),
+            &printed,
+            "",
+        );
+        assert_eq!(rounds, 0);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        assert!(!ups[0].switch_build && !ups[0].explicit_target);
+        assert_eq!(ups[0].new_version, "0.99.beta20-3");
+        // A lower repo has the newer one: a later-repo row, not a switch.
+        let sync = alpm::parse_sync_list("cachyos lib32-libcaca 0.99.beta20-2\nminka lib32-libcaca 0.99.beta20-3\n");
+        let (ups, _) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        assert!(ups[0].explicit_target && !ups[0].switch_build);
+        assert_eq!(ups[0].first_repo.as_deref(), Some("cachyos"));
+    }
+
+    #[test]
+    fn a_copy_of_the_installed_build_is_no_switch() {
+        // Only [minka] has that version, and it is the very build installed
+        // (the same file, republished): nothing to switch to.
+        let sync = alpm::parse_sync_list("minka lib32-libcaca 0.99.beta20-2\n");
+        let (v, _, by) = ARCH_LIBCACA;
+        let printed = sp_line("minka", "lib32-libcaca", v, "Sat Sep  7 10:01:56 2024", by);
+        let (ups, _) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert!(ups.is_empty(), "{ups:#?}");
+        // The same date by another packager is another build.
+        let printed = sp_line("minka", "lib32-libcaca", v, "Sat Sep  7 10:01:56 2024", "Sophie <s@example.org>");
+        let (ups, _) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert_eq!(ups.len(), 1);
+    }
+
+    #[test]
+    fn unknown_builds_settle_nothing() {
+        let sync = alpm::parse_sync_list("cachyos lib32-libcaca 0.99.beta20-2\nminka lib32-libcaca 0.99.beta20-2\n");
+        // pacman printed only one copy (the lookup failed for the other).
+        let printed = sp_line("minka", "lib32-libcaca", "0.99.beta20-2", MINKA_LIBCACA, "Sophie <s@example.org>");
+        let (ups, _) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert!(ups.is_empty(), "{ups:#?}");
+        // A build without a date is no build to compare: pacman prints the
+        // epoch for it.
+        let printed = sp_line("minka", "lib32-libcaca", "0.99.beta20-2", "Thu Jan  1 00:00:00 1970", "Sophie <s@example.org>");
+        let sync = alpm::parse_sync_list("minka lib32-libcaca 0.99.beta20-2\n");
+        let (ups, rounds) = switch_case("", &libcaca_installed(), &sync, &Conf::default(), &printed, "");
+        assert_eq!(rounds, 1);
+        assert!(ups.is_empty(), "{ups:#?}");
+    }
+
+    #[test]
+    fn copies_without_install_usage_are_looked_up_but_never_targets() {
+        // Built from the AUR (no %INSTALLED_DB%); [hi] has Install, [lo]
+        // (later in pacman.conf) has not. A repo/name lookup works in any
+        // repository, so lo's copy is learnt too, in a later round.
+        let installed = HashMap::from([("xx".to_string(), built("1-1", None, 5, "p"))]);
+        let sync = alpm::parse_sync_list("hi xx 1-1\nlo xx 1-1\n");
+        let conf = Conf { install_repos: Some(HashSet::from(["hi".to_string()])), ..Conf::default() };
+        let inputs = Inputs {
+            repo_lines: "",
+            aur_lines: "",
+            installed: &installed,
+            sync_entries: &sync,
+            sysupgrade: Some(&[]),
+            final_targets: None,
+            conf: &conf,
+        };
+        let k = |r: &str, n: &str| (r.to_string(), n.to_string());
+        let b = |date: i64| SyncBuild { version: "1-1".into(), build_date: Some(date), packager: "p".into() };
+        assert_eq!(switch_lookups(&[], &inputs, &SyncBuilds::new(), &HashSet::new()), [k("hi", "xx")]);
+        let builds = SyncBuilds::from([(k("hi", "xx"), b(6))]);
+        let tried = HashSet::from([k("hi", "xx")]);
+        assert_eq!(switch_lookups(&[], &inputs, &builds, &tried), [k("lo", "xx")]);
+
+        // Both copies are other builds: a row, targeting the Install repo.
+        let sp = |repo: &str, date: &str| sp_line(repo, "xx", "1-1", date, "p");
+        let printed = format!("{}{}", sp("hi", "Thu Jan  1 00:00:06 1970"), sp("lo", "Thu Jan  1 00:00:07 1970"));
+        let (ups, rounds) = switch_case("", &installed, &sync, &conf, &printed, "");
+        assert_eq!(rounds, 2);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        assert!(ups[0].switch_build);
+        assert_eq!(ups[0].candidate_repo, "hi");
+        // lo's copy is the installed build (an -U of its file): no row.
+        let printed = format!("{}{}", sp("hi", "Thu Jan  1 00:00:06 1970"), sp("lo", "Thu Jan  1 00:00:05 1970"));
+        let (ups, _) = switch_case("", &installed, &sync, &conf, &printed, "");
+        assert!(ups.is_empty(), "{ups:#?}");
+
+        // A package whose only copy is in [lo] has no target: not looked up.
+        let sync = alpm::parse_sync_list("lo xx 1-1\n");
+        let inputs = Inputs { sync_entries: &sync, ..inputs };
+        assert!(switch_lookups(&[], &inputs, &SyncBuilds::new(), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn ignored_switches_are_held() {
+        let sync = alpm::parse_sync_list("minka lib32-libcaca 0.99.beta20-2\n");
+        let printed = sp_line("minka", "lib32-libcaca", "0.99.beta20-2", MINKA_LIBCACA, "Sophie <s@example.org>");
+        // IgnorePkg on the installed package: shown held, like any other row.
+        let conf = Conf { ignored: HashSet::from(["lib32-libcaca".to_string()]), ..Conf::default() };
+        let (ups, _) = switch_case("", &libcaca_installed(), &sync, &conf, &printed, "");
+        assert_eq!(ups.len(), 1);
+        assert!(ups[0].switch_build && ups[0].held, "{ups:#?}");
+        assert_eq!(ups[0].held_by.as_deref(), Some("ignore"));
+        let state = State { schema: 1, checked_at: 0, updates: ups, repo_change_count: 0, last_notified_count: 0, ..Default::default() };
+        assert_eq!((state.total(), state.held()), (0, 1));
+        // IgnoreGroup on the switch's own build: held as well.
+        let conf = Conf { group_patterns: vec!["lib32*".into()], ..Conf::default() };
+        let (ups, _) = switch_case("", &libcaca_installed(), &sync, &conf, &printed, "lib32-libcaca|minka|lib32-extra|\n");
+        assert!(ups[0].switch_build && ups[0].held, "{ups:#?}");
+    }
+
+    #[test]
+    fn switch_lookups_ask_each_name_once_origin_first() {
+        let installed = HashMap::from([
+            ("aa".to_string(), built("1-1", Some("lo"), 5, "p")),
+            ("bb".to_string(), built("1-1", None, 5, "p")),
+            ("cc".to_string(), pkg("1-1", None)),
+        ]);
+        let sync = alpm::parse_sync_list("hi aa 1-1\nhi bb 1-1\nhi cc 1-1\nlo aa 1-1\nlo bb 1-1\n");
+        let inputs = Inputs {
+            repo_lines: "",
+            aur_lines: "",
+            installed: &installed,
+            sync_entries: &sync,
+            sysupgrade: Some(&[]),
+            final_targets: None,
+            conf: &Conf::default(),
+        };
+        let k = |r: &str, n: &str| (r.to_string(), n.to_string());
+        let (builds, tried) = (SyncBuilds::new(), HashSet::new());
+        // cc has no build date to compare: never looked up.
+        assert_eq!(switch_lookups(&[], &inputs, &builds, &tried), [k("lo", "aa"), k("hi", "bb")]);
+        let tried = HashSet::from([k("lo", "aa"), k("hi", "bb")]);
+        let mut builds = SyncBuilds::new();
+        let b = |date: i64| SyncBuild { version: "1-1".into(), build_date: Some(date), packager: "p".into() };
+        builds.insert(k("lo", "aa"), b(5));
+        builds.insert(k("hi", "bb"), b(6));
+        // aa matched its origin; bb's next copy is asked.
+        assert_eq!(switch_lookups(&[], &inputs, &builds, &tried), [k("lo", "bb")]);
+        // A package with a row of its own, or one a row replaces, is never
+        // asked about.
+        let row = |name: &str, replaces: &[&str]| Update {
+            name: name.into(),
+            old_version: "1-1".into(),
+            new_version: "2-1".into(),
+            installed_repo: None,
+            candidate_repo: "hi".into(),
+            transition: Transition::UnknownSource,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+            replaces: replaces
+                .iter()
+                .map(|n| Replaced { name: n.to_string(), version: "1-1".into(), installed_repo: None })
+                .collect(),
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
+        };
+        assert!(switch_lookups(&[row("bb", &[])], &inputs, &builds, &tried).is_empty());
+        assert!(switch_lookups(&[row("zz", &["bb"])], &inputs, &builds, &tried).is_empty());
+    }
+
+    #[test]
+    fn c_locale_dates_and_build_lines_parse() {
+        assert_eq!(parse_c_date("Thu Aug 27 12:25:22 2026"), Some(1787833522));
+        assert_eq!(parse_c_date("Sat Sep  7 10:01:56 2024"), Some(1725703316));
+        assert_eq!(parse_c_date("Thu Jan  1 00:00:00 1970"), Some(0));
+        assert_eq!(parse_c_date("Tue Feb 29 23:59:59 2028"), Some(1835481599));
+        assert_eq!(parse_c_date("Wed Mar  1 00:00:00 2000"), Some(951868800));
+        assert_eq!(parse_c_date(""), None);
+        assert_eq!(parse_c_date("Sat 07 Sep 2024 11:01:56 BST"), None, "a localised %c is refused");
+        assert_eq!(parse_c_date("Sat Sep  7 25:01:56 2024"), None);
+        let b = parse_sync_builds(
+            "python-pkg_resources|cachyos|81.0.0-1|Thu Aug 27 12:25:22 2026|CachyOS <admin@cachyos.org>\n\
+             warning: not a build line\n\
+             odd|minka|1-1||A | B <ab@example.org>\n\
+             nodate|minka|1-1|Thu Jan  1 00:00:00 1970|T <t@example.org>\n",
+        );
+        assert_eq!(b.len(), 3);
+        let nodate = &b[&("minka".to_string(), "nodate".to_string())];
+        assert_eq!(nodate.build_date, None, "pacman's epoch for no date is unknown");
+        let p = &b[&("cachyos".to_string(), "python-pkg_resources".to_string())];
+        assert_eq!((p.version.as_str(), p.build_date), ("81.0.0-1", Some(1787833522)));
+        assert_eq!(p.packager, "CachyOS <admin@cachyos.org>");
+        let odd = &b[&("minka".to_string(), "odd".to_string())];
+        assert_eq!((odd.build_date, odd.packager.as_str()), (None, "A | B <ab@example.org>"));
+    }
+
     #[test]
     fn state_from_an_older_core_still_loads() {
         // A state.json written by MinkaSyu 0.5.0 has none of the new keys.
@@ -1862,6 +2949,459 @@ mod tests {
         let state: State = serde_json::from_str(json).unwrap();
         let u = &state.updates[0];
         assert!(u.replaces.is_empty() && !u.held && u.held_by.is_none() && u.superseded_by.is_empty());
+        assert!(!u.switch_build && !u.is_origin_group());
+        assert!(state.untracked.is_empty() && state.aur_unreachable.is_none());
         assert_eq!(state.total(), 1);
+    }
+
+    // ---- the origin group --------------------------------------------------
+
+    /// The check's pipeline as run_check runs it: merge, lookup rounds
+    /// answered from `printed`, then add_build_rows.
+    fn origin_case(
+        repo_lines: &str,
+        installed: &HashMap<String, alpm::InstalledPkg>,
+        sync: &[alpm::SyncEntry],
+        conf: &Conf,
+        printed: &str,
+    ) -> Vec<Update> {
+        origin_case_with(repo_lines, "", installed, sync, conf, printed, "")
+    }
+
+    /// origin_case with `sup` as `-Sup -dd` output (TARGET_FORMAT) and
+    /// `info` as the explicit rows' builds (BUILD_FORMAT).
+    fn origin_case_with(
+        repo_lines: &str,
+        sup: &str,
+        installed: &HashMap<String, alpm::InstalledPkg>,
+        sync: &[alpm::SyncEntry],
+        conf: &Conf,
+        printed: &str,
+        info: &str,
+    ) -> Vec<Update> {
+        let targets = parse_sysupgrade(sup);
+        let inputs = Inputs {
+            repo_lines,
+            aur_lines: "",
+            installed,
+            sync_entries: sync,
+            sysupgrade: Some(&targets),
+            final_targets: None,
+            conf,
+        };
+        let mut ups = merge_updates_with_cmp(&inputs, &mut system_vercmp);
+        let all = parse_sync_builds(printed);
+        let (mut builds, mut tried) = (SyncBuilds::new(), HashSet::new());
+        loop {
+            let round = switch_lookups(&ups, &inputs, &builds, &tried);
+            if round.is_empty() {
+                break;
+            }
+            for k in round {
+                if let Some(b) = all.get(&k) {
+                    builds.insert(k.clone(), b.clone());
+                }
+                tried.insert(k);
+            }
+        }
+        add_build_rows(&mut ups, &inputs, &builds, &mut |_| parse_candidate_info(info), &mut system_vercmp);
+        ups
+    }
+
+    const EXTRA_DATE: &str = "Tue Aug 12 12:00:00 2025";
+    const EXTRA_SECS: i64 = 1755000000;
+    const ARCH: &str = "Arch <a@archlinux.org>";
+
+    /// A dependency installed with no %INSTALLED_DB%, built at EXTRA_SECS by ARCH.
+    fn pulled_in(version: &str) -> alpm::InstalledPkg {
+        alpm::InstalledPkg { explicit: false, ..built(version, None, EXTRA_SECS, ARCH) }
+    }
+
+    #[test]
+    fn a_repo_build_without_recorded_repo_joins_the_origin_group() {
+        let installed = HashMap::from([
+            ("zstd".to_string(), pulled_in("1.5.7-2")),
+            // Its repository recorded: tracked, never in the group.
+            ("ripgrep".to_string(), built("15.1.0-1", Some("extra"), EXTRA_SECS, ARCH)),
+        ]);
+        let sync = alpm::parse_sync_list("extra zstd 1.5.7-2\nextra ripgrep 15.1.0-1\n");
+        let printed = format!(
+            "{}{}",
+            sp_line("extra", "zstd", "1.5.7-2", EXTRA_DATE, ARCH),
+            sp_line("extra", "ripgrep", "15.1.0-1", EXTRA_DATE, ARCH)
+        );
+        let ups = origin_case("", &installed, &sync, &Conf::default(), &printed);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        let g = &ups[0];
+        assert!(g.is_origin_group() && g.explicit_target && g.pending() && !g.switch_build, "{g:#?}");
+        assert_eq!(g.name, ORIGIN_GROUP);
+        assert_eq!(g.transition, Transition::UnknownSource);
+        assert_eq!(
+            g.origin_group,
+            [OriginMember { name: "zstd".into(), version: "1.5.7-2".into(), repo: "extra".into(), explicit: false }]
+        );
+        assert_eq!(g.origin_group[0].target(), "extra/zstd");
+
+        // The same version as another build: a switch, not the group.
+        let printed = sp_line("extra", "zstd", "1.5.7-2", "Sun Nov  1 10:00:00 2026", ARCH);
+        let ups = origin_case("", &installed, &sync, &Conf::default(), &printed);
+        assert!(ups.iter().all(|u| !u.is_origin_group()), "{ups:#?}");
+        assert!(ups.iter().any(|u| u.name == "zstd" && u.switch_build), "{ups:#?}");
+
+        // A build lookup that found nothing settles nothing.
+        assert!(origin_case("", &installed, &sync, &Conf::default(), "").is_empty());
+
+        // A pending upgrade is an update row, and the upgrade records it.
+        let sync = alpm::parse_sync_list("extra zstd 1.5.7-3\nextra ripgrep 15.1.0-1\n");
+        let ups = origin_case("zstd 1.5.7-2 -> 1.5.7-3\n", &installed, &sync, &Conf::default(), &printed);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        assert!(!ups[0].is_origin_group() && ups[0].name == "zstd" && ups[0].new_version == "1.5.7-3");
+
+        // IgnorePkg holds it: an explicit target would install it anyway.
+        let sync = alpm::parse_sync_list("extra zstd 1.5.7-2\n");
+        let printed = sp_line("extra", "zstd", "1.5.7-2", EXTRA_DATE, ARCH);
+        let conf = Conf { ignored: HashSet::from(["zstd".to_string()]), ..Conf::default() };
+        assert!(origin_case("", &installed, &sync, &conf, &printed).is_empty());
+    }
+
+    #[test]
+    fn the_origin_group_is_one_update_whatever_its_size() {
+        let names = ["aa", "bb", "cc", "dd"];
+        let installed: HashMap<String, alpm::InstalledPkg> =
+            names.iter().map(|n| (n.to_string(), pulled_in("1-1"))).collect();
+        let sync = alpm::parse_sync_list(
+            &names.iter().map(|n| format!("extra {n} 1-1\n")).collect::<String>(),
+        );
+        let printed: String = names.iter().map(|n| sp_line("extra", n, "1-1", EXTRA_DATE, ARCH)).collect();
+        let mut ups = origin_case("", &installed, &sync, &Conf::default(), &printed);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        let group = ups[0].clone();
+        assert_eq!(group.origin_group.len(), 4);
+        assert_eq!((group.old_version.as_str(), group.candidate_repo.as_str()), ("4 packages", "extra"));
+        ups.push(Update {
+            name: "mesa".into(),
+            old_version: "1-1".into(),
+            new_version: "2-1".into(),
+            installed_repo: Some("extra".into()),
+            candidate_repo: "extra".into(),
+            transition: Transition::Same,
+            explicit_target: false,
+            origin_group: Vec::new(),
+            ..group
+        });
+        let state = State { schema: 1, updates: ups, ..Default::default() };
+        assert_eq!(state.total(), 2, "the group and mesa");
+        assert_eq!(state.repo_change_count, 0);
+    }
+
+    #[test]
+    fn the_origin_group_reinstalls_from_the_repo_whose_copy_matches() {
+        // [cachyos] (first) has another build of that version, [extra] and
+        // [minka] both the installed one: extra is the first that matches.
+        let installed = HashMap::from([("zstd".to_string(), pulled_in("1.5.7-2"))]);
+        let sync = alpm::parse_sync_list("cachyos zstd 1.5.7-2\nextra zstd 1.5.7-2\nminka zstd 1.5.7-2\n");
+        let printed = format!(
+            "{}{}{}",
+            sp_line("cachyos", "zstd", "1.5.7-2", "Sun Nov  1 10:00:00 2026", "CachyOS <admin@cachyos.org>"),
+            sp_line("extra", "zstd", "1.5.7-2", EXTRA_DATE, ARCH),
+            sp_line("minka", "zstd", "1.5.7-2", EXTRA_DATE, ARCH)
+        );
+        let ups = origin_case("", &installed, &sync, &Conf::default(), &printed);
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        assert_eq!(ups[0].origin_group[0].repo, "extra");
+        assert_eq!(ups[0].candidate_repo, "extra");
+        // Members from several repositories: listed in pacman.conf order.
+        let installed = HashMap::from([
+            ("zstd".to_string(), pulled_in("1.5.7-2")),
+            ("lib32-zstd".to_string(), pulled_in("1.5.7-2")),
+        ]);
+        let sync = alpm::parse_sync_list("extra zstd 1.5.7-2\nmultilib lib32-zstd 1.5.7-2\n");
+        let printed = format!(
+            "{}{}",
+            sp_line("extra", "zstd", "1.5.7-2", EXTRA_DATE, ARCH),
+            sp_line("multilib", "lib32-zstd", "1.5.7-2", EXTRA_DATE, ARCH)
+        );
+        let ups = origin_case("", &installed, &sync, &Conf::default(), &printed);
+        assert_eq!(ups[0].candidate_repo, "extra, multilib");
+        let targets: Vec<String> = ups[0].origin_group.iter().map(OriginMember::target).collect();
+        assert_eq!(targets, ["multilib/lib32-zstd", "extra/zstd"]);
+    }
+
+    #[test]
+    fn a_member_an_upgrade_conflicts_with_stays_out_of_the_group() {
+        // Reproduced in a scratch root on 22/11/2026: app 2.0-1 conflicts
+        // with mem, which app 1.0-1 pulled in. `-Su scratch/mem` aborts
+        // ("unresolvable package conflicts"), while plain -Su asks to
+        // remove mem.
+        let installed = HashMap::from([
+            ("app".to_string(), built("1.0-1", Some("scratch"), EXTRA_SECS, ARCH)),
+            ("mem".to_string(), pulled_in("1.0-1")),
+        ]);
+        let sync = alpm::parse_sync_list("scratch app 2.0-1\nscratch mem 1.0-1\n");
+        let printed = sp_line("scratch", "mem", "1.0-1", EXTRA_DATE, ARCH);
+        let ups = origin_case_with(
+            "app 1.0-1 -> 2.0-1\n",
+            "app|2.0-1|scratch||mem|\n",
+            &installed,
+            &sync,
+            &Conf::default(),
+            &printed,
+            "",
+        );
+        assert_eq!(names(&ups), ["app"], "{ups:#?}");
+        // Without the conflict, mem is a member.
+        let ups = origin_case_with(
+            "app 1.0-1 -> 2.0-1\n",
+            "app|2.0-1|scratch|||\n",
+            &installed,
+            &sync,
+            &Conf::default(),
+            &printed,
+            "",
+        );
+        assert_eq!(names(&ups), [ORIGIN_GROUP, "app"], "{ups:#?}");
+        // A conflict on something mem provides, with its version.
+        let provider = HashMap::from([
+            ("app".to_string(), built("1.0-1", Some("scratch"), EXTRA_SECS, ARCH)),
+            ("mem".to_string(), alpm::InstalledPkg { provides: deps(&["libmem.so=1-64"]), ..pulled_in("1.0-1") }),
+        ]);
+        let conflicts = |c: &str| {
+            let sup = format!("app|2.0-1|scratch||{c}|\n");
+            let ups = origin_case_with("app 1.0-1 -> 2.0-1\n", &sup, &provider, &sync, &Conf::default(), &printed, "");
+            ups.iter().any(Update::is_origin_group)
+        };
+        assert!(!conflicts("libmem.so"), "an unversioned conflict");
+        assert!(!conflicts("libmem.so=1-64"));
+        assert!(conflicts("libmem.so=2-64"), "another soname is no conflict");
+        assert!(conflicts("mem<1.0"), "a constraint mem's version fails is none");
+    }
+
+    #[test]
+    fn a_member_a_later_build_replaces_or_conflicts_with_stays_out() {
+        // Reproduced on 22/11/2026: ax 1.0-1 from repoA, which has 1.1-1;
+        // repoB has ax 2.0-1 with replaces=(zm) conflicts=(zm); zm came
+        // from repoB unrecorded. ax sorts before zm, so libalpm's walk
+        // takes repoA/ax first and -Sup -dd shows no replacement: only
+        // ticking repoB/ax replaces zm, and with zm a target as well
+        // pacman aborts.
+        let installed = HashMap::from([
+            ("ax".to_string(), built("1.0-1", Some("repoA"), EXTRA_SECS, ARCH)),
+            ("zm".to_string(), pulled_in("1.0-1")),
+        ]);
+        let sync = alpm::parse_sync_list("repoA ax 1.1-1\nrepoB ax 2.0-1\nrepoB zm 1.0-1\n");
+        let printed = sp_line("repoB", "zm", "1.0-1", EXTRA_DATE, ARCH);
+        let case = |info: &str| {
+            origin_case_with("ax 1.0-1 -> 1.1-1\n", "ax|1.1-1|repoA|||\n", &installed, &sync, &Conf::default(), &printed, info)
+        };
+        let ups = case("ax|repoB||zm|zm\n");
+        assert_eq!(names(&ups), ["ax"], "{ups:#?}");
+        let ax = &ups[0];
+        assert!(ax.explicit_target && ax.candidate_repo == "repoB", "{ax:#?}");
+        assert_eq!(ax.replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["zm"]);
+        // The replacement alone (annotate_explicit's) keeps zm out, since
+        // the group is made after it ...
+        assert_eq!(names(&case("ax|repoB||zm|\n")), ["ax"]);
+        // ... and so does the conflict alone.
+        assert_eq!(names(&case("ax|repoB|||zm\n")), ["ax"]);
+        // Neither: zm is a member.
+        assert_eq!(names(&case("ax|repoB|||\n")), [ORIGIN_GROUP, "ax"]);
+    }
+
+    #[test]
+    fn a_switch_an_upgrade_conflicts_with_is_dropped() {
+        // lib32-libcaca as a switch; an upgrade that conflicts with it would
+        // make its minka/lib32-libcaca target abort the whole -Syu.
+        let mut installed = libcaca_installed();
+        installed.insert("app".to_string(), built("1-1", Some("extra"), EXTRA_SECS, ARCH));
+        let sync = alpm::parse_sync_list("extra app 2-1\nminka lib32-libcaca 0.99.beta20-2\n");
+        let printed = sp_line("minka", "lib32-libcaca", "0.99.beta20-2", MINKA_LIBCACA, "Sophie <s@example.org>");
+        let case = |sup: &str| {
+            let ups = origin_case_with("app 1-1 -> 2-1\n", sup, &installed, &sync, &Conf::default(), &printed, "");
+            ups.iter().any(|u| u.switch_build)
+        };
+        assert!(case("app|2-1|extra|||\n"));
+        assert!(!case("app|2-1|extra||lib32-libcaca|\n"));
+
+        // A later-repo build that replaces it and conflicts with it: no
+        // switch, and that row lists it as replaced.
+        let mut installed = libcaca_installed();
+        installed.insert("xx".to_string(), built("1-1", Some("repoA"), EXTRA_SECS, ARCH));
+        let sync = alpm::parse_sync_list("repoA xx 1.1-1\nrepoB xx 2-1\nminka lib32-libcaca 0.99.beta20-2\n");
+        let ups = origin_case_with(
+            "xx 1-1 -> 1.1-1\n",
+            "xx|1.1-1|repoA|||\n",
+            &installed,
+            &sync,
+            &Conf::default(),
+            &printed,
+            "xx|repoB||lib32-libcaca|lib32-libcaca\n",
+        );
+        assert_eq!(names(&ups), ["xx"], "{ups:#?}");
+        assert_eq!(ups[0].replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["lib32-libcaca"]);
+    }
+
+    // ---- untracked packages ------------------------------------------------
+
+    fn untracked_inputs<'a>(
+        installed: &'a HashMap<String, alpm::InstalledPkg>,
+        sync: &'a [alpm::SyncEntry],
+        conf: &'a Conf,
+    ) -> Inputs<'a> {
+        Inputs {
+            repo_lines: "",
+            aur_lines: "",
+            installed,
+            sync_entries: sync,
+            sysupgrade: Some(&[]),
+            final_targets: None,
+            conf,
+        }
+    }
+
+    #[test]
+    fn untracked_packages_are_in_no_repo_and_not_in_the_aur() {
+        // 22/11/2026: gitcomet in no repository and not in the AUR; paru in
+        // the AUR; python-async-timeout the AUR's 5.0.1-2, newer than
+        // [extra]'s (paru never asks the AUR about it); libwpe needed by
+        // wpebackend-fdo through its soname.
+        let mut installed = HashMap::from([
+            ("gitcomet".to_string(), pkg("0.2.5-1", None)),
+            ("paru".to_string(), pkg("2.2.0-2", None)),
+            (
+                "python-async-timeout".to_string(),
+                alpm::InstalledPkg { explicit: false, validation: vec!["none".into()], ..pkg("5.0.1-2", None) },
+            ),
+            // 22/11/2026: cachyos-extra-v4's signed 1.68-1.1, if that
+            // repository dropped it while [extra] has 1.68-1: pacman tracks
+            // it by name, so no error (and no advice to downgrade).
+            (
+                "perl-datetime".to_string(),
+                alpm::InstalledPkg { explicit: false, validation: vec!["pgp".into()], ..pkg("1.68-1.1", None) },
+            ),
+            // [minka]'s checksummed build, pulled in with no record.
+            (
+                "coreutils-uutils".to_string(),
+                alpm::InstalledPkg { validation: vec!["sha256".into()], ..pkg("0.4.0-2", None) },
+            ),
+            ("ripgrep".to_string(), pkg("15.1.0-1", Some("extra"))),
+            // Recorded from [extra], which is past it: pacman tracks that.
+            ("moved".to_string(), pkg("3-1", Some("extra"))),
+            // A repository that dropped it, and nothing else has it.
+            ("dropped".to_string(), pkg("1-1", Some("multilib"))),
+            (
+                "libwpe".to_string(),
+                alpm::InstalledPkg {
+                    explicit: false,
+                    provides: deps(&["libwpe-1.0.so=1-64"]),
+                    ..pkg("1.16.3-1.1", None)
+                },
+            ),
+            (
+                "wpebackend-fdo".to_string(),
+                alpm::InstalledPkg {
+                    explicit: false,
+                    depends: deps(&["libwpe-1.0.so=1-64"]),
+                    optdepends: deps(&["gitcomet"]),
+                    ..pkg("1.16.1-1.1", None)
+                },
+            ),
+        ]);
+        let sync = alpm::parse_sync_list(
+            "extra python-async-timeout 5.0.1-1\nextra ripgrep 15.1.0-1\nextra moved 2-1\nextra perl-datetime 1.68-1\n\
+             minka coreutils-uutils 0.4.0-1\n",
+        );
+        let conf = Conf::default();
+        let inputs = untracked_inputs(&installed, &sync, &conf);
+        let candidates = untracked_candidates(&[], &inputs);
+        let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["dropped", "gitcomet", "libwpe", "paru", "python-async-timeout", "wpebackend-fdo"]);
+
+        let aur = HashMap::from([
+            ("paru".to_string(), "2.2.0-2".to_string()),
+            ("python-async-timeout".to_string(), "5.0.1-2".to_string()),
+        ]);
+        let (flagged, note) = flag_untracked(candidates.clone(), Ok(&aur));
+        assert_eq!(note, None);
+        let names: Vec<&str> = flagged.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["dropped", "gitcomet", "libwpe", "python-async-timeout", "wpebackend-fdo"]);
+        let by = |n: &str| flagged.iter().find(|t| t.name == n).unwrap_or_else(|| panic!("{n} not flagged: {flagged:#?}"));
+        let g = by("gitcomet");
+        assert_eq!((g.kind.as_str(), g.explicit, g.required_by.len()), ("no_source", true, 0));
+        assert_eq!(g.optional_for, ["wpebackend-fdo"]);
+        assert!(g.hint.starts_with("no repository or AUR package provides it"), "{}", g.hint);
+        let p = by("python-async-timeout");
+        assert_eq!((p.kind.as_str(), p.explicit), ("other_build", false));
+        assert_eq!((p.repo_versions.as_slice(), p.aur_version.as_deref()), (&["extra 5.0.1-1".to_string()][..], Some("5.0.1-2")));
+        assert!(p.hint.starts_with("extra has 5.0.1-1, not this build; the AUR has 5.0.1-2, but paru never"), "{}", p.hint);
+        assert_eq!(by("libwpe").required_by, ["wpebackend-fdo"]);
+        assert!(by("dropped").hint.starts_with("multilib no longer has it"), "{}", by("dropped").hint);
+        // Not the AUR's either: a file of unknown origin.
+        let (flagged, _) = flag_untracked(candidates.clone(), Ok(&HashMap::new()));
+        let p = flagged.iter().find(|t| t.name == "python-async-timeout").expect("flagged");
+        assert!(p.aur_version.is_none() && p.hint.contains("installed from a file with no signature"), "{}", p.hint);
+        // Without its %VALIDATION% (or with a signature) the same package
+        // is pacman's to track: no candidate.
+        let mut signed = installed.clone();
+        signed.insert("python-async-timeout".into(), alpm::InstalledPkg { explicit: false, ..pkg("5.0.1-2", None) });
+        let inputs_signed = untracked_inputs(&signed, &sync, &conf);
+        assert!(untracked_candidates(&[], &inputs_signed).iter().all(|c| c.name != "python-async-timeout"));
+
+        // The AUR could not be asked: nothing in no repository is flagged
+        // (paru may well track it), and the note says why. What a
+        // repository has the name of is flagged still: the AUR's answer
+        // could not have cleared it.
+        let (flagged, note) = flag_untracked(candidates, Err("curl: (6) Could not resolve host"));
+        let names: Vec<&str> = flagged.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["python-async-timeout"]);
+        let note = note.expect("a note");
+        assert!(note.starts_with("AUR unreachable") && note.contains("5 packages in no repository were not checked"), "{note}");
+        // With no candidates there is nothing to ask about.
+        assert_eq!(flag_untracked(Vec::new(), Err("down")), (Vec::new(), None));
+
+        // A package a row touches is the list's already: an AUR update, a
+        // replaced package.
+        installed.insert("old".to_string(), pkg("1-1", None));
+        let inputs = untracked_inputs(&installed, &sync, &conf);
+        let mut row = Update {
+            name: "gitcomet".into(),
+            old_version: "0.2.5-1".into(),
+            new_version: "0.2.6-1".into(),
+            installed_repo: Some("aur".into()),
+            candidate_repo: "aur".into(),
+            transition: Transition::Same,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+            replaces: vec![Replaced { name: "old".into(), version: "1-1".into(), installed_repo: None }],
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
+        };
+        let names = |rows: &[Update]| -> Vec<String> {
+            untracked_candidates(rows, &inputs).into_iter().map(|c| c.name).collect()
+        };
+        assert!(!names(std::slice::from_ref(&row)).iter().any(|n| n == "gitcomet" || n == "old"));
+        row.replaces.clear();
+        assert!(names(&[row]).iter().any(|n| n == "old"));
+    }
+
+    #[test]
+    fn aur_answers_parse() {
+        let ok = r#"{"resultcount":1,"results":[{"Name":"paru","Version":"2.2.0-1"}],"type":"multiinfo","version":5}"#;
+        assert_eq!(parse_aur_info(ok), Ok(HashMap::from([("paru".to_string(), "2.2.0-1".to_string())])));
+        let none = r#"{"resultcount":0,"results":[],"type":"multiinfo","version":5}"#;
+        assert_eq!(parse_aur_info(none), Ok(HashMap::new()));
+        let err = r#"{"error":"Too many package results.","resultcount":0,"results":[],"type":"error","version":5}"#;
+        assert_eq!(parse_aur_info(err), Err("the AUR answered: Too many package results.".to_string()));
+        assert!(parse_aur_info("<html>502</html>").is_err());
+        assert!(parse_aur_info("{}").is_err());
+        assert_eq!(
+            aur_info_form(&["libsigc++".into(), "python-async-timeout".into(), "a@b".into()]),
+            "arg%5B%5D=libsigc%2B%2B&arg%5B%5D=python-async-timeout&arg%5B%5D=a%40b"
+        );
     }
 }

@@ -53,6 +53,10 @@ pub struct App {
     /// card per step, newest first, each there until dismissed.
     pub run_reports: Signal<Vec<RunReport>>,
     pub sel: Signal<UpdateSelection>,
+    /// The origin group's names are shown.
+    pub origin_open: Signal<bool>,
+    /// The untracked card was dismissed; it comes back when the list changes.
+    pub untracked_dismissed: Signal<bool>,
 
     pub query: Signal<String>,
     pub searching: Signal<bool>,
@@ -74,6 +78,11 @@ pub struct App {
     pub detail_target: Signal<String>,
     pub appstream: Signal<Loaded<Option<Appstream>>>,
     pub repos: Signal<Loaded<Vec<RepoOption>>>,
+    /// The local DB's word on the detail view's package: its install reason.
+    pub local: Signal<Loaded<Option<LocalPackage>>>,
+    /// The package whose install reason a terminal is changing, until that
+    /// step reports back. The shown reason is the DB's, never this guess.
+    pub reason_busy: Signal<Option<String>>,
     /// The first screenshot, once downloaded (images load from files only).
     pub shot: Signal<Option<PathBuf>>,
 
@@ -112,6 +121,8 @@ impl App {
             error: signal(String::new()),
             run_reports: signal(Vec::new()),
             sel: signal(UpdateSelection::default()),
+            origin_open: signal(false),
+            untracked_dismissed: signal(false),
             query: signal(String::new()),
             searching: signal(false),
             searched: signal(false),
@@ -129,6 +140,8 @@ impl App {
             detail_target: signal(String::new()),
             appstream: signal(Loaded::default()),
             repos: signal(Loaded::default()),
+            local: signal(Loaded::default()),
+            reason_busy: signal(None),
             shot: signal(None),
             sources: signal(None),
             sources_loading: signal(false),
@@ -165,6 +178,12 @@ impl App {
                     // Two steps can run at once: each report files only
                     // its own step's card.
                     let report: RunReport = parse(payload);
+                    if report.step == "reason" {
+                        self.reason_done();
+                        // The newest outcome of a package's reason change is
+                        // the one its card (and the detail view) tells.
+                        self.run_reports.update(|cards| drop_reason_cards(cards, report.command.last()));
+                    }
                     self.run_reports.update(|cards| record_run(cards, report));
                 }
             },
@@ -230,6 +249,28 @@ impl App {
         }
     }
 
+    /// For `--shot … --detail <package> <local.json>`: opens the detail
+    /// view of a package, its install reason from the file. Without a core
+    /// the other answers come back empty.
+    pub fn load_detail(self, name: &str, local: &std::path::Path) {
+        let data: Option<LocalPackage> = std::fs::read_to_string(local)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        self.open_detail(Detail {
+            name: name.to_string(),
+            context: Context::Installed,
+            version: data.as_ref().map(|p| p.version.clone()).unwrap_or_default(),
+            repo: String::new(),
+            description: String::new(),
+        });
+        self.local.set(Loaded {
+            name: name.to_string(),
+            loading: false,
+            loaded: true,
+            data,
+        });
+    }
+
     fn tick_clock(self) {
         set_timeout(Duration::from_secs(60), move || {
             if !self.now.is_alive() {
@@ -252,6 +293,12 @@ impl App {
     fn set_state(self, v: Value) {
         let state: State = parse(v);
         self.sel.update(|s| s.reconcile(&state.updates));
+        let same_untracked = self
+            .state
+            .with_untracked(|old| old.as_ref().is_some_and(|o| o.untracked == state.untracked));
+        if !same_untracked {
+            self.untracked_dismissed.set(false);
+        }
         self.state.set(Some(state));
         self.state_gen.update(|g| *g += 1);
     }
@@ -285,15 +332,36 @@ impl App {
     pub fn apply(self) {
         let view = untrack(|| self.updates_view());
         self.error.set(String::new());
+        let mut targets = view.explicit_targets;
+        targets.extend(view.origin_targets);
         self.request(
             "apply",
-            json!({ "ignore": view.ignored_names, "targets": view.explicit_targets }),
+            json!({ "ignore": view.ignored_names, "targets": targets }),
             |_| {},
         );
     }
 
+    fn origin_group(self) -> Option<Update> {
+        self.state
+            .with_untracked(|s| s.as_ref().and_then(|s| s.updates.iter().find(|u| u.is_origin_group()).cloned()))
+    }
+
+    /// The origin group's own tick (see UpdateSelection::set_group).
+    pub fn set_group(self, on: bool) {
+        if let Some(group) = self.origin_group() {
+            self.sel.update(|s| s.set_group(&group, on));
+        }
+    }
+
+    /// One member's tick (see UpdateSelection::toggle_member).
+    pub fn toggle_member(self, name: &str) {
+        if let Some(group) = self.origin_group() {
+            self.sel.update(|s| s.toggle_member(&group, name));
+        }
+    }
+
     pub fn tick_all(self) {
-        self.sel.update(|s| s.ignored.clear());
+        self.sel.update(|s| s.tick_all());
     }
 
     pub fn untick_all(self) {
@@ -304,7 +372,7 @@ impl App {
                     .map(|s| s.updates.iter().map(|u| u.name.clone()).collect())
             })
             .unwrap_or_default();
-        self.sel.update(|s| s.ignored = names);
+        self.sel.update(|s| s.untick_all(names));
     }
 
     pub fn search(self) {
@@ -394,6 +462,7 @@ impl App {
             data: Vec::new(),
         });
 
+        self.load_local(name.clone());
         let n = name.clone();
         core::request("appstream", json!({ "package": name }), move |reply| {
             if self.appstream.with_untracked(|a| a.name != n) {
@@ -429,6 +498,79 @@ impl App {
 
     pub fn close_detail(self) {
         self.detail.set(None);
+    }
+
+    /// Asks the local DB about `name` for the detail view (its install
+    /// reason, what requires it). The answer lands only while that package
+    /// is still the one shown.
+    fn load_local(self, name: String) {
+        let keep = self.local.with_untracked(|l| (l.name == name).then(|| l.data.clone()).flatten());
+        self.local.set(Loaded {
+            name: name.clone(),
+            loading: true,
+            loaded: false,
+            data: keep,
+        });
+        let n = name.clone();
+        core::request("local_package", json!({ "package": name }), move |reply| {
+            if !self.local.is_alive() || self.local.with_untracked(|l| l.name != n) {
+                return;
+            }
+            let data: Option<LocalPackage> = reply.ok().and_then(|v| serde_json::from_value(v).ok());
+            self.local.set(Loaded {
+                name: n,
+                loading: false,
+                loaded: true,
+                data,
+            });
+        });
+    }
+
+    /// Marks the detail view's package a dependency or explicit, in a
+    /// terminal (`sudo pacman -D`). The view keeps showing what the DB
+    /// says until that step reports back (reason_done).
+    pub fn set_reason(self, explicit: bool) {
+        if self.reason_busy.with_untracked(|b| b.is_some()) {
+            return;
+        }
+        let Some(p) = self.local.with_untracked(|l| l.data.clone()).filter(|p| p.installed) else {
+            return;
+        };
+        if p.explicit == explicit {
+            return;
+        }
+        self.reason_busy.set(Some(p.name.clone()));
+        let flag = if explicit { "--asexplicit" } else { "--asdeps" };
+        let name = p.name.clone();
+        core::request("set_reason", json!({ "package": p.name, "explicit": explicit }), move |reply| {
+            if let Err(e) = reply {
+                self.reason_busy.set(None);
+                // A card, not the error bar: the detail view over it shows
+                // the same report (reason_section), and so does the list.
+                let report = RunReport {
+                    step: "reason".into(),
+                    headline: format!("Install reason change did not start: {e}"),
+                    command: ["sudo", "pacman", "-D", flag, "--", &name].iter().map(|a| a.to_string()).collect(),
+                    ..Default::default()
+                };
+                self.run_reports.update(|cards| {
+                    drop_reason_cards(cards, report.command.last());
+                    record_run(cards, report);
+                });
+            }
+        });
+    }
+
+    /// A reason change ended, whichever way: read the DB again, for the
+    /// open detail view and the installed list.
+    fn reason_done(self) {
+        self.reason_busy.set(None);
+        if let Some(name) = self.detail.with_untracked(|d| d.as_ref().map(|d| d.name.clone())) {
+            self.load_local(name);
+        }
+        if self.installed_loaded.get_untracked() {
+            self.load_installed();
+        }
     }
 
     /// A chosen build the repo list no longer offers falls back to the

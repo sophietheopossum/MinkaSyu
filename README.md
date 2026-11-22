@@ -42,6 +42,26 @@ whenever `minka-syu-gui` is missing (`$MINKA_SYU_DIR` points `qs -p` at
 a checkout's `ui/`). `minka-syu-gui --tab updates|browse|installed|sources`
 opens on a tab, and `--detail <pkg>` on a package's detail view.
 
+The QML fallback does not know switch rows or the no-recorded-repository
+row. It shows them as later-repo rows, and while they are unticked its
+command preview lists them under `--ignore` (the group as
+`(no recorded repository)`). The core drops those names before paru
+runs: an unticked switch or reinstall is only left out.
+
+The detail view of an installed package shows its install reason as
+two buttons, Dependency and Explicit, with what requires it and what it
+is optional for (pacman's "Required By" and "Optional For", versions
+and sonames matched as libalpm matches them). A press opens the
+terminal on `sudo pacman -D --asdeps|--asexplicit -- <pkg>` (the
+"reason" step, reported like the others); the buttons show what the
+local DB says, read again when that step ends, and never flip before. A
+failed change says so under the buttons too, as long as its card is
+there. A package nothing requires gets one more line: as a dependency
+it is an orphan, which `pacman -Qdt` lists; if something has it as an
+optional dependency, only `pacman -Qdtt` does. From the CLI:
+`minka-syu reason [--json] <pkg>` shows it, `minka-syu reason
+[--dry-run] --asdeps|--asexplicit <pkg>` changes it.
+
 Tabs: **Updates** (below), **Browse** (search repos + AUR, tick builds
 to install together), **Installed** (filter, tick to remove), and
 **Sources**, shown only when a `minkarepo` is found
@@ -64,6 +84,53 @@ where. If that fails, the check falls back to `-Qu` and pacman.conf.
   and are applied as explicit `repo/name` targets, because a plain
   `-Syu` never selects them. If that build replaces an installed
   package, the row says so.
+- **Same-version switches.** An installed package whose build is in no
+  repository, while a repository carries that version as a build of its
+  own: its repository dropped it (Arch's `[multilib]` lib32-libcaca,
+  rebuilt in `[minka]` at the same 0.99.beta20-2), or it came from the
+  AUR or a file. Nothing is newer, so `-Qu` and `-Syu` never see it.
+  Builds are told apart by build date and packager: the local DB's
+  against each repository copy's, from one `pacman -Sp` per round. The
+  row offers the first repository in pacman.conf order with that
+  version, and reads like a repo change with the same version on both
+  sides ("switch to minka's build"). Like a later-repo row it starts
+  unticked and is applied as a `repo/name` target, which pacman
+  reinstalls from there. Unticked, it is only left out, never passed to
+  `--ignore`. A package with no recorded repository whose build a
+  repository has is that repository's package, not a switch.
+- **No recorded repository.** libalpm records where a package came from
+  (`%INSTALLED_DB%`) only for a named target or a plain upgrade, so a
+  package pacman pulls in as a dependency or a replacement has none until
+  its next upgrade (78 packages on 22/11/2026, 77 of them dependencies).
+  Those whose build a repository carries (same version, build date and
+  packager, from the switches' lookup) form one row, counted as one
+  update everywhere (the window, notifications, MinkaShell's pill), with
+  its names shown on demand and tickable one by one. Ticked, each is
+  reinstalled from that repository (the first in pacman.conf order whose
+  copy is the build) as a `repo/name` target of the same `paru -Syu`,
+  which records it. Like a switch it starts unticked and is never
+  passed to `--ignore`; the CLI's `apply` includes it, less any member
+  named in `--ignore` (`--ignore '(no recorded repository)'` leaves out
+  all of them). IgnorePkg/IgnoreGroup keep a package out of it, and so
+  does a conflict: a package that something the run may install
+  conflicts with (an upgrade in `-Su`'s set, or a later-repo or switch
+  row's build, ticked or not) would make pacman abort the whole
+  transaction as a `repo/name` target, where without one it asks to
+  remove it. A replacement keeps its package out too. A switch row is
+  dropped for the same conflict. Still unseen: conflicts of dependencies
+  new to the run, and the package's own `%CONFLICTS%`. In the window the
+  group's box shows a mix when some names are left out; leaving a name
+  out only drops its reinstall, and never carries over as `--ignore`
+  when that package later gets an update of its own.
+- **Install reasons survive reinstalls.** A sync reinstall keeps the
+  installed package's `%REASON%` (libalpm's commit_single_pkg copies it
+  from the old package), with or without `-y -u`, and paru passes
+  `repo/name` targets on unchanged; checked in a scratch root on
+  22/11/2026 with pacman 7.1.0 (CachyOS) and paru 2.2.0. So a switch or
+  a reinstall from the row above leaves dependencies dependencies, and
+  no `pacman -D` stage follows. Only `--asdeps`/`--asexplicit` (every
+  target's reason) or `--needed` (skips same-version targets) would
+  break that, and MinkaSyu passes neither.
 - **Replacements.** A package whose `replaces` names an installed
   package, such as `minka/coreutils-uutils` replacing the orphaned
   `coreutils-hybrid`. `-Qu` never reports these. Which installed
@@ -91,3 +158,29 @@ where. If that fails, the check falls back to `-Qu` and pacman.conf.
   `Usage = Upgrade`. They cannot be ticked or given a repo, and they do
   not count towards pending updates, notifications or MinkaShell's bar
   pill.
+
+**Untracked packages** are an error, not an update: an installed package
+nothing tracks. The check lists them after the updates, and the window
+in a red card above the list (dismissed until the list changes); each
+with its version, install reason, what requires it, and what to do.
+Two kinds:
+
+- in no repository, and the AUR has no package of that name (one AUR RPC
+  info request per check, POSTed through curl, for every candidate;
+  `$MINKA_SYU_AUR_RPC` overrides the URL). paru checks such "foreign"
+  packages against the AUR, so an AUR package of that name is tracked;
+- a repository has the name but not this version, no repository was
+  recorded, and libalpm validated it with nothing (`%VALIDATION%`
+  none): installed with `-U` from a file with no signature. paru never
+  asks the AUR about a name a repository has (it splits packages by
+  that), so even an AUR build of it is untracked (python-async-timeout
+  5.0.1-2 on 22/11/2026, the AUR's, while `[extra]` has 5.0.1-1). A
+  missing `%INSTALLED_DB%` alone means nothing (dependencies never get
+  one), and a signed or checksummed build is a repository's, which
+  pacman tracks by name: a v4 repository's 1.68-1.1 that it dropped,
+  while `[extra]` has 1.68-1, is no error.
+
+When the AUR cannot be asked, no package of the first kind is flagged
+(most are AUR packages) and an amber note says so instead. A package
+whose recorded repository moved past it is tracked by that repository,
+and a row (an update, a replacement) keeps a package off the list.

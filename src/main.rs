@@ -11,6 +11,10 @@
 //!   installed          list installed packages with origin + install reason
 //!   install [--dry-run] <pkg...>   open the terminal on `paru -S <pkg...>`
 //!   remove [--dry-run] <pkg...>    open the terminal on `paru -Rns <pkg...>`
+//!   reason [--json] <pkg>          an installed package's install reason
+//!                      and what requires it
+//!   reason [--dry-run] --asdeps|--asexplicit <pkg>
+//!                      open the terminal on `sudo pacman -D --asdeps|--asexplicit`
 //!   sources [--refresh]
 //!                      MinkaPKG packages vs upstream, through
 //!                      `minkarepo check` (JSON; cached unless --refresh)
@@ -56,6 +60,7 @@ fn main() {
         "appstream" => cmd_appstream(rest.first().copied().unwrap_or("")),
         "install" => cmd_packages(true, rest.contains(&"--dry-run"), &positional(&rest), Report::Wait),
         "remove" => cmd_packages(false, rest.contains(&"--dry-run"), &positional(&rest), Report::Wait),
+        "reason" => cmd_reason(&rest),
         "sources" => cmd_sources(rest.contains(&"--refresh")),
         "ui" => cmd_ui(),
         "run" => match run::run_verb(&rest) {
@@ -68,7 +73,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|sources|ui|serve)"
+                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|reason|sources|ui|serve)"
             );
             std::process::exit(2);
         }
@@ -88,10 +93,20 @@ fn held_reason(u: &check::Update) -> &'static str {
 }
 
 fn print_summary(state: &State) {
-    for u in &state.updates {
+    // The origin group is bookkeeping: after the updates, next to the
+    // total that counts it.
+    for u in state.updates.iter().filter(|u| !u.is_origin_group()) {
         let from = u.installed_repo.as_deref().unwrap_or("unknown source");
         if u.held {
-            println!("{} {} -> {}  [{}] (held: {})", u.name, u.old_version, u.new_version, u.candidate_repo, held_reason(u));
+            let switch = if u.switch_build { format!("; {}", u.switch_note()) } else { String::new() };
+            println!(
+                "{} {} -> {}  [{}] (held: {}{switch})",
+                u.name,
+                u.old_version,
+                u.new_version,
+                u.candidate_repo,
+                held_reason(u)
+            );
         } else if !u.superseded_by.is_empty() {
             println!(
                 "{} {} -> {}  [{}] (replaced by {})",
@@ -106,6 +121,16 @@ fn print_summary(state: &State) {
         } else if !u.replaces.is_empty() {
             let replaced: Vec<String> = u.replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
             println!("{} {}  [{}] replaces {}", u.name, u.new_version, u.candidate_repo, replaced.join(", "));
+        } else if u.switch_build {
+            println!(
+                "{} {} -> {}  [repo: {} -> {}; {}]",
+                u.name,
+                u.old_version,
+                u.new_version,
+                from,
+                u.candidate_repo,
+                u.switch_note()
+            );
         } else if u.explicit_target {
             println!(
                 "{} {} -> {}  [repo: {} -> {}; newer than {} {}]",
@@ -123,6 +148,9 @@ fn print_summary(state: &State) {
             println!("{} {} -> {}  [{}]", u.name, u.old_version, u.new_version, u.candidate_repo);
         }
     }
+    if let Some(group) = origin_row(state) {
+        print_origin_group(group);
+    }
     let held = state.held();
     println!(
         "{} update{} ({} change{} repository){}",
@@ -132,6 +160,99 @@ fn print_summary(state: &State) {
         if state.repo_change_count == 1 { "s" } else { "" },
         if held > 0 { format!(", {held} held") } else { String::new() }
     );
+    print_untracked(state);
+}
+
+/// The origin group: one line, then its names by repository.
+fn print_origin_group(u: &check::Update) {
+    let n = u.origin_group.len();
+    println!(
+        "{n} package{} with no recorded repository: reinstall {} from {} to record where {} came from  [{}]",
+        if n == 1 { "" } else { "s" },
+        if n == 1 { "it" } else { "them" },
+        if n == 1 { "its repository" } else { "their repositories" },
+        if n == 1 { "it" } else { "they" },
+        u.candidate_repo
+    );
+    for repo in u.candidate_repo.split(", ") {
+        let names: Vec<&str> = u.origin_group.iter().filter(|m| m.repo == repo).map(|m| m.name.as_str()).collect();
+        if !names.is_empty() {
+            for line in wrap_words(&format!("    {repo}: "), &names, NAMES_WIDTH) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// How wide a list of names may run before it wraps.
+const NAMES_WIDTH: usize = 100;
+
+/// `words` after `lead`, wrapped at `width` columns, the lines after the
+/// first indented under the first word. Every word is kept: these are what
+/// an apply reinstalls, and the CLI cannot expand an "and N more".
+fn wrap_words(lead: &str, words: &[&str], width: usize) -> Vec<String> {
+    let indent = " ".repeat(lead.chars().count());
+    let mut lines = Vec::new();
+    let mut line = lead.to_string();
+    let mut empty = true;
+    for w in words {
+        if !empty && line.chars().count() + 1 + w.chars().count() > width {
+            lines.push(std::mem::replace(&mut line, indent.clone()));
+            empty = true;
+        }
+        if !empty {
+            line.push(' ');
+        }
+        line.push_str(w);
+        empty = false;
+    }
+    lines.push(line);
+    lines
+}
+
+/// "required by a, b and 3 more" with at most `max` names, as the window
+/// caps them, then "; optional for ..." when optional dependencies name
+/// it, and `full` (where to see every name) when a list was cut.
+fn needed_text(required_by: &[String], optional_for: &[String], max: usize, full: &str) -> String {
+    let list = |names: &[String]| {
+        let shown: Vec<&str> = names.iter().take(max).map(String::as_str).collect();
+        let more = names.len().saturating_sub(max);
+        if more > 0 { format!("{} and {more} more", shown.join(", ")) } else { shown.join(", ") }
+    };
+    let mut out =
+        if required_by.is_empty() { "nothing requires it".to_string() } else { format!("required by {}", list(required_by)) };
+    if !optional_for.is_empty() {
+        out += &format!("; optional for {}", list(optional_for));
+    }
+    if required_by.len() > max || optional_for.len() > max {
+        out += &format!("; {full}");
+    }
+    out
+}
+
+/// Packages nothing tracks: an error to fix, after the updates.
+fn print_untracked(state: &State) {
+    if let Some(note) = &state.aur_unreachable {
+        println!("note: {note}");
+    }
+    if state.untracked.is_empty() {
+        return;
+    }
+    let n = state.untracked.len();
+    println!(
+        "untracked: {n} installed package{} that no repository or AUR package tracks",
+        if n == 1 { "" } else { "s" }
+    );
+    for t in &state.untracked {
+        let needed = needed_text(&t.required_by, &t.optional_for, 4, "minka-syu reason --json lists them all");
+        println!(
+            "  {} {} ({}; {needed}): {}",
+            t.name,
+            t.version,
+            if t.explicit { "explicit" } else { "dependency" },
+            t.hint
+        );
+    }
 }
 
 fn cmd_check(notify: bool) -> Result<(), String> {
@@ -173,14 +294,43 @@ fn terminal() -> String {
 
 /// `repo/package` targets selected for a system upgrade: the ticked
 /// updates whose chosen candidate sits in a lower-ranked repository
-/// than pacman's own, so a plain `-Syu` would never select them.
+/// than pacman's own, or that switch to another repository's build of
+/// the same version, so a plain `-Syu` would never select them. The
+/// origin group's row stands for its members' targets, less the members
+/// `ignore` names.
 fn explicit_targets(state: &State, ignore: &[String]) -> Vec<String> {
-    state
-        .updates
-        .iter()
-        .filter(|u| u.explicit_target && u.pending() && !ignore.contains(&u.name))
-        .map(|u| format!("{}/{}", u.candidate_repo, u.name))
-        .collect()
+    let mut out = Vec::new();
+    for u in state.updates.iter().filter(|u| u.explicit_target && u.pending() && !ignore.contains(&u.name)) {
+        if u.is_origin_group() {
+            out.extend(u.origin_group.iter().filter(|m| !ignore.contains(&m.name)).map(check::OriginMember::target));
+        } else {
+            out.push(format!("{}/{}", u.candidate_repo, u.name));
+        }
+    }
+    out
+}
+
+/// The origin group's row, if the state has one.
+fn origin_row(state: &State) -> Option<&check::Update> {
+    state.updates.iter().find(|u| u.is_origin_group())
+}
+
+/// A requested list with the origin group's own target (what the QML
+/// window sends for its row: "<candidate_repo>/(no recorded repository)")
+/// replaced by its members' targets, less the members `ignore` names.
+fn expand_origin_target(state: &State, ignore: &[String], requested: &[String]) -> Vec<String> {
+    let suffix = format!("/{}", check::ORIGIN_GROUP);
+    let mut out = Vec::new();
+    for t in requested {
+        if t.ends_with(&suffix) {
+            if let Some(row) = origin_row(state) {
+                out.extend(row.origin_group.iter().filter(|m| !ignore.contains(&m.name)).map(check::OriginMember::target));
+            }
+        } else {
+            out.push(t.clone());
+        }
+    }
+    out
 }
 
 fn validate_targets(targets: &[String]) -> Result<(), String> {
@@ -243,6 +393,7 @@ fn resolve_apply_targets(
         validate_targets(&targets)?;
         return Ok(targets);
     };
+    let requested = &expand_origin_target(state, ignore, requested)[..];
     validate_targets(requested)?;
     let mut seen: Vec<String> = Vec::new();
     for t in requested {
@@ -253,7 +404,19 @@ fn resolve_apply_targets(
         if ignore.iter().any(|n| n == name) {
             return Err(format!("upgrade target is also ignored: {t}"));
         }
-        let Some(update) = state.updates.iter().find(|u| u.name == name) else {
+        // A member of the origin group: reinstalled only from the
+        // repository whose copy is its build, and only with the group.
+        if let Some(member) = origin_row(state).and_then(|r| r.origin_group.iter().find(|m| m.name == name)) {
+            if ignore.iter().any(|n| n == check::ORIGIN_GROUP) {
+                return Err(format!("{name} is in the unticked group of packages with no recorded repository: {t}"));
+            }
+            if repo != member.repo {
+                return Err(format!("{name} is {}'s build, not {repo}'s: {t}", member.repo));
+            }
+            seen.push(name.to_string());
+            continue;
+        }
+        let Some(update) = state.updates.iter().find(|u| u.name == name && !u.is_origin_group()) else {
             return Err(format!("upgrade target is not a pending update: {t}"));
         };
         if update.held {
@@ -415,6 +578,38 @@ fn cmd_apply_state(dry_run: bool, ignore: &[String], state: &State) -> Result<()
     cmd_apply_state_targets(dry_run, ignore, None, state, Report::Wait)
 }
 
+/// The --ignore list paru gets: the unticked rows, less switch rows and
+/// the origin group (its row and its members). A switch or a reinstall
+/// happens only through its target, so unticking one just leaves the
+/// target out; it is no upgrade to hold back, and --ignore would make
+/// pacman treat the package as IgnorePkg for the whole run.
+fn paru_ignore(state: &State, ignore: &[String]) -> Vec<String> {
+    let origin = origin_row(state).map(|r| r.origin_group.as_slice()).unwrap_or_default();
+    ignore
+        .iter()
+        .filter(|n| {
+            n.as_str() != check::ORIGIN_GROUP
+                && !origin.iter().any(|m| m.name == **n)
+                && !state.updates.iter().any(|u| u.switch_build && u.name == **n)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The terminal argv of an apply: unticked rows as --ignore (see
+/// paru_ignore), ticked explicit rows as repo/name targets. Neither
+/// --needed (it would skip the same-version reinstalls) nor --asdeps or
+/// --asexplicit (they would set every target's install reason): a sync
+/// reinstall keeps each package's reason as it is.
+fn apply_step_argv(ignore: &[String], requested: Option<&[String]>, state: &State) -> Result<Vec<String>, String> {
+    let paru = paru_ignore(state, ignore);
+    if !paru.is_empty() {
+        validate_names(&paru, "--ignore")?;
+    }
+    let targets = resolve_apply_targets(state, ignore, requested)?;
+    Ok(upgrade_argv_with_targets(&paru, &targets))
+}
+
 fn cmd_apply_state_targets(
     dry_run: bool,
     ignore: &[String],
@@ -422,11 +617,7 @@ fn cmd_apply_state_targets(
     state: &State,
     report: Report,
 ) -> Result<(), String> {
-    if !ignore.is_empty() {
-        validate_names(ignore, "--ignore")?;
-    }
-    let targets = resolve_apply_targets(state, ignore, requested)?;
-    launch_step(&upgrade_argv_with_targets(ignore, &targets), "apply", dry_run, report)
+    launch_step(&apply_step_argv(ignore, requested, state)?, "apply", dry_run, report)
 }
 
 fn cmd_apply(dry_run: bool, ignore: &[String]) -> Result<(), String> {
@@ -441,6 +632,67 @@ fn cmd_packages(install: bool, dry_run: bool, packages: &[String], report: Repor
     }
     let argv = if install { install_argv(packages) } else { remove_argv(packages) };
     launch_step(&argv, if install { "install" } else { "remove" }, dry_run, report)
+}
+
+/// The terminal argv that marks an installed package a dependency or
+/// explicit: `sudo pacman -D`, which paru would only pass on to it.
+pub fn reason_argv(package: &str, explicit: bool) -> Vec<String> {
+    vec![
+        terminal(),
+        "-e".into(),
+        "sudo".into(),
+        "pacman".into(),
+        "-D".into(),
+        if explicit { "--asexplicit" } else { "--asdeps" }.into(),
+        "--".into(),
+        package.to_string(),
+    ]
+}
+
+/// Changes one installed package's install reason, in the terminal, as the
+/// "reason" step (run.rs reports how it ended).
+fn cmd_set_reason(package: &str, explicit: bool, dry_run: bool, report: Report) -> Result<(), String> {
+    if !valid_package_name(package) {
+        return Err(format!("invalid package name: {package:?}"));
+    }
+    if !catalog::run_local_package(package).installed {
+        return Err(format!("{package} is not installed"));
+    }
+    launch_step(&reason_argv(package, explicit), "reason", dry_run, report)
+}
+
+/// `reason [--json] <pkg>` shows; with --asdeps or --asexplicit, changes.
+fn cmd_reason(args: &[&str]) -> Result<(), String> {
+    let names = positional(args);
+    let [package] = names.as_slice() else {
+        return Err("reason takes one package".to_string());
+    };
+    let (deps, explicit) = (args.contains(&"--asdeps"), args.contains(&"--asexplicit"));
+    if deps && explicit {
+        return Err("reason: --asdeps or --asexplicit, not both".to_string());
+    }
+    if deps || explicit {
+        return cmd_set_reason(package, explicit, args.contains(&"--dry-run"), Report::Wait);
+    }
+    if !valid_package_name(package) {
+        return Err(format!("invalid package name: {package:?}"));
+    }
+    let local = catalog::run_local_package(package);
+    if args.contains(&"--json") {
+        println!("{}", serde_json::to_string_pretty(&local).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    if !local.installed {
+        return Err(format!("{package} is not installed"));
+    }
+    let needed = needed_text(&local.required_by, &local.optional_for, 6, "--json lists them all");
+    println!(
+        "{} {}: {} ({needed})",
+        local.name,
+        local.version,
+        if local.explicit { "explicit" } else { "dependency" }
+    );
+    Ok(())
 }
 
 fn cmd_search(query: &str) -> Result<(), String> {
@@ -617,6 +869,7 @@ fn state_or_empty() -> State {
         updates: Vec::new(),
         repo_change_count: 0,
         last_notified_count: 0,
+        ..Default::default()
     })
 }
 
@@ -707,6 +960,28 @@ fn dispatch(
         "remove" => {
             let packages = string_array(params, "packages");
             cmd_packages(false, false, &packages, Report::Broadcast).map_err(error_code)?;
+            Ok(serde_json::Value::Null)
+        }
+        "local_package" => {
+            let package = params
+                .get("package")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_code("local_package needs a package".to_string()))?;
+            if !valid_package_name(package) {
+                return Err(error_code(format!("invalid package name: {package:?}")));
+            }
+            serde_json::to_value(catalog::run_local_package(package)).map_err(|e| Error::internal(e.to_string()))
+        }
+        "set_reason" => {
+            let package = params
+                .get("package")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| error_code("set_reason needs a package".to_string()))?;
+            let explicit = params
+                .get("explicit")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| error_code("set_reason needs explicit: true|false".to_string()))?;
+            cmd_set_reason(package, explicit, false, Report::Broadcast).map_err(error_code)?;
             Ok(serde_json::Value::Null)
         }
         "sources" => {
@@ -867,6 +1142,8 @@ mod tests {
             superseded_by: Vec::new(),
             new_install: false,
             reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -878,6 +1155,7 @@ mod tests {
             ],
             repo_change_count: 0,
             last_notified_count: 0,
+            ..Default::default()
         };
         // Unticked explicit candidates are left to --ignore, not targeted.
         let targets = explicit_targets(&state, &["held-back".to_string()]);
@@ -910,6 +1188,8 @@ mod tests {
             superseded_by: Vec::new(),
             new_install: false,
             reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -917,6 +1197,7 @@ mod tests {
             updates: vec![upd("mesa"), upd("sqlite")],
             repo_change_count: 0,
             last_notified_count: 0,
+            ..Default::default()
         };
         // A manual repo choice for a pending, ticked update is fine.
         assert_eq!(
@@ -959,6 +1240,8 @@ mod tests {
             superseded_by: Vec::new(),
             new_install: false,
             reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
         };
         let state = State {
             schema: 1,
@@ -966,6 +1249,7 @@ mod tests {
             updates: vec![replacement],
             repo_change_count: 0,
             last_notified_count: 0,
+            ..Default::default()
         };
         // Plain -Syu performs it: no explicit target is derived.
         assert!(explicit_targets(&state, &[]).is_empty());
@@ -1000,6 +1284,8 @@ mod tests {
             superseded_by: vec!["coreutils-uutils".into()],
             new_install: false,
             reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
         });
         assert_eq!(both.total(), 1);
         let hybrid = ["minka/coreutils-hybrid".to_string()];
@@ -1008,6 +1294,197 @@ mod tests {
         // Unticking it is an ordinary --ignore, which skips the replacement.
         let argv = upgrade_argv(&["coreutils-uutils".into()]);
         assert_eq!(&argv[2..], ["paru", "-Syu", "--sudoloop", "--ignore=coreutils-uutils"]);
+    }
+
+    #[test]
+    fn unticked_switches_are_left_out_and_never_ignored() {
+        let switch = check::Update {
+            name: "lib32-libcaca".into(),
+            old_version: "0.99.beta20-2".into(),
+            new_version: "0.99.beta20-2".into(),
+            installed_repo: Some("multilib".into()),
+            candidate_repo: "minka".into(),
+            transition: check::Transition::Changed,
+            explicit_target: true,
+            first_repo: None,
+            first_version: None,
+            replaces: Vec::new(),
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
+            switch_build: true,
+            origin_group: Vec::new(),
+        };
+        let mesa = check::Update {
+            name: "mesa".into(),
+            new_version: "2-1".into(),
+            candidate_repo: "extra".into(),
+            transition: check::Transition::Same,
+            explicit_target: false,
+            switch_build: false,
+            ..switch.clone()
+        };
+        let state = State {
+            schema: 1,
+            checked_at: 0,
+            updates: vec![switch, mesa],
+            repo_change_count: 1,
+            last_notified_count: 0,
+            ..Default::default()
+        };
+        let tail = |argv: Vec<String>| argv[2..].to_vec();
+        let ignore = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(state.total(), 2);
+        // Ticked (the CLI's default): its repo/name target rides along.
+        assert_eq!(
+            tail(apply_step_argv(&[], None, &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop", "minka/lib32-libcaca"]
+        );
+        // Unticked: no target, and no --ignore for it either.
+        assert_eq!(
+            tail(apply_step_argv(&ignore(&["lib32-libcaca", "mesa"]), None, &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop", "--ignore=mesa"]
+        );
+        // The window's own target list behaves the same.
+        assert_eq!(
+            tail(apply_step_argv(&ignore(&["lib32-libcaca"]), Some(&[]), &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop"]
+        );
+        assert_eq!(
+            tail(apply_step_argv(&[], Some(&["minka/lib32-libcaca".into()]), &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop", "minka/lib32-libcaca"]
+        );
+        // Held by IgnorePkg: never targeted, and not counted.
+        let mut held = state.clone();
+        held.updates[0].held = true;
+        held.updates[0].held_by = Some("ignore".into());
+        assert_eq!(held.total(), 1);
+        assert_eq!(tail(apply_step_argv(&[], None, &held).unwrap()), ["paru", "-Syu", "--sudoloop"]);
+        assert!(apply_step_argv(&[], Some(&["minka/lib32-libcaca".into()]), &held).is_err());
+    }
+
+    fn origin_state() -> State {
+        let member = |name: &str, repo: &str, explicit: bool| check::OriginMember {
+            name: name.into(),
+            version: "1-1".into(),
+            repo: repo.into(),
+            explicit,
+        };
+        let group = check::Update {
+            name: check::ORIGIN_GROUP.into(),
+            old_version: "2 packages".into(),
+            new_version: "same builds".into(),
+            installed_repo: None,
+            candidate_repo: "extra, multilib".into(),
+            transition: check::Transition::UnknownSource,
+            explicit_target: true,
+            first_repo: None,
+            first_version: None,
+            replaces: Vec::new(),
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: vec![member("zstd", "extra", false), member("lib32-zstd", "multilib", false)],
+        };
+        let mesa = check::Update {
+            name: "mesa".into(),
+            old_version: "1-1".into(),
+            new_version: "2-1".into(),
+            installed_repo: Some("extra".into()),
+            candidate_repo: "extra".into(),
+            transition: check::Transition::Same,
+            explicit_target: false,
+            origin_group: Vec::new(),
+            ..group.clone()
+        };
+        State { schema: 1, updates: vec![group, mesa], ..Default::default() }
+    }
+
+    #[test]
+    fn the_origin_group_rides_along_as_member_targets() {
+        let state = origin_state();
+        let tail = |argv: Vec<String>| argv[2..].to_vec();
+        let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(state.total(), 2, "the group is one update");
+        // The CLI's default, like a switch row: every member's target.
+        let all = ["paru", "-Syu", "--sudoloop", "extra/zstd", "multilib/lib32-zstd"];
+        assert_eq!(tail(apply_step_argv(&[], None, &state).unwrap()), all);
+        // A member named in --ignore is left out, and never passed on.
+        assert_eq!(
+            tail(apply_step_argv(&names(&["zstd", "mesa"]), None, &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop", "--ignore=mesa", "multilib/lib32-zstd"]
+        );
+        // The whole group unticked: no targets, no --ignore for it.
+        assert_eq!(
+            tail(apply_step_argv(&names(&[check::ORIGIN_GROUP]), None, &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop"]
+        );
+        // The window sends the members' targets.
+        assert_eq!(
+            tail(apply_step_argv(&[], Some(&names(&["multilib/lib32-zstd"])), &state).unwrap()),
+            ["paru", "-Syu", "--sudoloop", "multilib/lib32-zstd"]
+        );
+        // The QML window sends the row's own target: its members, then.
+        let qml = names(&[&format!("extra, multilib/{}", check::ORIGIN_GROUP)]);
+        assert_eq!(tail(apply_step_argv(&names(&["lib32-zstd"]), Some(&qml), &state).unwrap()), all[..4]);
+        assert_eq!(tail(apply_step_argv(&[], Some(&qml), &state).unwrap()), all);
+        // A member from another repository, or with the group unticked, is refused.
+        assert!(apply_step_argv(&[], Some(&names(&["cachyos/zstd"])), &state).is_err());
+        assert!(apply_step_argv(&names(&[check::ORIGIN_GROUP]), Some(&names(&["extra/zstd"])), &state).is_err());
+        // Nor is the row's name ever a target of its own.
+        assert!(apply_step_argv(&[], Some(&names(&["extra/(no"])), &state).is_err());
+        // Reinstalls keep the install reason only without these.
+        let argv = apply_step_argv(&[], None, &state).unwrap();
+        assert!(!argv.iter().any(|a| a == "--needed" || a == "--asdeps" || a == "--asexplicit"), "{argv:?}");
+    }
+
+    #[test]
+    fn reason_changes_run_pacman_d_through_the_runner() {
+        let deps = reason_argv("python-lockfile", false);
+        assert_eq!(&deps[1..], ["-e", "sudo", "pacman", "-D", "--asdeps", "--", "python-lockfile"]);
+        let explicit = reason_argv("libwpe", true);
+        assert_eq!(&explicit[2..], ["sudo", "pacman", "-D", "--asexplicit", "--", "libwpe"]);
+        // launch_step's wrapping: the terminal runs `minka-syu run --step
+        // reason`, which records it and reports how it ended.
+        let wrapped = run::wrap(&deps, std::path::Path::new("/usr/bin/minka-syu"), "reason", std::path::Path::new("/s/r.json"));
+        assert_eq!(
+            &wrapped[1..],
+            [
+                "-e", "/usr/bin/minka-syu", "run", "--step", "reason", "--result", "/s/r.json", "--", "sudo", "pacman",
+                "-D", "--asdeps", "--", "python-lockfile"
+            ]
+        );
+        assert_eq!(run::step_label("reason"), "Install reason change");
+        // Names are checked before anything reaches sudo.
+        assert!(cmd_set_reason("-Rns", true, true, Report::Wait).is_err());
+        assert!(cmd_reason(&["--asdeps", "--asexplicit", "x"]).is_err());
+        assert!(cmd_reason(&["--asdeps"]).is_err());
+    }
+
+    #[test]
+    fn cli_lists_wrap_and_cap() {
+        let names: Vec<String> = (0..30).map(|i| format!("perl-module-{i:02}")).collect();
+        let words: Vec<&str> = names.iter().map(String::as_str).collect();
+        let lines = wrap_words("    extra: ", &words, NAMES_WIDTH);
+        assert!(lines.len() > 1 && lines.iter().all(|l| l.chars().count() <= NAMES_WIDTH), "{lines:#?}");
+        assert!(lines[0].starts_with("    extra: perl-module-00 "));
+        assert!(lines[1].starts_with(&format!("{}perl-module-", " ".repeat(11))), "{lines:#?}");
+        // Every name is kept.
+        let joined = lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        assert_eq!(joined.split_whitespace().filter(|w| w.starts_with("perl-")).count(), 30);
+        assert_eq!(wrap_words("    a: ", &["x"], 10), ["    a: x"]);
+        let many: Vec<String> = (0..9).map(|i| format!("p{i}")).collect();
+        assert_eq!(needed_text(&[], &[], 6, "x"), "nothing requires it");
+        assert_eq!(
+            needed_text(&many, &[], 6, "--json lists them all"),
+            "required by p0, p1, p2, p3, p4, p5 and 3 more; --json lists them all"
+        );
+        assert_eq!(needed_text(&[], &["yt-dlp".into()], 6, "x"), "nothing requires it; optional for yt-dlp");
     }
 
     #[test]

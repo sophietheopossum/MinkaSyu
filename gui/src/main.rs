@@ -42,7 +42,13 @@ fn tab_named(name: &str) -> Option<app::Tab> {
 /// directory). For checking the look of the window. With `--busy` after
 /// the file, the tab is drawn as it looks while the core is working; with
 /// `--run <result.json>` (once per card), with the card of that step's
-/// result.
+/// result; with `--detail <package> <local.json>`, with that package's
+/// detail view open, its install reason from the file (what
+/// `minka-syu reason --json <package>` prints); with `--names`, with the
+/// origin group's names shown; with `--leave-out <name>` (once per name),
+/// with the origin group ticked and those members left out; with
+/// `--height <px>`, that many pixels high instead of 875 (the list below
+/// the fold).
 fn shot() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let at = args.iter().position(|a| a == "--shot")?;
@@ -52,6 +58,12 @@ fn shot() -> Option<i32> {
         return Some(2);
     };
     let busy = args.iter().any(|a| a == "--busy");
+    let names = args.iter().any(|a| a == "--names");
+    let height = args
+        .iter()
+        .position(|a| a == "--height")
+        .and_then(|i| args.get(i + 1)?.parse::<u32>().ok())
+        .unwrap_or(875);
     let runs: Vec<std::path::PathBuf> = args
         .iter()
         .enumerate()
@@ -59,17 +71,37 @@ fn shot() -> Option<i32> {
         .filter_map(|(i, _)| args.get(i + 1))
         .map(std::path::PathBuf::from)
         .collect();
+    let left_out: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--leave-out")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect();
+    let detail = args
+        .iter()
+        .position(|a| a == "--detail")
+        .and_then(|i| Some((args.get(i + 1)?.clone(), std::path::PathBuf::from(args.get(i + 2)?))));
     let dir = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/state")))
         .unwrap_or_default()
         .join("minka-syu");
-    let drawn = anti_webui::app::headless::render_png(file, 1100, 875, 1.25, move || {
+    let drawn = anti_webui::app::headless::render_png(file, 1100, height, 1.25, move || {
         theme::install_widget_theme();
         let app = app::App::new();
         app.load_saved(&dir, tab);
         for file in &runs {
             app.load_run(file);
+        }
+        app.origin_open.set(names);
+        if !left_out.is_empty() {
+            app.set_group(true);
+            for name in &left_out {
+                app.toggle_member(name);
+            }
+        }
+        if let Some((name, local)) = &detail {
+            app.load_detail(name, local);
         }
         if busy {
             app.checking.set(true);

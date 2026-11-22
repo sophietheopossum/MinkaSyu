@@ -2,15 +2,20 @@
 //! the local DB for what is installed (and which repo it came from), and
 //! `pacman -Sl` output for what the sync DBs offer, in pacman.conf order.
 
+use crate::check::{DepSpec, dep_matches, parse_depstring};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct InstalledPkg {
     pub version: String,
     /// The sync repo the package was installed from (`%INSTALLED_DB%`).
-    /// Absent for packages installed from files (most AUR/manual builds)
-    /// and for anything installed before libalpm recorded it.
+    /// libalpm records it only for a named target and for a plain
+    /// sysupgrade of an installed package: a package pulled in as a
+    /// dependency or as a replacement has none until its next upgrade,
+    /// and neither has one installed from a file (most AUR/manual builds)
+    /// or before libalpm recorded it.
     pub repo: Option<String>,
     pub description: String,
     /// Installed size in bytes (`%SIZE%`); 0 when unrecorded.
@@ -19,11 +24,45 @@ pub struct InstalledPkg {
     /// libalpm writes `%REASON% 1` for dependencies and omits the
     /// field entirely for explicit installs.
     pub explicit: bool,
+    /// When the installed build was made (`%BUILDDATE%`, Unix seconds).
+    /// With `packager`, what tells two builds of one version apart.
+    pub build_date: Option<i64>,
+    /// Who made it (`%PACKAGER%`); empty when unrecorded.
+    pub packager: String,
+    /// What it depends on (`%DEPENDS%`), with the constraints.
+    pub depends: Vec<DepSpec>,
+    /// What it optionally depends on (`%OPTDEPENDS%`), less the
+    /// descriptions.
+    pub optdepends: Vec<DepSpec>,
+    /// What it provides (`%PROVIDES%`), with the versions.
+    pub provides: Vec<DepSpec>,
+    /// How libalpm checked the file when it was installed
+    /// (`%VALIDATION%`): "none", or any of "md5", "sha256" and "pgp".
+    /// Empty when unrecorded. A repository's package always has a
+    /// checksum or a signature; "none" alone means a file installed with
+    /// -U and no signature (a local or AUR build).
+    pub validation: Vec<String>,
+}
+
+impl InstalledPkg {
+    /// Installed from a file with no signature or checksum (`-U` of a
+    /// local or AUR build), not from a repository.
+    pub fn unsigned_file(&self) -> bool {
+        self.validation.len() == 1 && self.validation[0] == "none"
+    }
+}
+
+/// An %OPTDEPENDS% line's depstring: "name[op ver]: description" less the
+/// description. libalpm cuts at ": ", since an epoch has a bare ':'.
+fn optdep_string(line: &str) -> &str {
+    line.split_once(": ").map_or(line, |(dep, _)| dep).trim()
 }
 
 /// Parse one local-DB `desc` file into (name, package).
 /// Format: `%FIELD%` line, value line(s), blank line, repeated.
-/// Only the first value line of each field we care about is read.
+/// Only the first value line of each field we care about is read, except
+/// for the lists (%DEPENDS%, %OPTDEPENDS%, %PROVIDES%, %VALIDATION%),
+/// which run to the blank line.
 pub fn parse_desc(text: &str) -> (Option<String>, Option<InstalledPkg>) {
     let mut name = None;
     let mut version = None;
@@ -31,8 +70,38 @@ pub fn parse_desc(text: &str) -> (Option<String>, Option<InstalledPkg>) {
     let mut description = None;
     let mut size = None;
     let mut reason = None;
+    let mut build_date = None;
+    let mut packager = None;
+    let (mut depends, mut optdepends, mut provides) = (Vec::new(), Vec::new(), Vec::new());
+    let mut validation = Vec::new();
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
+        let list = match line.trim() {
+            "%DEPENDS%" => Some(&mut depends),
+            "%OPTDEPENDS%" => Some(&mut optdepends),
+            "%PROVIDES%" => Some(&mut provides),
+            _ => None,
+        };
+        let optional = line.trim() == "%OPTDEPENDS%";
+        if let Some(list) = list {
+            for value in lines.by_ref() {
+                let value = if optional { optdep_string(value) } else { value.trim() };
+                if value.is_empty() {
+                    break;
+                }
+                list.extend(parse_depstring(value));
+            }
+            continue;
+        }
+        if line.trim() == "%VALIDATION%" {
+            for value in lines.by_ref() {
+                if value.trim().is_empty() {
+                    break;
+                }
+                validation.push(value.trim().to_string());
+            }
+            continue;
+        }
         let target = match line.trim() {
             "%NAME%" => &mut name,
             "%VERSION%" => &mut version,
@@ -40,6 +109,8 @@ pub fn parse_desc(text: &str) -> (Option<String>, Option<InstalledPkg>) {
             "%DESC%" => &mut description,
             "%SIZE%" => &mut size,
             "%REASON%" => &mut reason,
+            "%BUILDDATE%" => &mut build_date,
+            "%PACKAGER%" => &mut packager,
             _ => continue,
         };
         if let Some(value) = lines.next() {
@@ -55,8 +126,60 @@ pub fn parse_desc(text: &str) -> (Option<String>, Option<InstalledPkg>) {
         description: description.unwrap_or_default(),
         size_bytes: size.and_then(|s| s.parse().ok()).unwrap_or(0),
         explicit: reason.as_deref() != Some("1"),
+        build_date: build_date.and_then(|d| d.parse().ok()),
+        packager: packager.unwrap_or_default(),
+        depends,
+        optdepends,
+        provides,
+        validation,
     });
     (name, pkg)
+}
+
+/// The installed packages with a dependency in `deps_of` that `name`
+/// satisfies, sorted, as libalpm's alpm_pkg_compute_requiredby matches
+/// them (_alpm_depcmp: by name and version, or by a provide, an
+/// unversioned provide only for an unversioned dependency). A package that
+/// depends on itself counts, as in pacman.
+fn dependents(
+    name: &str,
+    installed: &HashMap<String, InstalledPkg>,
+    deps_of: fn(&InstalledPkg) -> &[DepSpec],
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Vec<String> {
+    let Some(pkg) = installed.get(name) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (other, p) in installed {
+        if deps_of(p).iter().any(|d| dep_matches(d, name, &pkg.version, &pkg.provides, cmp)) {
+            out.push(other.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The installed packages that depend on `name`: pacman's "Required By".
+/// Nothing there and nothing in optional_for: `pacman -Qdt` lists it,
+/// when it is a dependency.
+pub fn required_by(
+    name: &str,
+    installed: &HashMap<String, InstalledPkg>,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Vec<String> {
+    dependents(name, installed, |p| &p.depends, cmp)
+}
+
+/// The installed packages that optionally depend on `name`: pacman's
+/// "Optional For". `pacman -Qdt` skips a package these name; `-Qdtt` lists
+/// it too.
+pub fn optional_for(
+    name: &str,
+    installed: &HashMap<String, InstalledPkg>,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Vec<String> {
+    dependents(name, installed, |p| &p.optdepends, cmp)
 }
 
 /// Read every installed package's version + origin repo from the local DB.
@@ -176,7 +299,7 @@ mod tests {
 
     #[test]
     fn desc_with_installed_db() {
-        let text = "%NAME%\nbcachefs-dkms\n\n%VERSION%\n3:1.39.7-1.1\n\n%INSTALLED_DB%\ncachyos-extra-v4\n\n%DESC%\nbcachefs DKMS\n\n%SIZE%\n123456\n\n%REASON%\n1\n";
+        let text = "%NAME%\nbcachefs-dkms\n\n%VERSION%\n3:1.39.7-1.1\n\n%INSTALLED_DB%\ncachyos-extra-v4\n\n%DESC%\nbcachefs DKMS\n\n%BUILDDATE%\n1725703316\n\n%PACKAGER%\nCachyOS <admin@cachyos.org>\n\n%SIZE%\n123456\n\n%REASON%\n1\n";
         let (name, pkg) = parse_desc(text);
         assert_eq!(name.as_deref(), Some("bcachefs-dkms"));
         let pkg = pkg.expect("pkg");
@@ -185,6 +308,73 @@ mod tests {
         assert_eq!(pkg.description, "bcachefs DKMS");
         assert_eq!(pkg.size_bytes, 123456);
         assert!(!pkg.explicit, "REASON 1 is a dependency install");
+        assert_eq!(pkg.build_date, Some(1725703316));
+        assert_eq!(pkg.packager, "CachyOS <admin@cachyos.org>");
+    }
+
+    /// Depstrings, parsed.
+    fn deps(list: &[&str]) -> Vec<DepSpec> {
+        list.iter().filter_map(|d| parse_depstring(d)).collect()
+    }
+
+    fn parsed(descs: &[&str]) -> HashMap<String, InstalledPkg> {
+        descs
+            .iter()
+            .filter_map(|t| match parse_desc(t) {
+                (Some(n), Some(p)) => Some((n, p)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn desc_lists_and_required_by() {
+        // libwpe on 22/11/2026: wpebackend-fdo needs it through a soname it
+        // provides, not by name; app only optionally.
+        let libwpe = "%NAME%\nlibwpe\n\n%VERSION%\n1.16.3-1.1\n\n%DEPENDS%\nlibxkbcommon\nglibc>=2.40\n\n%PROVIDES%\nlibwpe-1.0.so=1-64\n\n%REASON%\n1\n\n%VALIDATION%\nsha256\npgp\n";
+        let fdo = "%NAME%\nwpebackend-fdo\n\n%VERSION%\n1.16.1-1.1\n\n%DEPENDS%\nlibwpe-1.0.so=1-64\nwayland\n\n%VALIDATION%\nnone\n";
+        let app = "%NAME%\napp\n\n%VERSION%\n1-1\n\n%DEPENDS%\nwpebackend-fdo>=1.16\n\n%OPTDEPENDS%\nlibwpe: not a dependency\nepoch>=1:2.0: an epoch in the constraint\n\n";
+        let (_, p) = parse_desc(libwpe);
+        let p = p.expect("pkg");
+        assert_eq!(p.depends, deps(&["libxkbcommon", "glibc>=2.40"]));
+        assert_eq!(p.provides, deps(&["libwpe-1.0.so=1-64"]));
+        assert_eq!((p.validation.as_slice(), p.unsigned_file()), (&["sha256".to_string(), "pgp".to_string()][..], false));
+        let installed = parsed(&[libwpe, fdo, app]);
+        assert!(installed["wpebackend-fdo"].unsigned_file());
+        assert_eq!(installed["app"].optdepends, deps(&["libwpe", "epoch>=1:2.0"]));
+        let cmp: &mut dyn FnMut(&str, &str) -> Ordering = &mut crate::check::system_vercmp;
+        assert_eq!(required_by("libwpe", &installed, cmp), ["wpebackend-fdo"]);
+        assert_eq!(optional_for("libwpe", &installed, cmp), ["app"]);
+        assert_eq!(required_by("wpebackend-fdo", &installed, cmp), ["app"]);
+        assert!(optional_for("wpebackend-fdo", &installed, cmp).is_empty());
+        assert!(required_by("app", &installed, cmp).is_empty(), "optdepends do not count");
+        assert!(required_by("absent", &installed, cmp).is_empty());
+    }
+
+    #[test]
+    fn required_by_checks_versions_as_libalpm_does() {
+        // 22/11/2026: lib32-acl provides libacl.so=1-32, rsync needs the
+        // 64-bit libacl.so=1-64; the names alone would collide.
+        let lib32_acl = "%NAME%\nlib32-acl\n\n%VERSION%\n2.3.2-1\n\n%PROVIDES%\nlibacl.so=1-32\n\n";
+        let acl = "%NAME%\nacl\n\n%VERSION%\n2.3.2-1\n\n%PROVIDES%\nlibacl.so=1-64\n\n";
+        let rsync = "%NAME%\nrsync\n\n%VERSION%\n3.4.1-2\n\n%DEPENDS%\nlibacl.so=1-64\nglibc>=2.40\nfoo>=2\n\n";
+        let wine = "%NAME%\nwine\n\n%VERSION%\n10.0-1\n\n%DEPENDS%\nlibacl.so=1-32\n\n";
+        // An unversioned provide never satisfies a versioned dependency.
+        let foo = "%NAME%\nfoo-compat\n\n%VERSION%\n3-1\n\n%PROVIDES%\nfoo\n\n";
+        let glibc = "%NAME%\nglibc\n\n%VERSION%\n2.39-1\n\n";
+        let installed = parsed(&[lib32_acl, acl, rsync, wine, foo, glibc]);
+        let cmp: &mut dyn FnMut(&str, &str) -> Ordering = &mut crate::check::system_vercmp;
+        assert_eq!(required_by("lib32-acl", &installed, cmp), ["wine"], "only the 32-bit soname");
+        assert_eq!(required_by("acl", &installed, cmp), ["rsync"]);
+        assert!(required_by("foo-compat", &installed, cmp).is_empty());
+        // glibc 2.39 fails rsync's glibc>=2.40, so rsync does not name it.
+        let mut fixed = |a: &str, b: &str| a.cmp(b);
+        assert!(required_by("glibc", &installed, &mut fixed).is_empty());
+        let newer = parsed(&["%NAME%\nglibc\n\n%VERSION%\n2.41-1\n\n", rsync]);
+        assert_eq!(required_by("glibc", &newer, &mut fixed), ["rsync"]);
+        // A package that depends on itself counts, as in pacman.
+        let selfish = parsed(&["%NAME%\nperl-x\n\n%VERSION%\n1-1\n\n%DEPENDS%\nperl-x\n\n"]);
+        assert_eq!(required_by("perl-x", &selfish, &mut fixed), ["perl-x"]);
     }
 
     #[test]
@@ -196,6 +386,8 @@ mod tests {
         assert_eq!(pkg.version, "12.6.1-1");
         assert_eq!(pkg.repo, None);
         assert!(pkg.explicit, "no REASON field means explicitly installed");
+        assert_eq!((pkg.build_date, pkg.packager.as_str()), (None, ""));
+        assert!(pkg.validation.is_empty() && !pkg.unsigned_file(), "unrecorded is not unsigned");
     }
 
     #[test]

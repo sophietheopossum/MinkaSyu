@@ -37,6 +37,7 @@ pub struct DetailPlace {
     pub target: String,
     pub need_list: Option<NeedList>,
     pub need_all: bool,
+    pub shared_all: bool,
 }
 
 /// An answer that belongs to one package name: a slow reply for a package
@@ -96,6 +97,8 @@ pub struct App {
     /// The NEEDED BY list that is open, and whether it shows every name.
     pub need_list: Signal<Option<NeedList>>,
     pub need_all: Signal<bool>,
+    /// Whether ALSO PROVIDED BY's rows show every name.
+    pub shared_all: Signal<bool>,
     /// The detail views that dependents' were opened over, newest last.
     /// Closing the overlay clears them.
     pub back_stack: Signal<Vec<DetailPlace>>,
@@ -171,6 +174,7 @@ impl App {
             reason_busy: signal(None),
             need_list: signal(None),
             need_all: signal(false),
+            shared_all: signal(false),
             back_stack: signal(Vec::new()),
             removing: signal(Vec::new()),
             shot: signal(None),
@@ -495,10 +499,12 @@ impl App {
         self.removing.with(|r| r.iter().find(|names| names.iter().any(|n| n == name)).cloned())
     }
 
-    /// Nothing in flight can change what removing `name` takes: no removal
-    /// of it, and no install reason change, which can make one of its
-    /// remove_targets needed before the DB says so.
-    pub fn removal_free(self, name: &str) -> bool {
+    /// Nothing in flight touches `name`: no install reason change (one at a
+    /// time, and one can make a remove target needed before the DB says
+    /// so) and no removal that takes it (paru removes what it names
+    /// whatever its reason says by then). Remove… and the Dependency and
+    /// Explicit buttons are greyed while it is false.
+    pub fn nothing_in_flight(self, name: &str) -> bool {
         self.reason_busy.with(|b| b.is_none()) && self.removal_of(name).is_none()
     }
 
@@ -511,12 +517,12 @@ impl App {
             return;
         };
         let name = shown[0].clone();
-        if !untrack(|| self.removal_free(&name)) {
+        if !untrack(|| self.nothing_in_flight(&name)) {
             return;
         }
         core::request("local_package", json!({ "package": name }), move |reply| {
             // A second press, or a reason change, may have started meanwhile.
-            if !untrack(|| self.removal_free(&name)) {
+            if !untrack(|| self.nothing_in_flight(&name)) {
                 return;
             }
             let now: Option<LocalPackage> = reply.ok().and_then(|v| serde_json::from_value(v).ok());
@@ -549,6 +555,7 @@ impl App {
         self.detail.set(Some(d));
         self.need_list.set(None);
         self.need_all.set(false);
+        self.shared_all.set(false);
         self.compare_picks.set(Vec::new());
         self.shot.set(None);
         self.appstream.set(Loaded {
@@ -605,8 +612,9 @@ impl App {
         self.compare_picks.set(Vec::new());
     }
 
-    /// Opens the detail view of `name`, a package that needs the one shown,
-    /// over it: Back returns to this one as it was left.
+    /// Opens the detail view of `name`, a package that needs the one shown
+    /// or offers a name it offers, over it: Back returns to this one as it
+    /// was left.
     pub fn open_dependent(self, name: &str) {
         let Some(current) = self.detail.get_untracked() else {
             return;
@@ -620,6 +628,7 @@ impl App {
                 target: self.detail_target.get_untracked(),
                 need_list: self.need_list.get_untracked(),
                 need_all: self.need_all.get_untracked(),
+                shared_all: self.shared_all.get_untracked(),
             })
         });
         // The installed list's facts, when it has been read; the view
@@ -644,6 +653,7 @@ impl App {
         self.detail_target.set(place.target);
         self.need_list.set(place.need_list);
         self.need_all.set(place.need_all);
+        self.shared_all.set(place.shared_all);
     }
 
     /// Asks the local DB about `name` for the detail view (its install
@@ -676,15 +686,10 @@ impl App {
     /// terminal (`sudo pacman -D`). The view keeps showing what the DB
     /// says until that step reports back (reason_done).
     pub fn set_reason(self, explicit: bool) {
-        if self.reason_busy.with_untracked(|b| b.is_some()) {
-            return;
-        }
         let Some(p) = self.local.with_untracked(|l| l.data.clone()).filter(|p| p.installed) else {
             return;
         };
-        // Not while a removal that takes it is open: paru removes what it
-        // names whatever its reason says by then.
-        if p.explicit == explicit || untrack(|| self.removal_of(&p.name)).is_some() {
+        if p.explicit == explicit || !untrack(|| self.nothing_in_flight(&p.name)) {
             return;
         }
         self.reason_busy.set(Some(p.name.clone()));

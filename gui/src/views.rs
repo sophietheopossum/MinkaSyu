@@ -230,6 +230,7 @@ fn tab_switch(app: App, with_sources: bool) -> Div {
                 app.load_installed();
             }
         },
+        || false,
     )
 }
 
@@ -1962,6 +1963,7 @@ fn reason_section(app: App) -> Div {
                     vec!["Dependency", "Explicit"],
                     move |i| local_explicit(app) == (i == 1),
                     move |i| app.set_reason(i == 1),
+                    move || !app.nothing_in_flight(&local_name(app)),
                 ))
                 .child(
                     div()
@@ -2114,7 +2116,7 @@ fn need_lists(app: App, p: &LocalPackage, open: Option<NeedList>, all: bool) -> 
     for name in shown {
         // Every name in the explicit list is explicit: no marks there.
         let marked = kind != NeedList::Explicit && explicit.contains(name.as_str());
-        grid = grid.child(need_name(app, name.clone(), marked));
+        grid = grid.child(need_name(app, name.clone(), marked.then_some(("explicit", OK_GREEN))));
     }
     if left_out > 0 {
         let total = names.len();
@@ -2125,8 +2127,59 @@ fn need_lists(app: App, p: &LocalPackage, open: Option<NeedList>, all: bool) -> 
     column.child(grid)
 }
 
-/// One name in a NEEDED BY list: opens that package's detail view.
-fn need_name(app: App, name: String, explicit: bool) -> Div {
+/// The names the package offers that other installed packages offer too
+/// (the core's alpm::shared_provides), a row each: "java-runtime: jdk11-openjdk,
+/// …". A name opens that package's detail view (Back returns here); one
+/// that is the shared name itself (ca-certificates, which
+/// ca-certificates-utils provides) is marked, so the row does not read as a
+/// package providing itself.
+fn shared_section(app: App) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(3.0_f32)
+        .child(section_label("ALSO PROVIDED BY"))
+        .child(dyn_view(move || {
+            let all = app.shared_all.get();
+            let rows = app.local.with(|l| l.data.as_ref().map(|p| shared_rows(p, all)).unwrap_or_default());
+            untrack(|| shared_rows_view(app, rows, all))
+        }))
+}
+
+/// ALSO PROVIDED BY's rows (model::shared_rows): the shared name, then the
+/// packages that offer it too, and "Show all" on a row that was cut (for
+/// every row at once, as NEEDED BY's lists do it).
+fn shared_rows_view(app: App, rows: Vec<(String, Vec<String>, usize)>, all: bool) -> Div {
+    let mut column = div().w_full().flex().flex_col().gap(1.0_f32);
+    for (shared, shown, more) in rows {
+        let mut row = div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .column_gap(10.0_f32)
+            .row_gap(1.0_f32)
+            .child(mono_text(format!("{shared}:"), FONT_SIZE - 2.0_f32, TEXT_MUTED).whitespace_nowrap());
+        let total = shown.len() + more;
+        for name in shown {
+            let mark = (name == shared).then_some(("its name", TEXT_FAINT));
+            row = row.child(need_name(app, name, mark));
+        }
+        if more > 0 {
+            row = row.child(text_button(move || format!("Show all {total}"), PURPLE, move || app.shared_all.set(true)));
+        } else if all && total > SHARED_CAP {
+            row = row.child(text_button(|| "Show fewer".into(), PURPLE, move || app.shared_all.set(false)));
+        }
+        column = column.child(row);
+    }
+    column
+}
+
+/// One name in a NEEDED BY or ALSO PROVIDED BY list: opens that package's
+/// detail view. `mark` follows it, in its colour ("explicit").
+fn need_name(app: App, name: String, mark: Option<(&'static str, u32)>) -> Div {
     let shown = name.clone();
     let mut item = div()
         .flex_none()
@@ -2136,8 +2189,8 @@ fn need_name(app: App, name: String, explicit: bool) -> Div {
         .items_center()
         .gap(4.0_f32)
         .child(name_link(move || shown.clone(), FONT_SIZE - 1.0_f32, move || app.open_dependent(&name)));
-    if explicit {
-        item = item.child(mono_text("explicit", FONT_SIZE - 3.0_f32, OK_GREEN).whitespace_nowrap());
+    if let Some((mark, hex)) = mark {
+        item = item.child(mono_text(mark, FONT_SIZE - 3.0_f32, hex).whitespace_nowrap());
     }
     item
 }
@@ -2261,6 +2314,10 @@ fn detail_overlay(app: App) -> Div {
         }))
         .child(show(local_installed, move || untrack(|| reason_section(app))))
         .child(show(local_installed, move || untrack(|| needed_section(app))))
+        .child(show(
+            move || app.local.with(|l| l.data.as_ref().is_some_and(|p| p.installed && !p.shared_provides.is_empty())),
+            move || untrack(|| shared_section(app)),
+        ))
         .child(show(
             move || repos_loading() || app.repos.with(|r| !r.data.is_empty()),
             || section_label("AVAILABLE REPOSITORIES"),
@@ -2420,7 +2477,7 @@ fn detail_overlay(app: App) -> Div {
                         false,
                         move || {
                             app.local.with(|l| l.data.as_ref().and_then(remove_targets)).is_some()
-                                && app.removal_free(&local_name(app))
+                                && app.nothing_in_flight(&local_name(app))
                         },
                         move || app.remove_detail(),
                     )

@@ -94,6 +94,9 @@ pub struct LocalPackage {
     /// The explicitly installed packages among required_by and
     /// optional_for, sorted: the window marks them in those lists.
     pub explicit_dependents: Vec<String>,
+    /// The names it offers (its own, its provides) that other installed
+    /// packages offer too (alpm::shared_provides).
+    pub shared_provides: Vec<alpm::SharedProvide>,
 }
 
 /// LocalPackage of `name`, from an installed map (not installed: only the
@@ -124,6 +127,7 @@ pub fn local_package(name: &str, installed: &HashMap<String, alpm::InstalledPkg>
                 needed_by_explicit: needed.explicit,
                 covered_by: needed.covered_by,
                 explicit_dependents,
+                shared_provides: alpm::shared_provides(name, installed),
             }
         }
         None => LocalPackage { name: name.to_string(), ..Default::default() },
@@ -665,6 +669,7 @@ cachyos-extra-v4/fastfetch 2.70.0-1.1 [0 B 2.01 MiB] [installed]\n    A fast sys
         assert!(fdo.all_required_by.is_empty(), "optional dependencies never need it");
         assert_eq!(fdo.explicit_dependents, ["app"], "the explicit ones among both lists");
         assert!(l.explicit_dependents.is_empty());
+        assert!(l.shared_provides.is_empty(), "no other package offers its soname");
         let absent = local_package("nope", &installed);
         assert!(!absent.installed && absent.name == "nope");
     }

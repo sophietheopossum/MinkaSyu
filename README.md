@@ -58,10 +58,13 @@ The detail view of an installed package shows its install reason as
 two buttons, Dependency and Explicit. A press opens the terminal on
 `sudo pacman -D --asdeps|--asexplicit -- <pkg>` (the "reason" step,
 reported like the others); the buttons show what the local DB says,
-read again when that step ends, and never flip before. A failed change
-says so under the buttons too, as long as its card is there. From the
-CLI: `minka-syu reason [--json] <pkg>` shows it, `minka-syu reason
-[--dry-run] --asdeps|--asexplicit <pkg>` changes it.
+read again when that step ends, and never flip before. They are
+greyed out, and take no press, while a press would do nothing: while any
+install reason change runs (one at a time), and while a removal that
+takes the package is open. A failed change says so under the buttons
+too, as long as its card is there. From the CLI: `minka-syu reason
+[--json] <pkg>` shows it, `minka-syu reason [--dry-run]
+--asdeps|--asexplicit <pkg>` changes it.
 
 Who actually needs a package is a narrower question than "Required
 By", and `reason` answers it too: the installed packages that `pacman
@@ -76,10 +79,28 @@ misses when dependencies require each other in a cycle. What excuses a
 package that requires it without needing it is named too: the installed
 packages that would stay and satisfy that dependency as well (for
 ca-certificates, ca-certificates-utils, which provides it; a provider
-that itself goes with the package is none). `reason` says how many
-explicitly installed packages need it, or that none do, and what covers
-the rest; `--json` lists those as `needed_by_explicit`, every package
-that needs it as `all_required_by`, and the providers as `covered_by`.
+that itself goes with the package is none). `reason` says how many explicitly installed packages need it, or
+that none do, and what covers the rest; `--json` lists those as
+`needed_by_explicit`, every package that needs it as `all_required_by`,
+and the providers as `covered_by`.
+
+`reason` also flags the names a package offers (its own and its
+provides) that other installed packages offer too, whether or not
+anything requires them: "java-runtime is also provided by jdk11-openjdk,
+…", or for ca-certificates-utils "ca-certificates is also an installed
+package" (for ca-certificates itself, the providers that cover what
+requires it have said that already, so it is not said twice). A
+provide is compared by name alone (java-runtime=11 and
+java-runtime=21 are both a java-runtime), except a soname, which is
+compared with its version: a lib32 package and its 64-bit twin
+(libgtk-3.so=0-32, =0-64) are no alternatives, since a soname dependency
+normally names its architecture (one that leaves it out, as 1password's
+libgtk-3.so=0 does, takes either, and NEEDED BY says so), and counting
+them would flag 239 packages instead of 27 (on 23/11/2026; among the
+27, the JDKs, fonts' ttf-font, the GPU drivers' vulkan-driver and
+opengl-driver, audio hosts, the portal implementations and
+ca-certificates). `--json` lists them as `shared_provides`, each name
+with the packages in `also`.
 
 In the window, NEEDED BY under the install reason says it in one line:
 how many explicitly installed packages need it, and the first few; or,
@@ -99,7 +120,12 @@ after. "Required by" and "Optional for" (pacman's "Required By" and
 and "Explicit packages that need it" open lists of names, the first 12
 until "Show all", with explicitly installed packages marked. A name
 opens that package's detail view, and "Back to <package>" in its header
-returns; closing the view forgets the way back.
+returns; closing the view forgets the way back. ALSO PROVIDED BY, under
+NEEDED BY when there is something to say, has a row per shared name
+("java-runtime: jdk11-openjdk, jdk21-graalvm-bin, jdk25-graalvm-bin",
+the first 6 until "Show all"), whose names open those packages the same
+way; a package that is the shared name itself comes first, marked "its
+name".
 
 "Remove…" in the footer removes the package in the terminal with every
 package that needs it, which pacman would not leave broken: `paru -Rns
@@ -110,13 +136,13 @@ package. The command shows under NEEDED BY before the press, which
 reads the local DB again and opens the terminal only if the targets are
 still those. The button is off while an install reason change runs
 (it can make one of them needed), and while its own terminal is open,
-when Dependency and Explicit do nothing either and the line says what
+when Dependency and Explicit are greyed out too and the line says what
 it waits for; when the step ends, the view and the Installed tab's list
 (once it has been read) read the local DB again, and a failed removal
 says so under NEEDED BY as long as its card is there (the next removal
 of the same packages replaces it, as the next change of a package's
-install reason replaces that one's). The QML fallback
-has neither the section nor the button.
+install reason replaces that one's). The QML fallback has neither these
+sections nor the button.
 
 Tabs: **Updates** (below), **Browse** (search repos + AUR, tick builds
 to install together), **Installed** (filter, tick to remove), and

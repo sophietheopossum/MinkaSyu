@@ -127,6 +127,40 @@ pub struct LocalPackage {
     /// The explicitly installed packages among required_by and
     /// optional_for, which their lists mark.
     pub explicit_dependents: Vec<String>,
+    /// The names it offers that other installed packages offer too.
+    pub shared_provides: Vec<SharedProvide>,
+}
+
+/// A name a package offers (its own, or a provide) and the other installed
+/// packages that offer it too (the core's alpm::SharedProvide). A soname
+/// comes with its version: the core compares those whole, so a lib32
+/// package and its 64-bit twin share nothing.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SharedProvide {
+    pub name: String,
+    pub also: Vec<String>,
+}
+
+/// How many packages an ALSO PROVIDED BY row names before "Show all":
+/// ttf-font has a handful of providers, and the row stays one line.
+pub const SHARED_CAP: usize = 6;
+
+/// ALSO PROVIDED BY's rows: each shared name, the packages that offer it
+/// too (the first SHARED_CAP, or all), and how many it leaves out. The
+/// package named so comes first, so a cut never hides the one that
+/// explains the row.
+pub fn shared_rows(p: &LocalPackage, all: bool) -> Vec<(String, Vec<String>, usize)> {
+    p.shared_provides
+        .iter()
+        .map(|s| {
+            let mut also = s.also.clone();
+            also.sort_by_key(|n| *n != s.name);
+            let left_out = if all { 0 } else { also.len().saturating_sub(SHARED_CAP) };
+            also.truncate(also.len() - left_out);
+            (s.name.clone(), also, left_out)
+        })
+        .collect()
 }
 
 /// What changing a package's install reason would mean, in one line, or
@@ -2113,7 +2147,7 @@ mod tests {
         }))
         .unwrap();
         assert!(p.all_required_by.is_empty() && p.needed_by_explicit.is_empty() && p.explicit_dependents.is_empty());
-        assert!(p.covered_by.is_empty());
+        assert!(p.covered_by.is_empty() && p.shared_provides.is_empty() && shared_rows(&p, false).is_empty());
         // Explicit packages need it: a plain line.
         p.all_required_by = names(&["git", "perl-error"]);
         p.needed_by_explicit = names(&["git", "a", "b", "c", "d"]);
@@ -2192,6 +2226,36 @@ mod tests {
         assert!(NeedList::RequiredBy.names(&p).is_empty(), "no link to the view already open");
         p.installed = false;
         assert_eq!(needed_verdict(&p), None);
+    }
+
+    #[test]
+    fn also_provided_by_rows_cap_their_names() {
+        // ttf-dejavu on 23/11/2026, with two more fonts, and a soname that
+        // comes with its version.
+        let fonts = ["gnu-free-fonts", "noto-fonts", "ttf-bitstream-vera", "ttf-liberation", "ttf-ms-win10-auto", "x", "y"];
+        let p: LocalPackage = serde_json::from_value(serde_json::json!({
+            "name": "ttf-dejavu", "installed": true,
+            "shared_provides": [
+                {"name": "ttf-font", "also": fonts},
+                {"name": "libfoo.so=1-64", "also": ["foo-fork"]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            shared_rows(&p, false),
+            [("ttf-font".to_string(), names(&fonts[..SHARED_CAP]), 1), ("libfoo.so=1-64".to_string(), names(&["foo-fork"]), 0)]
+        );
+        assert_eq!(shared_rows(&p, true)[0], ("ttf-font".to_string(), names(&fonts), 0), "Show all");
+        // The package named like the shared name leads, so the cut keeps it.
+        let p: LocalPackage = serde_json::from_value(serde_json::json!({
+            "name": "x", "installed": true,
+            "shared_provides": [{"name": "ca-certificates", "also": ["a1", "a2", "a3", "a4", "a5", "a6", "ca-certificates"]}]
+        }))
+        .unwrap();
+        assert_eq!(
+            shared_rows(&p, false),
+            [("ca-certificates".to_string(), names(&["ca-certificates", "a1", "a2", "a3", "a4", "a5"]), 1)]
+        );
     }
 
     #[test]

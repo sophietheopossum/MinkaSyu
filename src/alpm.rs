@@ -3,6 +3,7 @@
 //! `pacman -Sl` output for what the sync DBs offer, in pacman.conf order.
 
 use crate::check::{DepSpec, dep_matches, parse_depstring};
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -274,6 +275,64 @@ pub fn needed_by(
     all.sort();
     let explicit = all.iter().filter(|n| installed[*n].explicit).cloned().collect();
     Needed { all, explicit, covered_by }
+}
+
+/// A name an installed package offers (its own, or a provide) that other
+/// installed packages offer too, as shared_provides finds it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SharedProvide {
+    /// The name; a soname with its version (`libfoo.so=1-64`).
+    pub name: String,
+    /// The other installed packages that offer it, sorted, each once.
+    pub also: Vec<String>,
+}
+
+/// What a provide is compared by: a soname with its version, so that a
+/// lib32 package and its 64-bit twin (libgtk-3.so=0-32, =0-64) do not
+/// count as offering the same thing, as a soname dependency normally
+/// names its architecture (compared by name, 204 sonames were shared on
+/// 23/11/2026); anything else by name alone, so jdk11's java-runtime=11
+/// and jdk21's java-runtime=21 are both a java-runtime.
+fn offer_key(p: &DepSpec) -> String {
+    match &p.constraint {
+        Some((op, version)) if p.name.contains(".so") => format!("{}{op}{version}", p.name),
+        _ => p.name.clone(),
+    }
+}
+
+/// The names `name` offers, its own and its provides, that other installed
+/// packages offer as well, by providing them or by being named so: ca-certificates
+/// and ca-certificates-utils (which provides ca-certificates), or the JDKs'
+/// java-runtime. Sorted by name; empty when `name` is not installed.
+pub fn shared_provides(name: &str, installed: &HashMap<String, InstalledPkg>) -> Vec<SharedProvide> {
+    let Some(pkg) = installed.get(name) else {
+        return Vec::new();
+    };
+    // A package that provides its own name (jdk21-openjdk=21...) offers it once.
+    let offers = |n: &str, p: &InstalledPkg| -> HashSet<String> {
+        std::iter::once(n.to_string()).chain(p.provides.iter().map(offer_key)).collect()
+    };
+    let mut also: HashMap<String, Vec<String>> = offers(name, pkg).into_iter().map(|k| (k, Vec::new())).collect();
+    for (other, p) in installed {
+        if other == name {
+            continue;
+        }
+        for key in offers(other, p) {
+            if let Some(list) = also.get_mut(&key) {
+                list.push(other.clone());
+            }
+        }
+    }
+    let mut shared: Vec<SharedProvide> = also
+        .into_iter()
+        .filter(|(_, list)| !list.is_empty())
+        .map(|(name, mut also)| {
+            also.sort();
+            SharedProvide { name, also }
+        })
+        .collect();
+    shared.sort_by(|a, b| a.name.cmp(&b.name));
+    shared
 }
 
 /// Read every installed package's version + origin repo from the local DB.
@@ -587,6 +646,63 @@ mod tests {
         assert!(covers("jre-a", &through).is_empty());
         // A package that depends on itself is no dependent to excuse.
         assert!(covers("lib", &[pkg("lib", &["lib"], &[], false)]).is_empty());
+    }
+
+    fn shared(name: &str, installed: &[(String, InstalledPkg)]) -> Vec<(String, Vec<String>)> {
+        let map: HashMap<String, InstalledPkg> = installed.iter().cloned().collect();
+        shared_provides(name, &map).into_iter().map(|s| (s.name, s.also)).collect()
+    }
+
+    fn row(name: &str, also: &[&str]) -> (String, Vec<String>) {
+        (name.to_string(), also.iter().map(|a| a.to_string()).collect())
+    }
+
+    #[test]
+    fn shared_provides_finds_other_packages_offering_a_name() {
+        // A virtual several packages provide, at different versions; each
+        // provides its own name too (jdk21-openjdk=21.0.13...), which is no
+        // one else's.
+        let jdks = [
+            pkg("jdk21-openjdk", &[], &["java-runtime=21", "jdk21-openjdk=21.0.13", "java-runtime-openjdk=21"], false),
+            pkg("jdk11-openjdk", &[], &["java-runtime=11", "java-runtime-openjdk=11"], false),
+            pkg("jdk25-graalvm-bin", &[], &["java-runtime=25"], true),
+            pkg("app", &["java-runtime"], &[], true),
+        ];
+        assert_eq!(
+            shared("jdk21-openjdk", &jdks),
+            [row("java-runtime", &["jdk11-openjdk", "jdk25-graalvm-bin"]), row("java-runtime-openjdk", &["jdk11-openjdk"])]
+        );
+        assert_eq!(shared("jdk25-graalvm-bin", &jdks), [row("java-runtime", &["jdk11-openjdk", "jdk21-openjdk"])]);
+        assert!(shared("app", &jdks).is_empty());
+        assert!(shared("absent", &jdks).is_empty());
+        // A provide that is another installed package's name, seen from both
+        // sides (ca-certificates on 23/11/2026); ca-certificates-java is
+        // ca-certificates-utils' alone.
+        let certs = [
+            pkg("ca-certificates", &["ca-certificates-mozilla"], &[], false),
+            pkg("ca-certificates-utils", &[], &["ca-certificates", "ca-certificates-java"], false),
+            pkg("ca-certificates-mozilla", &["ca-certificates-utils"], &[], false),
+        ];
+        assert_eq!(shared("ca-certificates", &certs), [row("ca-certificates", &["ca-certificates-utils"])]);
+        assert_eq!(shared("ca-certificates-utils", &certs), [row("ca-certificates", &["ca-certificates"])]);
+        assert!(shared("ca-certificates-mozilla", &certs).is_empty());
+    }
+
+    #[test]
+    fn shared_provides_compares_sonames_with_their_versions() {
+        // lib32 and 64-bit twins offer one soname at two versions: not shared.
+        let twins = [
+            pkg("gtk3", &[], &["libgtk-3.so=0-64", "gtk3-print-backends"], false),
+            pkg("lib32-gtk3", &[], &["libgtk-3.so=0-32"], false),
+        ];
+        assert!(shared("gtk3", &twins).is_empty());
+        assert!(shared("lib32-gtk3", &twins).is_empty());
+        // The same soname at the same version from two packages is.
+        let mut forked = twins.to_vec();
+        forked.push(pkg("gtk3-classic", &[], &["libgtk-3.so=0-64"], false));
+        assert_eq!(shared("gtk3", &forked), [row("libgtk-3.so=0-64", &["gtk3-classic"])]);
+        assert_eq!(shared("gtk3-classic", &forked), [row("libgtk-3.so=0-64", &["gtk3"])]);
+        assert!(shared("lib32-gtk3", &forked).is_empty());
     }
 
     #[test]

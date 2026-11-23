@@ -232,7 +232,9 @@ fn wrap_words(lead: &str, words: &[&str], width: usize) -> Vec<String> {
 /// it, then, given `needs` (all_required_by, needed_by_explicit and
 /// covered_by of a LocalPackage), whether anything installed explicitly
 /// needs it and what satisfies the packages that require it without
-/// needing it, and `full` (where to see every name) when a list was cut. `name` itself is
+/// needing it, then which other installed packages offer the names it
+/// offers (`shared`: at most `max` of those names), and `full` (where to
+/// see every name) when a list was cut. `name` itself is
 /// left out of `required_by`: pacman lists a package that depends on itself
 /// there, which says nothing about what else needs it.
 fn needed_text(
@@ -240,6 +242,7 @@ fn needed_text(
     required_by: &[String],
     optional_for: &[String],
     needs: Option<(&[String], &[String], &[String])>,
+    shared: &[alpm::SharedProvide],
     max: usize,
     full: &str,
 ) -> String {
@@ -258,8 +261,11 @@ fn needed_text(
         out += &format!("; optional for {}", list(optional_for));
     }
     let mut cut = others.len() > max || optional_for.len() > max;
+    // The covered_by this line names, if any.
+    let mut said_covers: &[String] = &[];
     // Nothing (else) requires it: that has said all of it.
     if let Some((all, explicit, covered_by)) = needs.filter(|_| !others.is_empty()) {
+        said_covers = covered_by;
         let (clause, shown) = match explicit.len() {
             // Not expected: what requires it and stays has a provider that stays.
             0 if all.is_empty() && covered_by.is_empty() => {
@@ -283,6 +289,26 @@ fn needed_text(
             cut |= covered_by.len() > max;
         }
     }
+    // Its own name, when what covers its requirers (named above) are all
+    // that offer it: ca-certificates and ca-certificates-utils, said once.
+    let shared: Vec<&alpm::SharedProvide> =
+        shared.iter().filter(|s| !(s.name == name && s.also.iter().all(|n| said_covers.contains(n)))).collect();
+    for s in shared.iter().take(max) {
+        // A name that is another package's own (ca-certificates-utils
+        // provides ca-certificates): "provided by ca-certificates" would read
+        // as a loop.
+        let providers: Vec<String> = s.also.iter().filter(|n| **n != s.name).cloned().collect();
+        out += &match (providers.len() < s.also.len(), providers.is_empty()) {
+            (true, true) => format!("; {} is also an installed package", s.name),
+            (true, false) => format!("; {} is also an installed package, and provided by {}", s.name, list(&providers)),
+            (false, _) => format!("; {} is also provided by {}", s.name, list(&providers)),
+        };
+        cut |= providers.len() > max;
+    }
+    if shared.len() > max {
+        out += &format!("; and {} more names other packages offer too", shared.len() - max);
+        cut = true;
+    }
     if cut {
         out += &format!("; {full}");
     }
@@ -303,7 +329,7 @@ fn print_untracked(state: &State) {
         if n == 1 { "" } else { "s" }
     );
     for t in &state.untracked {
-        let needed = needed_text(&t.name, &t.required_by, &t.optional_for, None, 4, "minka-syu reason --json lists them all");
+        let needed = needed_text(&t.name, &t.required_by, &t.optional_for, None, &[], 4, "minka-syu reason --json lists them all");
         println!(
             "  {} {} ({}; {needed}): {}",
             t.name,
@@ -745,7 +771,8 @@ fn cmd_reason(args: &[&str]) -> Result<(), String> {
         return Err(format!("{package} is not installed"));
     }
     let needs = (local.all_required_by.as_slice(), local.needed_by_explicit.as_slice(), local.covered_by.as_slice());
-    let needed = needed_text(&local.name, &local.required_by, &local.optional_for, Some(needs), 6, "--json lists them all");
+    let needed =
+        needed_text(&local.name, &local.required_by, &local.optional_for, Some(needs), &local.shared_provides, 6, "--json lists them all");
     println!(
         "{} {}: {} ({needed})",
         local.name,
@@ -1643,66 +1670,99 @@ mod tests {
         assert_eq!(joined.split_whitespace().filter(|w| w.starts_with("perl-")).count(), 30);
         assert_eq!(wrap_words("    a: ", &["x"], 10), ["    a: x"]);
         let many: Vec<String> = (0..9).map(|i| format!("p{i}")).collect();
-        assert_eq!(needed_text("pkg", &[], &[], None, 6, "x"), "nothing requires it");
+        assert_eq!(needed_text("pkg", &[], &[], None, &[], 6, "x"), "nothing requires it");
         assert_eq!(
-            needed_text("pkg", &many, &[], None, 6, "--json lists them all"),
+            needed_text("pkg", &many, &[], None, &[], 6, "--json lists them all"),
             "required by p0, p1, p2, p3, p4, p5 and 3 more; --json lists them all"
         );
-        assert_eq!(needed_text("pkg", &[], &["yt-dlp".into()], None, 6, "x"), "nothing requires it; optional for yt-dlp");
+        assert_eq!(needed_text("pkg", &[], &["yt-dlp".into()], None, &[], 6, "x"), "nothing requires it; optional for yt-dlp");
         // What `reason` adds: who needs it explicitly, said once.
         let (none, many): (&[String], &[String]) = (&[], &many);
-        assert_eq!(needed_text("pkg", &[], &[], Some((none, none, none)), 6, "x"), "nothing requires it");
+        assert_eq!(needed_text("pkg", &[], &[], Some((none, none, none)), &[], 6, "x"), "nothing requires it");
         let one: &[String] = &["git".to_string()];
         assert_eq!(
-            needed_text("pkg", one, &[], Some((one, one, none)), 6, "x"),
+            needed_text("pkg", one, &[], Some((one, one, none)), &[], 6, "x"),
             "required by git; needed by 1 explicitly installed package: git"
         );
         assert_eq!(
-            needed_text("pkg", one, &[], Some((many, none, none)), 6, "full"),
+            needed_text("pkg", one, &[], Some((many, none, none)), &[], 6, "full"),
             "required by git; nothing you installed explicitly needs it, only the dependencies p0, p1, p2, p3, p4, p5 and 3 more; full"
         );
         assert_eq!(
-            needed_text("pkg", one, &[], Some((one, none, none)), 6, "x"),
+            needed_text("pkg", one, &[], Some((one, none, none)), &[], 6, "x"),
             "required by git; nothing you installed explicitly needs it, only the dependency git"
         );
         assert_eq!(
-            needed_text("pkg", one, &[], Some((none, none, none)), 6, "x"),
+            needed_text("pkg", one, &[], Some((none, none, none)), &[], 6, "x"),
             "required by git; nothing needs it: another installed package satisfies what requires it"
         );
         assert_eq!(
-            needed_text("pkg", one, &[], Some((many, &many[..2], none)), 6, "x"),
+            needed_text("pkg", one, &[], Some((many, &many[..2], none)), &[], 6, "x"),
             "required by git; needed by 2 explicitly installed packages: p0, p1",
             "the uncut explicit list is all that is shown"
         );
         // It depends on itself, and nothing else requires it: no clause on
         // what satisfies its requirers, as there are none.
-        assert_eq!(needed_text("git", one, &[], Some((none, none, none)), 6, "x"), "nothing else requires it");
+        assert_eq!(needed_text("git", one, &[], Some((none, none, none)), &[], 6, "x"), "nothing else requires it");
         let with_self = ["git".to_string(), "p0".to_string()];
         assert_eq!(
-            needed_text("git", &with_self, &[], Some((&many[..1], none, none)), 6, "x"),
+            needed_text("git", &with_self, &[], Some((&many[..1], none, none)), &[], 6, "x"),
             "required by p0; nothing you installed explicitly needs it, only the dependency p0"
         );
         // What satisfies the packages that require it without needing it.
         let utils: &[String] = &["ca-certificates-utils".to_string()];
         assert_eq!(
-            needed_text("ca-certificates", one, &[], Some((none, none, utils)), 6, "x"),
+            needed_text("ca-certificates", one, &[], Some((none, none, utils)), &[], 6, "x"),
             "required by git; nothing needs it: ca-certificates-utils also provides what requires it"
         );
         assert_eq!(
-            needed_text("pkg", one, &[], Some((none, none, many)), 6, "full"),
+            needed_text("pkg", one, &[], Some((none, none, many)), &[], 6, "full"),
             "required by git; nothing needs it: p0, p1, p2, p3, p4, p5 and 3 more also provide what requires it; full"
         );
         let jdks: &[String] = &["jdk11-openjdk".to_string(), "jdk25-graalvm-bin".to_string()];
         assert_eq!(
-            needed_text("jdk21-openjdk", &with_self, &[], Some((&many[..1], none, jdks)), 6, "x"),
+            needed_text("jdk21-openjdk", &with_self, &[], Some((&many[..1], none, jdks)), &[], 6, "x"),
             "required by git, p0; nothing you installed explicitly needs it, only the dependency p0; \
              others are covered by jdk11-openjdk, jdk25-graalvm-bin"
         );
         assert_eq!(
-            needed_text("pkg", one, &[], Some((one, one, &many[..7])), 6, "full"),
+            needed_text("pkg", one, &[], Some((one, one, &many[..7])), &[], 6, "full"),
             "required by git; needed by 1 explicitly installed package: git; others are covered by p0, p1, p2, p3, p4, p5 \
              and 1 more; full"
         );
+        // The names it offers that other installed packages offer too, said
+        // even when nothing requires it, but not again when what covers its
+        // requirers has said it.
+        let shared = |name: &str, also: &[String]| alpm::SharedProvide { name: name.into(), also: also.to_vec() };
+        assert_eq!(
+            needed_text("ca-certificates", one, &[], Some((none, none, utils)), &[shared("ca-certificates", utils)], 6, "x"),
+            "required by git; nothing needs it: ca-certificates-utils also provides what requires it"
+        );
+        assert_eq!(
+            needed_text("ca-certificates", &[], &[], Some((none, none, none)), &[shared("ca-certificates", utils)], 6, "x"),
+            "nothing requires it; ca-certificates is also provided by ca-certificates-utils"
+        );
+        // From the provider's side the name is a package's own.
+        let certs = ["ca-certificates".to_string()];
+        assert_eq!(
+            needed_text("ca-certificates-utils", one, &[], Some((one, one, none)), &[shared("ca-certificates", &certs)], 6, "x"),
+            "required by git; needed by 1 explicitly installed package: git; ca-certificates is also an installed package"
+        );
+        let mut both = certs.to_vec();
+        both.extend_from_slice(&many[..7]);
+        assert_eq!(
+            needed_text("x", &[], &[], Some((none, none, none)), &[shared("ca-certificates", &both)], 6, "full"),
+            "nothing requires it; ca-certificates is also an installed package, and provided by p0, p1, p2, p3, p4, p5 \
+             and 1 more; full"
+        );
+        let fonts: Vec<alpm::SharedProvide> = (0..8).map(|i| shared(&format!("ttf-font-{i}"), &many[..2])).collect();
+        assert_eq!(
+            needed_text("ttf-dejavu", &[], &[], Some((none, none, none)), &fonts[..1], 6, "full"),
+            "nothing requires it; ttf-font-0 is also provided by p0, p1"
+        );
+        let line = needed_text("ttf-dejavu", &[], &[], Some((none, none, none)), &fonts, 6, "full");
+        assert!(line.contains("ttf-font-5 is also provided by p0, p1; and 2 more names other packages offer too; full"), "{line}");
+        assert!(!line.contains("ttf-font-6"), "{line}");
     }
 
     #[test]

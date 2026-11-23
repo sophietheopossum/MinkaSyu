@@ -16,22 +16,3 @@ anti-webui = { path = "../../AntiWebUI/src/anti-webui", default-features = false
 anti-webui-md3e = { path = "../../AntiWebUI/src/anti-webui-md3e" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[profile.release]
-lto = "thin"
-
-# AntiWebUI's workspace patches wgpu to bea4dev's adapter-filter fork. Cargo
-# reads patch tables only from the crate being built, so this one has to carry
-# the same patches (pinned to the fork revision in ../../AntiWebUI/Cargo.lock).
-# Keep in step with MinkaMon/Cargo.toml and MinkaShell/Cargo.toml.
-[patch.crates-io]
-naga = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-naga-types = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-core = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-core-deps-apple = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-core-deps-emscripten = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-core-deps-windows-linux-android = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-hal = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-naga-bridge = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }
-wgpu-types = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }

@@ -49,7 +49,8 @@ fn core() -> Option<Rc<Core>> {
 }
 
 /// $MINKA_SYU_BIN, the `minka-syu` beside this binary (installed: both in
-/// /usr/bin; in the checkout: MinkaSyu/target/<profile>/), then PATH.
+/// /usr/bin; in the checkout: both in the MinkaDE workspace's
+/// target/<profile>/), then PATH.
 pub fn core_bin() -> PathBuf {
     if let Some(p) = std::env::var_os("MINKA_SYU_BIN").filter(|v| !v.is_empty()) {
         return PathBuf::from(p);
@@ -61,15 +62,6 @@ pub fn core_bin() -> PathBuf {
         let beside = dir.join("minka-syu");
         if beside.is_file() {
             return beside;
-        }
-        // gui/target/<profile>/minka-syu-gui -> target/<profile>/minka-syu
-        if let (Some(profile), Some(gui)) = (dir.file_name(), dir.parent().and_then(|t| t.parent()))
-            && let Some(root) = gui.parent()
-        {
-            let dev = root.join("target").join(profile).join("minka-syu");
-            if dev.is_file() {
-                return dev;
-            }
         }
     }
     PathBuf::from("minka-syu")

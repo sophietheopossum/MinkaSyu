@@ -871,8 +871,8 @@ fn cmd_compare(args: &[String], print: bool) -> Result<(), String> {
 }
 
 /// The front end binary: $MINKA_SYU_GUI, `minka-syu-gui` beside this
-/// binary (installed, both are in /usr/bin; in a checkout, gui/target
-/// is searched too), then PATH.
+/// binary (installed, both are in /usr/bin; in a checkout, both are in the
+/// MinkaDE workspace's target/<profile>/), then PATH.
 fn find_gui() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("MINKA_SYU_GUI").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(p));
@@ -881,13 +881,6 @@ fn find_gui() -> Option<PathBuf> {
         let beside = dir.join("minka-syu-gui");
         if beside.is_file() {
             return Some(beside);
-        }
-        // target/<profile>/minka-syu -> gui/target/<profile>/minka-syu-gui
-        if let (Some(profile), Some(root)) = (dir.file_name(), dir.parent().and_then(|t| t.parent())) {
-            let dev = root.join("gui/target").join(profile).join("minka-syu-gui");
-            if dev.is_file() {
-                return Some(dev);
-            }
         }
     }
     let path = std::env::var_os("PATH")?;

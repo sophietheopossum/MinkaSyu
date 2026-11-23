@@ -580,18 +580,26 @@ fn update_row(app: App, u: Update) -> Div {
             mono_text(switch_note(&u), FONT_SIZE - 2.0_f32, PURPLE).whitespace_nowrap(),
         );
     } else if u.explicit_target {
-        details = details.child(
-            mono_text(
-                format!(
-                    "newer than {} {}",
-                    u.first_repo.as_deref().unwrap_or("?"),
-                    u.first_version.as_deref().unwrap_or("?")
-                ),
-                FONT_SIZE - 2.0_f32,
-                PURPLE,
-            )
-            .whitespace_nowrap(),
-        );
+        // Not for the first repository's own copy, chosen for a later-repo
+        // row: that is the build it would be newer than.
+        if u.first_repo.as_deref() != Some(u.candidate_repo.as_str()) {
+            details = details.child(
+                mono_text(
+                    format!(
+                        "newer than {} {}",
+                        u.first_repo.as_deref().unwrap_or("?"),
+                        u.first_version.as_deref().unwrap_or("?")
+                    ),
+                    FONT_SIZE - 2.0_f32,
+                    PURPLE,
+                )
+                .whitespace_nowrap(),
+            );
+        }
+    } else if let Some(note) = newer_note(&u).filter(|_| !inactive) {
+        // pacman's own upgrade, and the build the detail view can choose
+        // instead.
+        details = details.child(mono_text(note, FONT_SIZE - 2.0_f32, PURPLE).whitespace_nowrap());
     }
     if held {
         details = details.child(faint_note(held_reason(&u)));
@@ -658,6 +666,11 @@ fn update_row(app: App, u: Update) -> Div {
             FONT_SIZE - 2.0_f32,
             RED,
         ));
+    }
+    if let Some(note) = newer_replaces_note(&u).filter(|_| !inactive) {
+        // What the noted build would remove once chosen, wrapped as well;
+        // the note's colour, since nothing is removed unless it is.
+        column = column.child(mono_text(note, FONT_SIZE - 2.0_f32, PURPLE));
     }
 
     let mut row = div()
@@ -2182,7 +2195,13 @@ fn detail_overlay(app: App) -> Div {
     let action_label = move || {
         let ctx = app.detail.with(|d| d.as_ref().map(|d| d.context));
         match ctx {
-            Some(Context::Updates) => "Use for upgrade".to_string(),
+            Some(Context::Updates) => {
+                let option = app.selected_option();
+                app.state.with(|s| {
+                    let updates = s.as_ref().map(|s| s.updates.as_slice()).unwrap_or(&[]);
+                    update_action_label(option.as_ref(), updates).to_string()
+                })
+            }
             Some(Context::Browse) => "Select for install".to_string(),
             _ => {
                 if app.selected_option().is_some_and(|o| o.is_installed) {

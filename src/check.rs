@@ -29,18 +29,39 @@ pub struct Update {
     /// Repo the candidate comes from ("aur" for AUR updates).
     pub candidate_repo: String,
     pub transition: Transition,
-    /// True when this candidate is a strictly newer version in a
-    /// lower-ranked repository than the one pacman would normally
-    /// choose. Applying it requires an explicit `repo/name` target;
-    /// a plain `-Syu` would never select it.
+    /// True when a plain `-Syu` would not install this candidate at all, so
+    /// applying it requires an explicit `repo/name` target: a strictly
+    /// newer version in a lower-ranked repository for a package whose
+    /// first repository's copy is not newer than the installed one (a
+    /// later-repo row), a switch, or the origin group.
     #[serde(default)]
     pub explicit_target: bool,
-    /// The higher-ranked repo/version pacman would have used instead,
-    /// present only for explicit-target candidates.
+    /// A later-repo row's first repository and its copy's version (not
+    /// newer than the installed package, or -Syu would upgrade it).
     #[serde(default)]
     pub first_repo: Option<String>,
     #[serde(default)]
     pub first_version: Option<String>,
+    /// On a row that is pacman's own upgrade: a strictly newer build in a
+    /// lower-ranked repository, noted and not taken. The row stays that
+    /// upgrade, ticked by default, since an unticked row is `--ignore`,
+    /// which skips pacman's upgrade as well (on 23/11/2026 nvidia-settings
+    /// stayed at 615.78.08-1 that way: ALHP's 620.73.04-1.1 is newer than
+    /// cachyos-v4's 620.73.04-1 only by its rebuild suffix, and the row
+    /// offered it unticked). The window's detail view still offers this
+    /// build, as a `repo/name` target. Left out of the JSON when None, so
+    /// state.json reads as before in front ends that do not know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_version: Option<String>,
+    /// What that newer build would replace, attributed as an explicit
+    /// row's `replaces` are (annotate_explicit): chosen in the window, it
+    /// is a `repo/name` target like one, and pacman removes these. Kept
+    /// apart from `replaces`, which is what the row's own build does. Left
+    /// out of the JSON when empty, like `newer_repo`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub newer_replaces: Vec<Replaced>,
     /// Installed packages this candidate replaces (its %REPLACES%, as
     /// libalpm attributes them): installing it removes them. The row is
     /// the replacer, named after it; `old_version` / `installed_repo`
@@ -135,6 +156,17 @@ impl Update {
         } else {
             format!("switch to {}'s build", self.candidate_repo)
         }
+    }
+
+    /// The newer build a row notes and does not take, in words, with what
+    /// it would replace: choosing it removes those.
+    pub fn newer_note(&self) -> Option<String> {
+        let note = format!("newer build in {}: {}", self.newer_repo.as_ref()?, self.newer_version.as_ref()?);
+        if self.newer_replaces.is_empty() {
+            return Some(note);
+        }
+        let replaced: Vec<String> = self.newer_replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
+        Some(format!("{note}, which replaces {}", replaced.join(", ")))
     }
 }
 
@@ -618,12 +650,13 @@ pub struct Inputs<'a> {
 /// not upgrade (and no replacement removes) is held, and one it does
 /// takes its repo and version from there. Replacements are attributed
 /// by attribute_replacements. On top of that, a cross-repository scan
-/// promotes a strictly newer version from a lower-ranked repository it
-/// can install from: it replaces the standard candidate when there is
-/// one, and adds an update pacman would never offer when the first
-/// repository's copy is not newer than the installed package. Held
-/// rows are never promoted. Everything except the injected version
-/// comparison is pure.
+/// looks for a strictly newer version in a lower-ranked repository it can
+/// install from. Where -Su upgrades the package, that build is only noted
+/// on pacman's own row (`newer_repo`); it never takes the row over, whose
+/// untick would then hold back pacman's upgrade too. Where the first
+/// repository's copy is not newer than the installed package, it is an
+/// update pacman would never offer: a later-repo row. Held rows get
+/// neither. Everything except the injected version comparison is pure.
 pub fn merge_updates(inputs: &Inputs) -> Vec<Update> {
     merge_updates_with_cmp(inputs, &mut memo_vercmp())
 }
@@ -738,13 +771,12 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
             None => (qu_held || locally_ignored).then_some(reason),
         };
         let held = held_by.is_some();
-        let mut explicit_target = false;
-        let mut first_repo = None;
-        let mut first_version = None;
+        let mut newer_repo = None;
+        let mut newer_version = None;
 
-        // Promote a strictly newer version from a lower-ranked repo
-        // over pacman's own candidate. Not for a held package: it stays
-        // pacman's candidate, shown and left alone.
+        // Note a strictly newer version in a lower-ranked repo; the row
+        // stays pacman's own candidate (see Update::newer_repo). Not for a
+        // held package: it is shown and left alone.
         if let Some(entries) = sync_by_name.get(name.as_str()).filter(|_| !held) {
             let mut best: Option<&alpm::SyncEntry> = None;
             for e in entries {
@@ -754,9 +786,8 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
                 }
             }
             if let Some(best) = best.filter(|b| b.repo != candidate_repo) {
-                explicit_target = true;
-                first_repo = Some(std::mem::replace(&mut candidate_repo, best.repo.clone()));
-                first_version = Some(std::mem::replace(&mut new_version, best.version.clone()));
+                newer_repo = Some(best.repo.clone());
+                newer_version = Some(best.version.clone());
             }
         }
 
@@ -768,9 +799,12 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
             new_version,
             installed_repo,
             candidate_repo,
-            explicit_target,
-            first_repo,
-            first_version,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+            newer_repo,
+            newer_version,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held,
             held_by: held_by.map(String::from),
@@ -822,6 +856,9 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
                 explicit_target: true,
                 first_repo: Some(first.repo.clone()),
                 first_version: Some(first.version.clone()),
+                newer_repo: None,
+                newer_version: None,
+                newer_replaces: Vec::new(),
                 replaces: Vec::new(),
                 held,
                 held_by: held.then(|| "ignore".to_string()),
@@ -856,6 +893,9 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held,
             held_by: held.then(|| "ignore".to_string()),
@@ -870,6 +910,7 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
     // Replacements take their repo and version from -Su's own target
     // set, never from the by-name ranking above: a same-named package in
     // a higher repo without the replaces entry is not what -Syu installs.
+    // Nor is a newer build noted: only the replacing build replaces.
     for r in &replacements {
         if let Some(row) = updates.iter_mut().find(|u| u.name == r.name) {
             row.new_version = r.version.clone();
@@ -878,6 +919,8 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
             row.explicit_target = false;
             row.first_repo = None;
             row.first_version = None;
+            row.newer_repo = None;
+            row.newer_version = None;
             row.replaces = r.replaced.clone();
             row.reinstalls = reinstalls.get(&r.name).cloned().unwrap_or_default();
             row.held = false;
@@ -902,6 +945,9 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
                 explicit_target: false,
                 first_repo: None,
                 first_version: None,
+                newer_repo: None,
+                newer_version: None,
+                newer_replaces: Vec::new(),
                 replaces: r.replaced.clone(),
                 held: false,
                 held_by: None,
@@ -929,8 +975,9 @@ fn merge_updates_with_cmp(inputs: &Inputs, cmp: &mut dyn FnMut(&str, &str) -> Or
     updates
 }
 
-/// Groups, replaces and conflicts of an explicit candidate's build: -Su's
-/// target set cannot speak for builds a plain -Syu never selects.
+/// Groups, replaces and conflicts of an explicit candidate's build, or of
+/// a newer build a row notes: -Su's target set cannot speak for builds a
+/// plain -Syu never selects.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CandidateInfo {
     pub groups: Vec<String>,
@@ -938,7 +985,7 @@ pub struct CandidateInfo {
     pub conflicts: Vec<DepSpec>,
 }
 
-/// (repo, name) -> that explicit row's build.
+/// (repo, name) -> that build (see build_repo).
 pub type CandidateInfos = HashMap<(String, String), CandidateInfo>;
 
 /// The print format of explicit-build queries: name, repo, groups,
@@ -963,12 +1010,15 @@ pub fn parse_candidate_info(text: &str) -> HashMap<(String, String), CandidateIn
         .collect()
 }
 
-/// Finish explicit (later-repo) rows with their build's own data.
+/// Finish explicit (later-repo) rows with their build's own data, and the
+/// newer builds plain rows note.
 ///
 /// IgnoreGroup on the later build: libalpm checks the build as well as
-/// the installed package. A row that also has a standard upgrade (the
-/// first repo's build is newer than the installed one) falls back to
-/// it, which -Syu still performs; a row with nothing else is held.
+/// the installed package. An explicit row whose build it names is held:
+/// -Syu does nothing else for that package (see Update::explicit_target).
+/// A newer build it names is dropped from the note of its row, which is
+/// still pacman's own upgrade: no row points at a build pacman.conf holds
+/// back.
 ///
 /// Replaces: ticking the row adds the build before the sysupgrade walk,
 /// which then removes the packages it replaces, if:
@@ -979,6 +1029,10 @@ pub fn parse_candidate_info(text: &str) -> HashMap<(String, String), CandidateIn
 ///   (then it is already in the target list, or ignored);
 /// - no upgrade repo ranked above the build's offers a package of that
 ///   name or another replacer whose constraint it satisfies.
+///
+/// A newer build a row notes is such a target once the window chooses
+/// it, so the same rules list what it replaces, in `newer_replaces`: the
+/// row's own build is pacman's, whose replacements -Su's target set gives.
 pub fn annotate_explicit(
     updates: &mut [Update],
     info: &HashMap<(String, String), CandidateInfo>,
@@ -986,22 +1040,19 @@ pub fn annotate_explicit(
     cmp: &mut dyn FnMut(&str, &str) -> Ordering,
 ) {
     let Inputs { installed, sync_entries, sysupgrade, final_targets, conf, .. } = *inputs;
-    for u in updates.iter_mut().filter(|u| u.explicit_target && !u.held) {
-        let Some(build) = info.get(&(u.candidate_repo.clone(), u.name.clone())) else {
-            continue;
-        };
-        if !conf.ignores_build(&u.name, &build.groups) {
-            continue;
-        }
-        let standard = u.first_version.as_deref().is_some_and(|v| cmp(v, &u.old_version) == Ordering::Greater);
-        if standard {
-            u.candidate_repo = u.first_repo.take().unwrap_or_default();
-            u.new_version = u.first_version.take().unwrap_or_default();
-            u.explicit_target = false;
-            u.transition = transition(&u.installed_repo, &u.candidate_repo);
-        } else {
-            u.held = true;
-            u.held_by = Some("ignore".to_string());
+    let ignored_build = |repo: &str, name: &str| {
+        info.get(&(repo.to_string(), name.to_string())).is_some_and(|b| conf.ignores_build(name, &b.groups))
+    };
+    for u in updates.iter_mut().filter(|u| !u.held) {
+        if u.explicit_target {
+            if ignored_build(&u.candidate_repo, &u.name) {
+                u.held = true;
+                u.held_by = Some("ignore".to_string());
+            }
+        } else if u.newer_repo.as_deref().is_some_and(|repo| ignored_build(repo, &u.name)) {
+            u.newer_repo = None;
+            u.newer_version = None;
+            u.newer_replaces.clear();
         }
     }
 
@@ -1014,14 +1065,18 @@ pub fn annotate_explicit(
         .filter(|u| u.explicit_target && u.pending())
         .map(|u| u.name.clone())
         .collect();
-    for u in updates.iter_mut().filter(|u| u.explicit_target && u.pending()) {
-        let Some(build) = info.get(&(u.candidate_repo.clone(), u.name.clone())) else {
+    for u in updates.iter_mut().filter(|u| u.pending()) {
+        let Some(repo) = build_repo(u).map(str::to_string) else {
             continue;
         };
-        if !conf.upgrades_from(&u.candidate_repo) {
+        let Some(build) = info.get(&(repo.clone(), u.name.clone())) else {
+            continue;
+        };
+        if !conf.upgrades_from(&repo) {
             continue;
         }
-        let own_rank = rank(&u.candidate_repo);
+        let own_rank = rank(&repo);
+        let listed = if u.explicit_target { &mut u.replaces } else { &mut u.newer_replaces };
         for dep in &build.replaces {
             if dep.name == u.name
                 || target_names.contains(dep.name.as_str())
@@ -1039,10 +1094,10 @@ pub fn annotate_explicit(
                 rank(&t.repo) < own_rank
                     && t.replaces.iter().any(|d| d.name == dep.name && satisfies(&pkg.version, &d.constraint, cmp))
             });
-            if literal_above || replacer_above || u.replaces.iter().any(|r| r.name == dep.name) {
+            if literal_above || replacer_above || listed.iter().any(|r| r.name == dep.name) {
                 continue;
             }
-            u.replaces.push(Replaced {
+            listed.push(Replaced {
                 name: dep.name.clone(),
                 version: pkg.version.clone(),
                 installed_repo: pkg.repo.clone(),
@@ -1156,11 +1211,13 @@ fn switch_suspects<'a>(
 ) -> Vec<SwitchSuspect<'a>> {
     // A package with a row of its own (an upgrade, held or not, a later
     // repo, the AUR, a replacement) or one a replacement removes or
-    // installs again is the list's already.
+    // installs again is the list's already, and so is one a noted newer
+    // build would remove once chosen (the row says so).
     let mut touched: HashSet<&str> = HashSet::new();
     for u in updates {
         touched.insert(u.name.as_str());
         touched.extend(u.replaces.iter().map(|r| r.name.as_str()));
+        touched.extend(u.newer_replaces.iter().map(|r| r.name.as_str()));
         touched.extend(u.reinstalls.iter().map(String::as_str));
     }
     let mut by_name: HashMap<&str, Vec<&alpm::SyncEntry>> = HashMap::new();
@@ -1260,6 +1317,9 @@ pub fn switch_rows(updates: &[Update], inputs: &Inputs, builds: &SyncBuilds) -> 
                 explicit_target: true,
                 first_repo: None,
                 first_version: None,
+                newer_repo: None,
+                newer_version: None,
+                newer_replaces: Vec::new(),
                 replaces: Vec::new(),
                 held,
                 held_by: held.then(|| "ignore".to_string()),
@@ -1273,17 +1333,25 @@ pub fn switch_rows(updates: &[Update], inputs: &Inputs, builds: &SyncBuilds) -> 
         .collect()
 }
 
+/// The repository of a row's build that -Su's target set does not speak
+/// for, which CandidateInfos holds: an explicit row's own, or the newer
+/// build a plain row notes.
+fn build_repo(u: &Update) -> Option<&str> {
+    if u.explicit_target { Some(&u.candidate_repo) } else { u.newer_repo.as_deref() }
+}
+
 /// What a run may install, each with what it conflicts with: -Su's
-/// target set (the run without -dd when there was one), and the builds of
+/// target set (the run without -dd when there was one), the builds of
 /// every explicit row, ticked or not (the check cannot know which will
-/// be).
+/// be), and the newer builds plain rows note, which the window can choose
+/// for them.
 pub type RunInstalls = Vec<(String, Vec<DepSpec>)>;
 
 pub fn run_installs(inputs: &Inputs, updates: &[Update], info: &CandidateInfos) -> RunInstalls {
     let targets = inputs.final_targets.or(inputs.sysupgrade).unwrap_or_default();
     let mut out: RunInstalls = targets.iter().map(|t| (t.name.clone(), t.conflicts.clone())).collect();
-    for u in updates.iter().filter(|u| u.explicit_target && u.pending()) {
-        if let Some(build) = info.get(&(u.candidate_repo.clone(), u.name.clone())) {
+    for u in updates.iter().filter(|u| u.pending()) {
+        if let Some(build) = build_repo(u).and_then(|repo| info.get(&(repo.to_string(), u.name.clone()))) {
             out.push((u.name.clone(), build.conflicts.clone()));
         }
     }
@@ -1415,6 +1483,9 @@ pub fn origin_group_row(members: Vec<OriginMember>, sync_entries: &[alpm::SyncEn
         explicit_target: true,
         first_repo: None,
         first_version: None,
+        newer_repo: None,
+        newer_version: None,
+        newer_replaces: Vec::new(),
         replaces: Vec::new(),
         held: false,
         held_by: None,
@@ -1428,7 +1499,8 @@ pub fn origin_group_row(members: Vec<OriginMember>, sync_entries: &[alpm::SyncEn
 
 /// Installed packages that may be untracked, before the AUR is asked
 /// about them (flag_untracked). No row may touch them (an update, a
-/// replacement, an AUR update: those are tracked, or about to change).
+/// replacement, an AUR update: those are tracked, or about to change;
+/// nor a newer build a row notes, which would replace them).
 /// Two kinds:
 /// - "no_source": no repository has a package of that name, whatever was
 ///   recorded (a recorded repository that dropped it tracks nothing now).
@@ -1458,6 +1530,7 @@ pub fn untracked_candidates(updates: &[Update], inputs: &Inputs) -> Vec<Untracke
     for u in updates {
         touched.insert(u.name.as_str());
         touched.extend(u.replaces.iter().map(|r| r.name.as_str()));
+        touched.extend(u.newer_replaces.iter().map(|r| r.name.as_str()));
         touched.extend(u.reinstalls.iter().map(String::as_str));
         touched.extend(u.origin_group.iter().map(|m| m.name.as_str()));
     }
@@ -1808,14 +1881,15 @@ fn read_conf(installed: &HashMap<String, alpm::InstalledPkg>) -> Conf {
     }
 }
 
-/// Groups and replaces of the explicit rows' builds, in one print-mode
-/// `pacman -Sp -dd` of their repo/name targets on the private DB.
+/// Groups and replaces of the explicit rows' builds, and of the newer
+/// builds plain rows note, in one print-mode `pacman -Sp -dd` of their
+/// repo/name targets on the private DB (one per row, so no name twice).
 /// Failure means no information (no holds, no disclosures).
 fn explicit_candidate_info(db: &str, updates: &[Update]) -> HashMap<(String, String), CandidateInfo> {
     let targets: Vec<String> = updates
         .iter()
-        .filter(|u| u.explicit_target && !u.held && !u.is_origin_group())
-        .map(|u| format!("{}/{}", u.candidate_repo, u.name))
+        .filter(|u| !u.held && !u.is_origin_group())
+        .filter_map(|u| build_repo(u).map(|repo| format!("{repo}/{}", u.name)))
         .collect();
     if targets.is_empty() {
         return HashMap::new();
@@ -2119,24 +2193,29 @@ mod tests {
             assert!(!u.held);
             assert_eq!(u.first_repo.as_deref(), Some("cachyos-extra-v4"));
             assert_eq!(u.first_version.as_deref(), Some("3:1.39.7-1.1"));
+            assert_eq!((u.newer_repo.as_ref(), u.newer_version.as_ref()), (None, None));
         }
     }
 
     #[test]
-    fn promotes_lower_repo_over_standard_candidate_only_when_strictly_newer() {
+    fn a_newer_lower_repo_build_is_noted_on_pacman_s_own_upgrade() {
         let sync = alpm::parse_sync_list(
             "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.2\n\
              minka bcachefs-dkms 3:1.39.7-2\n",
         );
         let ups = merge("bcachefs-dkms 3:1.39.7-1.1 -> 3:1.39.7-1.2\n", "", &installed_map(), &sync, None, &Conf::default());
         assert_eq!(ups.len(), 1);
-        assert_eq!(ups[0].new_version, "3:1.39.7-2");
-        assert_eq!(ups[0].candidate_repo, "minka");
-        assert!(ups[0].explicit_target);
-        assert_eq!(ups[0].first_repo.as_deref(), Some("cachyos-extra-v4"));
-        assert_eq!(ups[0].first_version.as_deref(), Some("3:1.39.7-1.2"));
+        let u = &ups[0];
+        // The row is -Syu's upgrade, which an untick (--ignore) would hold.
+        assert_eq!((u.candidate_repo.as_str(), u.new_version.as_str()), ("cachyos-extra-v4", "3:1.39.7-1.2"));
+        assert!(!u.explicit_target && u.pending());
+        assert_eq!(u.transition, Transition::Same);
+        assert_eq!((u.first_repo.as_ref(), u.first_version.as_ref()), (None, None));
+        assert_eq!(u.newer_repo.as_deref(), Some("minka"));
+        assert_eq!(u.newer_version.as_deref(), Some("3:1.39.7-2"));
+        assert_eq!(u.newer_note().as_deref(), Some("newer build in minka: 3:1.39.7-2"));
 
-        // Equal versions: the higher-ranked repository keeps the win.
+        // Equal versions: nothing newer.
         let tie = alpm::parse_sync_list(
             "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-2\n\
              minka bcachefs-dkms 3:1.39.7-2\n",
@@ -2145,6 +2224,53 @@ mod tests {
         assert_eq!(ups.len(), 1);
         assert_eq!(ups[0].candidate_repo, "cachyos-extra-v4");
         assert!(!ups[0].explicit_target);
+        assert_eq!((ups[0].newer_repo.as_ref(), ups[0].newer_note()), (None, None));
+    }
+
+    #[test]
+    fn a_rebuild_suffix_never_holds_back_pacman_s_upgrade() {
+        // 23/11/2026: nvidia-settings 615.78.08-1 from cachyos-v4, which
+        // has 620.73.04-1; ALHP's extra-x86-64-v4 (ranked below) has
+        // 620.73.04-1.1, newer only by its rebuild suffix. The row was
+        // that build, unticked, so paru got --ignore=nvidia-settings and
+        // skipped cachyos-v4's upgrade as well.
+        let installed = HashMap::from([("nvidia-settings".to_string(), pkg("615.78.08-1", Some("cachyos-v4")))]);
+        let sync = alpm::parse_sync_list(
+            "cachyos-v4 nvidia-settings 620.73.04-1\n\
+             extra-x86-64-v4 nvidia-settings 620.73.04-1.1\n\
+             extra nvidia-settings 620.73.04-1\n",
+        );
+        let ups = merge(
+            "nvidia-settings 615.78.08-1 -> 620.73.04-1\n",
+            "",
+            &installed,
+            &sync,
+            Some("nvidia-settings|620.73.04-1|cachyos-v4|||\n"),
+            &Conf::default(),
+        );
+        assert_eq!(ups.len(), 1, "{ups:#?}");
+        let u = &ups[0];
+        assert!(!u.explicit_target && !u.held && u.pending(), "{u:#?}");
+        assert_eq!((u.candidate_repo.as_str(), u.new_version.as_str()), ("cachyos-v4", "620.73.04-1"));
+        assert_eq!(u.transition, Transition::Same);
+        assert_eq!(u.newer_note().as_deref(), Some("newer build in extra-x86-64-v4: 620.73.04-1.1"));
+        // One update, and no change of repository: the noted build is not
+        // what the run installs.
+        let state = State { schema: 1, updates: ups.clone(), repo_change_count: 0, ..Default::default() };
+        assert_eq!(state.total(), 1);
+        assert_eq!(ups.iter().filter(|u| u.pending() && u.transition == Transition::Changed).count(), 0);
+        // The CLI's apply has no target for it: a plain -Syu upgrades it.
+        assert!(ups.iter().all(|u| !u.explicit_target));
+
+        // In state.json only when there is one, and read back.
+        let json = serde_json::to_value(u).unwrap();
+        assert_eq!(json["newer_repo"], "extra-x86-64-v4");
+        let back: Update = serde_json::from_value(json).unwrap();
+        assert_eq!(&back, u);
+        let plain = Update { newer_repo: None, newer_version: None, ..u.clone() };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("newer_repo").is_none() && json.get("newer_version").is_none(), "{json}");
+        assert!(json.get("newer_replaces").is_none(), "{json}");
     }
 
     #[test]
@@ -2368,7 +2494,7 @@ mod tests {
     }
 
     #[test]
-    fn held_updates_are_listed_but_never_promoted() {
+    fn held_updates_are_listed_and_left_alone() {
         let sync = alpm::parse_sync_list(
             "cachyos-extra-v4 bcachefs-dkms 3:1.39.7-1.2\n\
              minka bcachefs-dkms 3:1.39.7-2\n",
@@ -2379,6 +2505,7 @@ mod tests {
         assert!(ups[0].held);
         assert_eq!(ups[0].candidate_repo, "cachyos-extra-v4");
         assert!(!ups[0].explicit_target);
+        assert_eq!(ups[0].newer_repo, None, "a held row points at no other build");
         // The sqlite case: the first repo matches the installed version,
         // a lower repo is newer, IgnorePkg holds it: shown as held.
         let sync = alpm::parse_sync_list(
@@ -2571,12 +2698,26 @@ mod tests {
         let ups = explicit_inputs_case(&installed, &sync, &[], &Conf::default(), "aa|lo||zz\nzz|lo2||\n");
         assert_eq!(names(&ups), ["aa", "zz"]);
         assert!(ups[0].replaces.is_empty(), "{ups:#?}");
+
+        // The same rules for a newer build a row notes (hi's aa 2-1 is
+        // -Su's upgrade, lo's 3-1 replaces zz), listed apart from what the
+        // row's own build replaces; n7 holds for it too.
+        let installed = HashMap::from([("aa".to_string(), pkg("1-1", Some("hi"))), ("zz".to_string(), pkg("2-1", None))]);
+        let sync = alpm::parse_sync_list("hi aa 2-1\nlo aa 3-1\n");
+        let sup = parse_sysupgrade("aa|2-1|hi|\n");
+        let ups = explicit_inputs_case(&installed, &sync, &sup, &Conf::default(), "aa|lo||zz\n");
+        assert!(!ups[0].explicit_target && ups[0].replaces.is_empty(), "{ups:#?}");
+        assert_eq!(ups[0].newer_replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["zz"]);
+        let ups = explicit_inputs_case(&installed, &sync, &sup, &usage(&["hi"], &["hi", "lo"]), "aa|lo||zz\n");
+        assert_eq!(ups[0].newer_repo.as_deref(), Some("lo"), "{ups:#?}");
+        assert!(ups[0].newer_replaces.is_empty(), "{ups:#?}");
     }
 
     #[test]
-    fn ignoregroup_on_a_later_build_falls_back_to_the_standard_upgrade() {
+    fn a_newer_build_ignoregroup_holds_is_not_noted() {
         // hi/foo 2-1 has no group, lo/foo 3-1 is in plasma; IgnoreGroup =
-        // plasma*. -Syu still upgrades to hi's 2-1, so the row offers that.
+        // plasma*. The row is -Syu's upgrade to hi's 2-1 either way, and
+        // points at lo's build only while pacman.conf lets it in.
         let installed = HashMap::from([("foo".to_string(), pkg("1-1", Some("hi")))]);
         let sync = alpm::parse_sync_list("hi foo 2-1\nlo foo 3-1\n");
         let conf = Conf { group_patterns: vec!["plasma*".into()], ..Conf::default() };
@@ -2589,13 +2730,20 @@ mod tests {
             final_targets: None,
             conf: &conf,
         };
-        let mut ups = merge_updates_with_cmp(&inputs, &mut system_vercmp);
-        assert!(ups[0].explicit_target);
+        let merged = merge_updates_with_cmp(&inputs, &mut system_vercmp);
+        assert!(!merged[0].explicit_target);
+        assert_eq!(merged[0].newer_note().as_deref(), Some("newer build in lo: 3-1"));
+        let mut ups = merged.clone();
         annotate_explicit(&mut ups, &parse_candidate_info("foo|lo|plasma|\n"), &inputs, &mut system_vercmp);
         let u = &ups[0];
         assert!(!u.held && !u.explicit_target, "{u:#?}");
         assert_eq!((u.candidate_repo.as_str(), u.new_version.as_str()), ("hi", "2-1"));
-        assert_eq!(u.first_repo, None);
+        assert_eq!((u.first_repo.as_ref(), u.newer_repo.as_ref(), u.newer_version.as_ref()), (None, None, None));
+        // Outside the group, the note stays.
+        let mut ups = merged;
+        annotate_explicit(&mut ups, &parse_candidate_info("foo|lo|kde|\n"), &inputs, &mut system_vercmp);
+        assert_eq!(ups[0].newer_repo.as_deref(), Some("lo"));
+        assert!(!ups[0].held);
     }
 
     #[test]
@@ -2898,6 +3046,9 @@ mod tests {
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: replaces
                 .iter()
                 .map(|n| Replaced { name: n.to_string(), version: "1-1".into(), installed_repo: None })
@@ -3182,7 +3333,7 @@ mod tests {
         // repoB has ax 2.0-1 with replaces=(zm) conflicts=(zm); zm came
         // from repoB unrecorded. ax sorts before zm, so libalpm's walk
         // takes repoA/ax first and -Sup -dd shows no replacement: only
-        // ticking repoB/ax replaces zm, and with zm a target as well
+        // repoB/ax as a target replaces zm, and with zm a target as well
         // pacman aborts.
         let installed = HashMap::from([
             ("ax".to_string(), built("1.0-1", Some("repoA"), EXTRA_SECS, ARCH)),
@@ -3193,17 +3344,41 @@ mod tests {
         let case = |info: &str| {
             origin_case_with("ax 1.0-1 -> 1.1-1\n", "ax|1.1-1|repoA|||\n", &installed, &sync, &Conf::default(), &printed, info)
         };
+        // -Syu upgrades ax from repoA, so the row is that upgrade, noting
+        // repoB's build, which the window can still choose for it. That
+        // build would remove zm, which the note says (pacman asks "Replace
+        // zm with repoB/ax?", default yes) ...
+        let ups = case("ax|repoB||zm|zm\n");
+        assert_eq!(names(&ups), ["ax"], "{ups:#?}");
+        let ax = &ups[0];
+        assert!(!ax.explicit_target && ax.candidate_repo == "repoA", "{ax:#?}");
+        assert_eq!(ax.newer_repo.as_deref(), Some("repoB"));
+        assert!(ax.replaces.is_empty(), "the row's own build replaces nothing");
+        assert_eq!(ax.newer_replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["zm"]);
+        assert_eq!(ax.newer_note().as_deref(), Some("newer build in repoB: 2.0-1, which replaces zm 1.0-1"));
+        // ... so zm stays out of the group, as with an explicit row: by
+        // that replacement alone, or by the conflict alone.
+        let ups = case("ax|repoB||zm|\n");
+        assert_eq!(names(&ups), ["ax"], "{ups:#?}");
+        assert_eq!(ups[0].newer_replaces.len(), 1);
+        let ups = case("ax|repoB|||zm\n");
+        assert_eq!(names(&ups), ["ax"]);
+        assert!(ups[0].newer_replaces.is_empty() && ups[0].newer_note().as_deref() == Some("newer build in repoB: 2.0-1"));
+        // Neither: zm is a member.
+        assert_eq!(names(&case("ax|repoB|||\n")), [ORIGIN_GROUP, "ax"]);
+
+        // With nothing in repoA newer than ax 1.0-1, repoB/ax is a later-repo
+        // row, whose replacement alone keeps zm out too: the row lists zm,
+        // and the group is made after it.
+        let sync = alpm::parse_sync_list("repoA ax 1.0-1\nrepoB ax 2.0-1\nrepoB zm 1.0-1\n");
+        let case = |info: &str| origin_case_with("", "", &installed, &sync, &Conf::default(), &printed, info);
         let ups = case("ax|repoB||zm|zm\n");
         assert_eq!(names(&ups), ["ax"], "{ups:#?}");
         let ax = &ups[0];
         assert!(ax.explicit_target && ax.candidate_repo == "repoB", "{ax:#?}");
         assert_eq!(ax.replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["zm"]);
-        // The replacement alone (annotate_explicit's) keeps zm out, since
-        // the group is made after it ...
         assert_eq!(names(&case("ax|repoB||zm|\n")), ["ax"]);
-        // ... and so does the conflict alone.
         assert_eq!(names(&case("ax|repoB|||zm\n")), ["ax"]);
-        // Neither: zm is a member.
         assert_eq!(names(&case("ax|repoB|||\n")), [ORIGIN_GROUP, "ax"]);
     }
 
@@ -3226,18 +3401,22 @@ mod tests {
         // switch, and that row lists it as replaced.
         let mut installed = libcaca_installed();
         installed.insert("xx".to_string(), built("1-1", Some("repoA"), EXTRA_SECS, ARCH));
-        let sync = alpm::parse_sync_list("repoA xx 1.1-1\nrepoB xx 2-1\nminka lib32-libcaca 0.99.beta20-2\n");
-        let ups = origin_case_with(
-            "xx 1-1 -> 1.1-1\n",
-            "xx|1.1-1|repoA|||\n",
-            &installed,
-            &sync,
-            &Conf::default(),
-            &printed,
-            "xx|repoB||lib32-libcaca|lib32-libcaca\n",
-        );
+        let info = "xx|repoB||lib32-libcaca|lib32-libcaca\n";
+        let sync = alpm::parse_sync_list("repoA xx 1-1\nrepoB xx 2-1\nminka lib32-libcaca 0.99.beta20-2\n");
+        let ups = origin_case_with("", "", &installed, &sync, &Conf::default(), &printed, info);
         assert_eq!(names(&ups), ["xx"], "{ups:#?}");
+        assert!(ups[0].explicit_target);
         assert_eq!(ups[0].replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["lib32-libcaca"]);
+        // The same build noted on -Syu's own upgrade of xx (repoA has 1.1-1)
+        // can still be chosen for it in the window: no switch either. The
+        // row's own build replaces nothing; the noted one lists it.
+        let sync = alpm::parse_sync_list("repoA xx 1.1-1\nrepoB xx 2-1\nminka lib32-libcaca 0.99.beta20-2\n");
+        let ups =
+            origin_case_with("xx 1-1 -> 1.1-1\n", "xx|1.1-1|repoA|||\n", &installed, &sync, &Conf::default(), &printed, info);
+        assert_eq!(names(&ups), ["xx"], "{ups:#?}");
+        assert!(!ups[0].explicit_target && ups[0].replaces.is_empty(), "{ups:#?}");
+        assert_eq!(ups[0].newer_replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["lib32-libcaca"]);
+        assert_eq!(ups[0].newer_repo.as_deref(), Some("repoB"));
     }
 
     // ---- untracked packages ------------------------------------------------
@@ -3372,6 +3551,9 @@ mod tests {
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: vec![Replaced { name: "old".into(), version: "1-1".into(), installed_repo: None }],
             held: false,
             held_by: None,

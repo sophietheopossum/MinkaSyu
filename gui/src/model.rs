@@ -27,6 +27,13 @@ pub struct Update {
     pub explicit_target: bool,
     pub first_repo: Option<String>,
     pub first_version: Option<String>,
+    /// On pacman's own upgrade: a newer build in a lower-ranked repository,
+    /// noted and not taken (an untick would --ignore pacman's upgrade too).
+    /// The detail view offers it; choosing it makes the row a target.
+    pub newer_repo: Option<String>,
+    pub newer_version: Option<String>,
+    /// What that build would replace: once it is chosen, the row's.
+    pub newer_replaces: Vec<Replaced>,
     pub replaces: Vec<Replaced>,
     pub held: bool,
     /// "ignore" | "usage"
@@ -279,10 +286,43 @@ pub fn locked_by(updates: &[Update], ignored: &BTreeSet<String>, u: &Update) -> 
         .map(|r| r.name.clone())
 }
 
-/// A saved repo choice that no longer applies: the update is held, or it
-/// became a replacement only its own repo performs.
+/// Whether `repo`'s build at `version` is another build than row `u`'s
+/// own candidate that the row can keep instead: not on a switch, whose
+/// installed build no repository has (a copy of that version is what the
+/// switch installs), nor on the origin group, which is no package. A
+/// replacer that is installed already offers its own build, to remove
+/// what it replaces: that is its candidate, never a keep.
+fn other_build(u: &Update, repo: &str, version: &str) -> bool {
+    !u.switch_build && !u.is_origin_group() && (u.candidate_repo != repo || u.new_version != version)
+}
+
+/// Whether `repo`'s build at `version` stands for what is installed, as
+/// far as a row can tell: the repository the package was installed from,
+/// at the installed version. The row carries no build date, so a copy
+/// that repository rebuilt in place counts too (the detail view does not
+/// mark that one installed). Choosing it keeps the package as it is
+/// (UpdateSelection::choose_build), and a choice of it is never applied
+/// (override_invalid): the two must agree, or the button ticks a row
+/// whose choice is then thrown away, and the run takes the row's own
+/// candidate, which she passed over. The Installed tab reinstalls a
+/// rebuilt copy.
+pub fn names_installed_build(u: &Update, repo: &str, version: &str) -> bool {
+    other_build(u, repo, version) && u.installed_repo.as_deref() == Some(repo) && version == u.old_version
+}
+
+/// A saved repo choice that no longer applies: the update is held, it
+/// became a replacement only its own repo performs, or it names the build
+/// that is installed (names_installed_build). Keeping that build is no
+/// upgrade: as a choice it left the row ticked with nothing to do (bpf on
+/// 23/11/2026, its later repository's build chosen back for ALHP's
+/// installed one), so it is never stored (UpdateSelection::choose_build)
+/// and never applied; one that became installed since it was chosen goes
+/// with the next state (UpdateSelection::reconcile). A switch keeps every
+/// choice.
 pub fn override_invalid(u: &Update, ov: &Override) -> bool {
-    u.held || (!u.explicit_target && !u.replaces.is_empty() && ov.repo != u.candidate_repo)
+    u.held
+        || names_installed_build(u, &ov.repo, &ov.version)
+        || (!u.explicit_target && !u.replaces.is_empty() && ov.repo != u.candidate_repo)
 }
 
 /// The update as it will run with its repo override applied.
@@ -294,29 +334,26 @@ pub fn effective_update(u: &Update, overrides: &BTreeMap<String, Override>) -> U
         return u.clone();
     }
     let mut copy = u.clone();
-    let default_repo = if u.explicit_target {
-        u.first_repo
-            .clone()
-            .unwrap_or_else(|| u.candidate_repo.clone())
-    } else {
-        u.candidate_repo.clone()
-    };
     copy.new_version = ov.version.clone();
     copy.candidate_repo = ov.repo.clone();
     // What a later build would replace does not carry over to another one.
+    // The newer build a plain row notes brings what it replaces itself.
     if ov.repo != u.candidate_repo {
-        copy.replaces.clear();
+        let noted = u.newer_repo.as_deref() == Some(ov.repo.as_str())
+            && u.newer_version.as_deref() == Some(ov.version.as_str());
+        copy.replaces = if noted { u.newer_replaces.clone() } else { Vec::new() };
     }
-    // -Syu never touches a switch's package: whichever build is chosen, it
-    // is installed only as a repo/name target.
-    copy.explicit_target = u.switch_build || ov.repo != default_repo;
-    if copy.explicit_target && copy.first_repo.is_none() && !u.switch_build {
-        copy.first_repo = Some(default_repo.clone());
+    // -Syu never touches the package of an explicit row (a later-repo
+    // row's first repository is not newer than what is installed, and a
+    // switch has nothing newer): whichever build is chosen, only a
+    // repo/name target installs it. Choosing the first repository's own
+    // copy once made such a row plain, ticked, and never applied. A plain
+    // row becomes a target when the build is not pacman's own, whose repo
+    // and version it keeps as first_repo/first_version.
+    copy.explicit_target = u.explicit_target || ov.repo != u.candidate_repo;
+    if copy.explicit_target && !u.explicit_target {
+        copy.first_repo = Some(u.candidate_repo.clone());
         copy.first_version = Some(u.new_version.clone());
-    }
-    if !copy.explicit_target {
-        copy.first_repo = None;
-        copy.first_version = None;
     }
     copy.transition = match &u.installed_repo {
         None => "unknown_source".into(),
@@ -405,11 +442,22 @@ impl UpdateSelection {
         self.seeded_explicit = seeded;
         self.kinds = kinds;
         self.left_out = left_out;
+        // A chosen build that is installed now (the run applied it) is
+        // kept as choose_build keeps one: its row is unticked. Ticked, the
+        // row would go back to its own candidate, which she passed over in
+        // choosing; on a later-repo row, that is the newest build, which
+        // needs her consent (aha: ALHP's build chosen over Arch's newer
+        // one, applied, rechecked, and Arch's next on Apply).
+        let ignored = &mut self.ignored;
         self.overrides.retain(|name, ov| {
-            updates
-                .iter()
-                .find(|u| &u.name == name)
-                .is_some_and(|u| !override_invalid(u, ov))
+            let Some(u) = updates.iter().find(|u| &u.name == name) else {
+                return false;
+            };
+            if !u.held && names_installed_build(u, &ov.repo, &ov.version) {
+                ignored.insert(name.clone());
+                return false;
+            }
+            !override_invalid(u, ov)
         });
     }
 
@@ -417,6 +465,29 @@ impl UpdateSelection {
         if !self.ignored.remove(name) {
             self.ignored.insert(name.to_string());
         }
+    }
+
+    /// The detail view's button in the Updates context, on the build it
+    /// shows. The installed build keeps the package as it is: the row is
+    /// unticked (--ignore for this run, which holds back a plain row's
+    /// upgrade; -Syu leaves a later-repo row's package alone anyway), and
+    /// no choice is kept, since none would install anything. Any other
+    /// build is chosen for the row, which is ticked.
+    pub fn choose_build(&mut self, updates: &[Update], option: &RepoOption) {
+        if keeps_installed(option, updates) {
+            self.overrides.remove(&option.name);
+            self.ignored.insert(option.name.clone());
+            return;
+        }
+        self.overrides.insert(
+            option.name.clone(),
+            Override {
+                repo: option.repo.clone(),
+                version: option.version.clone(),
+                target: option.target.clone(),
+            },
+        );
+        self.ignored.remove(&option.name);
     }
 
     /// The origin group's own tick, as md3e's tri-state box sets it: on
@@ -580,7 +651,8 @@ pub fn held_reason(u: &Update) -> &'static str {
     }
 }
 
-/// Why "Use for upgrade" cannot take this build, or None when it can.
+/// Why the detail view's button ("Use for upgrade", or "Keep installed
+/// build") cannot take this build, or None when it can.
 pub fn upgrade_blocked_reason(
     context: Context,
     option: Option<&RepoOption>,
@@ -630,6 +702,30 @@ pub fn upgrade_blocked_reason(
     None
 }
 
+/// Whether choosing `option` in the Updates context keeps what is
+/// installed: the detail view marks it installed, or the row takes it
+/// for the installed build (names_installed_build, which override_invalid
+/// applies), and it is not the row's own candidate (other_build). Not on
+/// a switch (one marked installed there is a build whose date the detail
+/// view could not read), nor on an origin group member, which is no row
+/// of its own.
+pub fn keeps_installed(option: &RepoOption, updates: &[Update]) -> bool {
+    updates.iter().any(|u| {
+        u.name == option.name
+            && (names_installed_build(u, &option.repo, &option.version)
+                || (option.is_installed && other_build(u, &option.repo, &option.version)))
+    })
+}
+
+/// The detail view's button in the Updates context.
+pub fn update_action_label(option: Option<&RepoOption>, updates: &[Update]) -> &'static str {
+    if option.is_some_and(|o| keeps_installed(o, updates)) {
+        "Keep installed build"
+    } else {
+        "Use for upgrade"
+    }
+}
+
 /// The badge an update row carries, if any.
 pub fn badge_label(u: &Update, superseded: bool) -> Option<&'static str> {
     if u.held {
@@ -656,6 +752,33 @@ pub fn switch_note(u: &Update) -> String {
     } else {
         format!("switch to {}'s build", u.candidate_repo)
     }
+}
+
+/// The newer build a row notes and does not take (the core's
+/// Update::newer_note, less what it replaces: newer_replaces_note), while
+/// it is pacman's own upgrade: once another build is chosen for it, it
+/// says what that is newer than instead.
+pub fn newer_note(u: &Update) -> Option<String> {
+    if u.explicit_target {
+        return None;
+    }
+    Some(format!(
+        "newer build in {}: {}",
+        u.newer_repo.as_ref()?,
+        u.newer_version.as_ref()?
+    ))
+}
+
+/// What the noted newer build would replace, on a line of its own that
+/// wraps (every package a choice removes must be readable), while the row
+/// shows the note. Chosen, the build's replacements are the row's own.
+pub fn newer_replaces_note(u: &Update) -> Option<String> {
+    newer_note(u)?;
+    if u.newer_replaces.is_empty() {
+        return None;
+    }
+    let replaced: Vec<String> = u.newer_replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
+    Some(format!("that build replaces {}", replaced.join(", ")))
 }
 
 /// The version text of an update row. A replacer that is not installed
@@ -1241,6 +1364,413 @@ mod tests {
         assert!(v.ignored_names.is_empty(), "{:?}", v.ignored_names);
         assert_eq!(v.selected, 3, "the upgrade starts ticked, as any update");
         assert!(!sel.left_out.contains("zstd"));
+    }
+
+    /// bpf on 23/11/2026: installed from ALHP's extra-x86-64-v4 (also the
+    /// first repository with it), while Arch's extra has a newer pkgrel.
+    fn bpf() -> Update {
+        Update {
+            name: "bpf".into(),
+            old_version: "7.3.5-1.1".into(),
+            new_version: "7.3.5-2".into(),
+            installed_repo: Some("extra-x86-64-v4".into()),
+            candidate_repo: "extra".into(),
+            transition: "changed".into(),
+            explicit_target: true,
+            first_repo: Some("extra-x86-64-v4".into()),
+            first_version: Some("7.3.5-1.1".into()),
+            ..Default::default()
+        }
+    }
+
+    fn build(name: &str, repo: &str, version: &str, installed: bool) -> RepoOption {
+        RepoOption {
+            name: name.into(),
+            repo: repo.into(),
+            version: version.into(),
+            target: format!("{repo}/{name}"),
+            is_installed: installed,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn choosing_the_installed_build_keeps_it() {
+        let updates = vec![bpf(), up("mesa")];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&updates);
+        let installed = build("bpf", "extra-x86-64-v4", "7.3.5-1.1", true);
+        let newest = build("bpf", "extra", "7.3.5-2", false);
+        assert_eq!(update_action_label(Some(&installed), &updates), "Keep installed build");
+        assert_eq!(update_action_label(Some(&newest), &updates), "Use for upgrade");
+        assert_eq!(update_action_label(None, &updates), "Use for upgrade");
+        // Ticked by hand, then the installed build chosen: no choice is
+        // kept, and the row is unticked instead of ticked with nothing to do.
+        sel.toggle("bpf");
+        sel.choose_build(&updates, &installed);
+        assert!(sel.overrides.is_empty() && sel.ignored.contains("bpf"), "{sel:?}");
+        let v = updates_view(&updates, &sel);
+        assert!(v.explicit_targets.is_empty(), "{v:?}");
+        assert_eq!(v.selected, 1);
+        // The newest build: a ticked target, as before.
+        sel.choose_build(&updates, &newest);
+        assert!(!sel.ignored.contains("bpf"));
+        assert_eq!(updates_view(&updates, &sel).explicit_targets, ["extra/bpf"]);
+        // Back to the installed build: that choice goes, the row is unticked.
+        sel.choose_build(&updates, &installed);
+        assert!(sel.overrides.is_empty() && sel.ignored.contains("bpf"));
+
+        // ALHP rebuilt 7.3.5-1.1 in place: the detail view no longer marks
+        // its copy installed (another build date), but the row takes it for
+        // the installed build, so the button keeps that too. As a choice,
+        // override_invalid threw it away and the ticked row installed
+        // extra's 7.3.5-2 (review, 23/11/2026).
+        let rebuilt = build("bpf", "extra-x86-64-v4", "7.3.5-1.1", false);
+        assert_eq!(update_action_label(Some(&rebuilt), &updates), "Keep installed build");
+        sel.toggle("bpf");
+        sel.choose_build(&updates, &rebuilt);
+        assert!(sel.overrides.is_empty() && sel.ignored.contains("bpf"), "{sel:?}");
+        assert!(updates_view(&updates, &sel).explicit_targets.is_empty());
+
+        // A plain row: unticked is --ignore, held for this run.
+        let plain = vec![from_lo("foo")];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&plain);
+        sel.choose_build(&plain, &build("foo", "lo", "1-1", true));
+        assert_eq!(updates_view(&plain, &sel).ignored_names, ["foo"]);
+        assert!(sel.overrides.is_empty());
+        // The same for lo's copy rebuilt in place, which was a ticked
+        // choice the run then dropped, upgrading from extra instead.
+        let rebuilt = build("foo", "lo", "1-1", false);
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&plain);
+        assert_eq!(update_action_label(Some(&rebuilt), &plain), "Keep installed build");
+        sel.choose_build(&plain, &rebuilt);
+        let v = updates_view(&plain, &sel);
+        assert_eq!(v.ignored_names, ["foo"]);
+        assert!(v.explicit_targets.is_empty() && sel.overrides.is_empty(), "{v:?}");
+    }
+
+    /// A plain upgrade from extra of a package installed from lo.
+    fn from_lo(name: &str) -> Update {
+        let mut u = up(name);
+        u.installed_repo = Some("lo".into());
+        u.transition = "changed".into();
+        u
+    }
+
+    /// A replacer that is installed already: its own build is its
+    /// candidate, which removes what it replaces.
+    fn installed_replacer() -> Update {
+        let mut u = up("coreutils-uutils");
+        u.old_version = "0.12.0-1".into();
+        u.new_version = "0.12.0-1".into();
+        u.candidate_repo = "minka".into();
+        u.installed_repo = Some("minka".into());
+        u.replaces = vec![Replaced { name: "coreutils-hybrid".into(), version: "9.4_0.0.28-1".into(), installed_repo: None }];
+        u
+    }
+
+    #[test]
+    fn the_button_never_ticks_a_choice_the_run_drops() {
+        // Every build the detail view could offer each kind of row, marked
+        // installed or not: a build the button stores is one the run
+        // applies, and one it does not store unticks the row.
+        let rows = vec![bpf(), from_lo("foo"), switch("x", Some("minka"), "minka"), installed_replacer(), nvidia_settings()];
+        for u in &rows {
+            let repos = [
+                u.installed_repo.clone(),
+                Some(u.candidate_repo.clone()),
+                u.first_repo.clone(),
+                u.newer_repo.clone(),
+                Some("other".to_string()),
+            ];
+            let versions = [
+                Some(u.old_version.clone()),
+                Some(u.new_version.clone()),
+                u.first_version.clone(),
+                u.newer_version.clone(),
+                Some("9-9".to_string()),
+            ];
+            for repo in repos.iter().flatten() {
+                for version in versions.iter().flatten() {
+                    for marked in [false, true] {
+                        let option = build(&u.name, repo, version, marked);
+                        let updates = std::slice::from_ref(u);
+                        if upgrade_blocked_reason(Context::Updates, Some(&option), updates, &BTreeSet::new()).is_some() {
+                            continue;
+                        }
+                        let mut sel = UpdateSelection::default();
+                        sel.choose_build(updates, &option);
+                        match sel.overrides.get(&u.name) {
+                            Some(ov) => {
+                                assert!(!override_invalid(u, ov), "{option:?} on {u:?}");
+                                assert!(!sel.ignored.contains(&u.name), "{option:?}");
+                                assert_eq!(update_action_label(Some(&option), updates), "Use for upgrade");
+                            }
+                            None => {
+                                assert!(sel.ignored.contains(&u.name), "{option:?}");
+                                assert_eq!(update_action_label(Some(&option), updates), "Keep installed build");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keeping_is_only_for_rows_that_offer_another_build() {
+        // A replacer installed already: its own build is the candidate, and
+        // choosing it keeps the replacement as it is.
+        let replacer = installed_replacer();
+        for marked in [true, false] {
+            let own = build("coreutils-uutils", "minka", "0.12.0-1", marked);
+            assert!(!keeps_installed(&own, std::slice::from_ref(&replacer)));
+        }
+        // A switch: its installed build is in no repository.
+        let sw = switch("x", Some("minka"), "minka");
+        for marked in [true, false] {
+            assert!(!keeps_installed(&build("x", "minka", "0.99.beta20-2", marked), std::slice::from_ref(&sw)));
+        }
+        // No row of that name (an origin group member).
+        let group = origin(&["zstd"]);
+        let zstd = build("zstd", "extra", "1-1", true);
+        assert!(!keeps_installed(&zstd, std::slice::from_ref(&group)));
+        let mut sel = UpdateSelection::default();
+        sel.choose_build(&[group], &zstd);
+        assert!(!sel.ignored.contains("zstd"), "never an --ignore of a later row");
+    }
+
+    #[test]
+    fn a_choice_of_the_installed_build_is_never_applied() {
+        // A choice that names the installed build (installed since it was
+        // made, see the next test): the row is as the check made it, and
+        // the next state drops the choice and unticks the row, as the
+        // button would have.
+        let u = bpf();
+        let installed = Override {
+            repo: "extra-x86-64-v4".into(),
+            version: "7.3.5-1.1".into(),
+            target: "extra-x86-64-v4/bpf".into(),
+        };
+        assert!(override_invalid(&u, &installed));
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(std::slice::from_ref(&u));
+        sel.toggle("bpf");
+        sel.overrides.insert("bpf".into(), installed);
+        assert_eq!(effective_update(&u, &sel.overrides), u, "the row as the check made it");
+        sel.reconcile(std::slice::from_ref(&u));
+        assert!(sel.overrides.is_empty() && sel.ignored.contains("bpf"), "{sel:?}");
+        assert!(updates_view(std::slice::from_ref(&u), &sel).explicit_targets.is_empty());
+        // The same on a plain row: unticked, its upgrade held for the run.
+        let plain = from_lo("foo");
+        let ov = Override { repo: "lo".into(), version: "1-1".into(), target: "lo/foo".into() };
+        assert!(override_invalid(&plain, &ov));
+        let mut sel = UpdateSelection::default();
+        sel.overrides.insert("foo".into(), ov);
+        sel.reconcile(std::slice::from_ref(&plain));
+        assert_eq!(updates_view(std::slice::from_ref(&plain), &sel).ignored_names, ["foo"]);
+        // Not on a switch, whose reinstall from its own repository has that
+        // repository and version too ...
+        let same = switch("x", Some("minka"), "minka");
+        let ov = Override { repo: "minka".into(), version: "0.99.beta20-2".into(), target: "minka/x".into() };
+        assert!(!override_invalid(&same, &ov));
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(std::slice::from_ref(&same));
+        sel.toggle("x");
+        sel.overrides.insert("x".into(), ov);
+        sel.reconcile(std::slice::from_ref(&same));
+        assert_eq!(updates_view(std::slice::from_ref(&same), &sel).explicit_targets, ["minka/x"]);
+        // ... nor on a replacer installed already, whose own build is its
+        // candidate: the row stays ticked.
+        let replacer = installed_replacer();
+        let ov = Override {
+            repo: "minka".into(),
+            version: "0.12.0-1".into(),
+            target: "minka/coreutils-uutils".into(),
+        };
+        assert!(!override_invalid(&replacer, &ov));
+        let mut sel = UpdateSelection::default();
+        sel.overrides.insert(replacer.name.clone(), ov);
+        sel.reconcile(std::slice::from_ref(&replacer));
+        assert!(sel.ignored.is_empty() && sel.overrides.len() == 1, "{sel:?}");
+    }
+
+    #[test]
+    fn a_chosen_build_once_installed_never_brings_the_newest() {
+        // Review, 23/11/2026: aha installed from cachyos-extra-v4 (the
+        // first repository) at 0.5.1-3.1, ALHP's 0.5.1-3.2 and Arch's
+        // 0.5.1-4 newer. She picks ALHP's build, applies, and the check
+        // runs again: the row is Arch's build still, which she passed over,
+        // and which the choice must not leave ticked.
+        let row = |installed_repo: &str, old: &str| Update {
+            name: "aha".into(),
+            old_version: old.into(),
+            new_version: "0.5.1-4".into(),
+            installed_repo: Some(installed_repo.into()),
+            candidate_repo: "extra".into(),
+            transition: "changed".into(),
+            explicit_target: true,
+            first_repo: Some("cachyos-extra-v4".into()),
+            first_version: Some("0.5.1-3.1".into()),
+            ..Default::default()
+        };
+        let before = vec![row("cachyos-extra-v4", "0.5.1-3.1")];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&before);
+        sel.choose_build(&before, &build("aha", "extra-x86-64-v4", "0.5.1-3.2", false));
+        assert_eq!(updates_view(&before, &sel).explicit_targets, ["extra-x86-64-v4/aha"]);
+        // Applied, and checked again.
+        let after = vec![row("extra-x86-64-v4", "0.5.1-3.2")];
+        sel.reconcile(&after);
+        assert!(sel.overrides.is_empty() && sel.ignored.contains("aha"), "{sel:?}");
+        let v = updates_view(&after, &sel);
+        assert!(v.explicit_targets.is_empty(), "{v:?}");
+        assert_eq!(v.selected, 0);
+        // Ticked by hand, it is Arch's build, as she asks.
+        sel.toggle("aha");
+        assert_eq!(updates_view(&after, &sel).explicit_targets, ["extra/aha"]);
+    }
+
+    #[test]
+    fn a_later_repo_row_given_its_first_repo_s_build_stays_a_target() {
+        // Installed from ALHP (1.0-1.1); cachyos (first) has an older 1.0-1,
+        // extra the newer 1.0-2. -Syu leaves the package alone, so choosing
+        // cachyos's copy is a target too, never a ticked row doing nothing.
+        let u = Update {
+            name: "foo".into(),
+            old_version: "1.0-1.1".into(),
+            new_version: "1.0-2".into(),
+            installed_repo: Some("extra-x86-64-v4".into()),
+            candidate_repo: "extra".into(),
+            transition: "changed".into(),
+            explicit_target: true,
+            first_repo: Some("cachyos-extra-v4".into()),
+            first_version: Some("1.0-1".into()),
+            ..Default::default()
+        };
+        let updates = vec![u.clone()];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&updates);
+        sel.choose_build(&updates, &build("foo", "cachyos-extra-v4", "1.0-1", false));
+        let e = effective_update(&u, &sel.overrides);
+        assert!(e.explicit_target && e.candidate_repo == "cachyos-extra-v4", "{e:?}");
+        assert_eq!(e.first_repo.as_deref(), Some("cachyos-extra-v4"));
+        assert_eq!(updates_view(&updates, &sel).explicit_targets, ["cachyos-extra-v4/foo"]);
+    }
+
+    /// nvidia-settings on 23/11/2026: pacman's upgrade from cachyos-v4, and
+    /// ALHP's suffix rebuild noted.
+    fn nvidia_settings() -> Update {
+        Update {
+            name: "nvidia-settings".into(),
+            old_version: "615.78.08-1".into(),
+            new_version: "620.73.04-1".into(),
+            installed_repo: Some("cachyos-v4".into()),
+            candidate_repo: "cachyos-v4".into(),
+            transition: "same".into(),
+            newer_repo: Some("extra-x86-64-v4".into()),
+            newer_version: Some("620.73.04-1.1".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_noted_newer_build_starts_as_pacman_s_upgrade_and_can_be_chosen() {
+        let updates = vec![nvidia_settings()];
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&updates);
+        let v = updates_view(&updates, &sel);
+        // Ticked, no target, nothing ignored: -Syu upgrades it from cachyos-v4.
+        assert_eq!((v.pending, v.selected, v.repo_changes), (1, 1, 0));
+        assert!(v.explicit_targets.is_empty() && v.ignored_names.is_empty(), "{v:?}");
+        assert_eq!(newer_note(&v.effective[0]).as_deref(), Some("newer build in extra-x86-64-v4: 620.73.04-1.1"));
+        assert_eq!(badge_label(&v.effective[0], false), None);
+        // The detail view's newest build: a target, which the row says.
+        let newest = build("nvidia-settings", "extra-x86-64-v4", "620.73.04-1.1", false);
+        assert_eq!(update_action_label(Some(&newest), &updates), "Use for upgrade");
+        sel.choose_build(&updates, &newest);
+        let v = updates_view(&updates, &sel);
+        assert_eq!(v.explicit_targets, ["extra-x86-64-v4/nvidia-settings"]);
+        assert!(v.ignored_names.is_empty());
+        assert_eq!((v.selected, v.repo_changes), (1, 1));
+        let e = &v.effective[0];
+        assert_eq!((e.first_repo.as_deref(), e.first_version.as_deref()), (Some("cachyos-v4"), Some("620.73.04-1")));
+        assert_eq!(newer_note(e), None, "it says what it is newer than instead");
+        // Unticked, it is held back like any plain row.
+        sel.toggle("nvidia-settings");
+        let v = updates_view(&updates, &sel);
+        assert!(v.explicit_targets.is_empty());
+        assert_eq!(v.ignored_names, ["nvidia-settings"]);
+
+        // The row an older core made of it (the newer build, unticked)
+        // starts ticked once the state says it is pacman's upgrade.
+        let mut promoted = nvidia_settings();
+        promoted.candidate_repo = "extra-x86-64-v4".into();
+        promoted.new_version = "620.73.04-1.1".into();
+        promoted.explicit_target = true;
+        promoted.first_repo = Some("cachyos-v4".into());
+        promoted.first_version = Some("620.73.04-1".into());
+        promoted.newer_repo = None;
+        promoted.newer_version = None;
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&[promoted]);
+        assert!(sel.ignored.contains("nvidia-settings"));
+        sel.reconcile(&updates);
+        assert!(updates_view(&updates, &sel).ignored_names.is_empty());
+
+        // The state file carries it.
+        let parsed: Update = serde_json::from_value(serde_json::json!({
+            "name": "nvidia-settings", "candidate_repo": "cachyos-v4",
+            "newer_repo": "extra-x86-64-v4", "newer_version": "620.73.04-1.1"
+        }))
+        .unwrap();
+        assert_eq!(parsed.newer_version.as_deref(), Some("620.73.04-1.1"));
+    }
+
+    #[test]
+    fn a_chosen_noted_build_says_what_it_replaces() {
+        // Review, 23/11/2026: ax is -Syu's upgrade from repoA; repoB's newer
+        // build replaces zm. The row says so while it notes that build, and
+        // once it is chosen the row is that replacement.
+        let ax = Update {
+            name: "ax".into(),
+            old_version: "1.0-1".into(),
+            new_version: "1.1-1".into(),
+            installed_repo: Some("repoA".into()),
+            candidate_repo: "repoA".into(),
+            transition: "same".into(),
+            newer_repo: Some("repoB".into()),
+            newer_version: Some("2.0-1".into()),
+            newer_replaces: vec![Replaced { name: "zm".into(), version: "1.0-1".into(), installed_repo: None }],
+            ..Default::default()
+        };
+        let updates = vec![ax.clone()];
+        assert_eq!(newer_note(&ax).as_deref(), Some("newer build in repoB: 2.0-1"));
+        assert_eq!(newer_replaces_note(&ax).as_deref(), Some("that build replaces zm 1.0-1"));
+        assert_eq!(badge_label(&ax, false), None);
+        let mut sel = UpdateSelection::default();
+        sel.reconcile(&updates);
+        sel.choose_build(&updates, &build("ax", "repoB", "2.0-1", false));
+        let v = updates_view(&updates, &sel);
+        let e = &v.effective[0];
+        assert_eq!(e.replaces.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["zm"]);
+        assert_eq!(badge_label(e, false), Some("replaces"));
+        assert_eq!((newer_note(e), newer_replaces_note(e)), (None, None));
+        assert_eq!(v.explicit_targets, ["repoB/ax"]);
+        // Another build replaces nothing of it.
+        sel.choose_build(&updates, &build("ax", "repoC", "2.0-1", false));
+        assert!(updates_view(&updates, &sel).effective[0].replaces.is_empty());
+        // Without a note, nothing to say.
+        let plain = Update { newer_replaces: Vec::new(), ..ax };
+        assert_eq!(newer_replaces_note(&plain), None);
+        // The state file carries it.
+        let parsed: Update = serde_json::from_value(serde_json::json!({
+            "name": "ax", "newer_replaces": [{ "name": "zm", "version": "1.0-1" }]
+        }))
+        .unwrap();
+        assert_eq!(parsed.newer_replaces.len(), 1);
     }
 
     #[test]

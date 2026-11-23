@@ -341,6 +341,12 @@ impl App {
         );
     }
 
+    /// The state's rows as they are now, for an action (untracked).
+    fn updates_untracked(self) -> Vec<Update> {
+        self.state
+            .with_untracked(|s| s.as_ref().map(|s| s.updates.clone()).unwrap_or_default())
+    }
+
     fn origin_group(self) -> Option<Update> {
         self.state
             .with_untracked(|s| s.as_ref().and_then(|s| s.updates.iter().find(|u| u.is_origin_group()).cloned()))
@@ -630,17 +636,10 @@ impl App {
             return;
         };
         match ctx {
-            Context::Updates => self.sel.update(|s| {
-                s.overrides.insert(
-                    option.name.clone(),
-                    Override {
-                        repo: option.repo.clone(),
-                        version: option.version.clone(),
-                        target: option.target.clone(),
-                    },
-                );
-                s.ignored.remove(&option.name);
-            }),
+            Context::Updates => {
+                let updates = self.updates_untracked();
+                self.sel.update(|s| s.choose_build(&updates, &option));
+            }
             Context::Browse => self
                 .install_sel
                 .update(|s| select_install_target(s, &option.target, &option.name)),

@@ -46,7 +46,10 @@ The QML fallback does not know switch rows or the no-recorded-repository
 row. It shows them as later-repo rows, and while they are unticked its
 command preview lists them under `--ignore` (the group as
 `(no recorded repository)`). The core drops those names before paru
-runs: an unticked switch or reinstall is only left out.
+runs: an unticked switch or reinstall is only left out. Its detail view
+does not keep an installed build either: choosing that build, or the
+first repository's copy, for a later-repo row leaves the row ticked with
+nothing to do.
 
 When the AUR has a package, its detail view links to the package's AUR
 page (comments, votes, maintainer) under the repository builds.
@@ -83,10 +86,39 @@ no root or lock), which settles what a plain `-Syu` installs and from
 where. If that fails, the check falls back to `-Qu` and pacman.conf.
 
 - **Later-repo updates.** A strictly newer version in a repo ranked
-  below the one pacman would pick ("later repo"). These start unticked
-  and are applied as explicit `repo/name` targets, because a plain
-  `-Syu` never selects them. If that build replaces an installed
-  package, the row says so.
+  below the one pacman would pick ("later repo"), for a package `-Syu`
+  leaves alone, since its first repository's copy is not newer than the
+  installed one. These start unticked and are applied as explicit
+  `repo/name` targets, because a plain `-Syu` never selects them. If
+  that build replaces an installed package, the row says so. In the
+  window's detail view, any build chosen for such a row is a target too,
+  except the installed one: "Keep installed build" unticks the row and
+  keeps no choice (choosing it used to leave the row ticked with nothing
+  to do, bpf on 23/11/2026). The repository the package was installed
+  from, at the installed version, counts as the installed build even
+  when it rebuilt that version in place (the Installed tab reinstalls
+  such a copy). On an ordinary upgrade the same button unticks the row:
+  `--ignore`, for that run. A chosen build that is installed by the next
+  check (the run applied it) goes the same way, its row unticked: the
+  row's own build, passed over for it, never comes ticked after it.
+- **Newer builds of an upgrade.** When `-Syu` upgrades a package and a
+  repo ranked below has a strictly newer build still, the row stays
+  pacman's upgrade, ticked, and notes the other build ("newer build in
+  extra-x86-64-v4: 620.73.04-1.1"); the detail view offers it, and
+  choosing it makes the row a `repo/name` target. Offering that build as
+  the row, unticked, held back pacman's own upgrade as well, since an
+  unticked row is `--ignore` (nvidia-settings, libxnvctrl and sqlite on
+  23/11/2026, where ALHP's builds were newer than CachyOS's only by their
+  rebuild suffix). If that build replaces an installed package, the row
+  says so beside the note, and once the build is chosen it is the row's
+  replacement, as on a later-repo row. The
+  row's repository change is pacman's own, from where the package was
+  installed to pacman's candidate; choosing the noted build makes it a
+  change to that build's repository instead, which may add one or take
+  one away (a package installed from the lower repository changes back
+  to the first one unless its build is chosen). The QML fallback shows
+  such a row as a plain upgrade, without the note or what the noted
+  build replaces.
 - **Same-version switches.** An installed package whose build is in no
   repository, while a repository carries that version as a build of its
   own: its repository dropped it (Arch's `[multilib]` lib32-libcaca,

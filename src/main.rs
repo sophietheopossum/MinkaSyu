@@ -92,61 +92,71 @@ fn held_reason(u: &check::Update) -> &'static str {
     }
 }
 
+/// One update as the CLI lists it.
+fn update_line(u: &check::Update) -> String {
+    let from = u.installed_repo.as_deref().unwrap_or("unknown source");
+    if u.held {
+        let switch = if u.switch_build { format!("; {}", u.switch_note()) } else { String::new() };
+        format!(
+            "{} {} -> {}  [{}] (held: {}{switch})",
+            u.name,
+            u.old_version,
+            u.new_version,
+            u.candidate_repo,
+            held_reason(u)
+        )
+    } else if !u.superseded_by.is_empty() {
+        format!(
+            "{} {} -> {}  [{}] (replaced by {})",
+            u.name,
+            u.old_version,
+            u.new_version,
+            u.candidate_repo,
+            u.superseded_by.join(", ")
+        )
+    } else if u.new_install {
+        format!("{} {}  [{}] (new package)", u.name, u.new_version, u.candidate_repo)
+    } else if !u.replaces.is_empty() {
+        let replaced: Vec<String> = u.replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
+        format!("{} {}  [{}] replaces {}", u.name, u.new_version, u.candidate_repo, replaced.join(", "))
+    } else if u.switch_build {
+        format!(
+            "{} {} -> {}  [repo: {} -> {}; {}]",
+            u.name,
+            u.old_version,
+            u.new_version,
+            from,
+            u.candidate_repo,
+            u.switch_note()
+        )
+    } else if u.explicit_target {
+        format!(
+            "{} {} -> {}  [repo: {} -> {}; newer than {} {}]",
+            u.name,
+            u.old_version,
+            u.new_version,
+            from,
+            u.candidate_repo,
+            u.first_repo.as_deref().unwrap_or("?"),
+            u.first_version.as_deref().unwrap_or("?")
+        )
+    } else {
+        // pacman's own upgrade, and the newer build a later repository
+        // has, when there is one: the window can choose that instead.
+        let newer = u.newer_note().map(|n| format!("; {n}")).unwrap_or_default();
+        if u.transition == check::Transition::Changed {
+            format!("{} {} -> {}  [repo: {} -> {}{newer}]", u.name, u.old_version, u.new_version, from, u.candidate_repo)
+        } else {
+            format!("{} {} -> {}  [{}{newer}]", u.name, u.old_version, u.new_version, u.candidate_repo)
+        }
+    }
+}
+
 fn print_summary(state: &State) {
     // The origin group is bookkeeping: after the updates, next to the
     // total that counts it.
     for u in state.updates.iter().filter(|u| !u.is_origin_group()) {
-        let from = u.installed_repo.as_deref().unwrap_or("unknown source");
-        if u.held {
-            let switch = if u.switch_build { format!("; {}", u.switch_note()) } else { String::new() };
-            println!(
-                "{} {} -> {}  [{}] (held: {}{switch})",
-                u.name,
-                u.old_version,
-                u.new_version,
-                u.candidate_repo,
-                held_reason(u)
-            );
-        } else if !u.superseded_by.is_empty() {
-            println!(
-                "{} {} -> {}  [{}] (replaced by {})",
-                u.name,
-                u.old_version,
-                u.new_version,
-                u.candidate_repo,
-                u.superseded_by.join(", ")
-            );
-        } else if u.new_install {
-            println!("{} {}  [{}] (new package)", u.name, u.new_version, u.candidate_repo);
-        } else if !u.replaces.is_empty() {
-            let replaced: Vec<String> = u.replaces.iter().map(|r| format!("{} {}", r.name, r.version)).collect();
-            println!("{} {}  [{}] replaces {}", u.name, u.new_version, u.candidate_repo, replaced.join(", "));
-        } else if u.switch_build {
-            println!(
-                "{} {} -> {}  [repo: {} -> {}; {}]",
-                u.name,
-                u.old_version,
-                u.new_version,
-                from,
-                u.candidate_repo,
-                u.switch_note()
-            );
-        } else if u.explicit_target {
-            println!(
-                "{} {} -> {}  [repo: {} -> {}; newer than {} {}]",
-                u.name,
-                u.old_version,
-                u.new_version,
-                from,
-                u.candidate_repo,
-                u.first_repo.as_deref().unwrap_or("?"),
-                u.first_version.as_deref().unwrap_or("?")
-            );
-        } else if u.transition == check::Transition::Changed {
-            println!("{} {} -> {}  [repo: {} -> {}]", u.name, u.old_version, u.new_version, from, u.candidate_repo);
-        } else {
-            println!("{} {} -> {}  [{}]", u.name, u.old_version, u.new_version, u.candidate_repo);
-        }
+        println!("{}", update_line(u));
     }
     if let Some(group) = origin_row(state) {
         print_origin_group(group);
@@ -1136,6 +1146,9 @@ mod tests {
             explicit_target: explicit,
             first_repo: explicit.then(|| "cachyos-extra-v4".to_string()),
             first_version: explicit.then(|| "1-1".to_string()),
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held: false,
             held_by: None,
@@ -1182,6 +1195,9 @@ mod tests {
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held: false,
             held_by: None,
@@ -1219,6 +1235,63 @@ mod tests {
     }
 
     #[test]
+    fn a_noted_newer_build_is_a_choice_not_the_default() {
+        // nvidia-settings on 23/11/2026: pacman's own upgrade, from
+        // cachyos-v4, and ALHP's suffix rebuild noted on the row.
+        let upd = |name: &str| check::Update {
+            name: name.into(),
+            old_version: "615.78.08-1".into(),
+            new_version: "620.73.04-1".into(),
+            installed_repo: Some("cachyos-v4".into()),
+            candidate_repo: "cachyos-v4".into(),
+            transition: check::Transition::Same,
+            explicit_target: false,
+            first_repo: None,
+            first_version: None,
+            newer_repo: Some("extra-x86-64-v4".into()),
+            newer_version: Some("620.73.04-1.1".into()),
+            newer_replaces: Vec::new(),
+            replaces: Vec::new(),
+            held: false,
+            held_by: None,
+            superseded_by: Vec::new(),
+            new_install: false,
+            reinstalls: Vec::new(),
+            switch_build: false,
+            origin_group: Vec::new(),
+        };
+        let state = State { schema: 1, updates: vec![upd("nvidia-settings")], ..Default::default() };
+        assert_eq!(
+            update_line(&state.updates[0]),
+            "nvidia-settings 615.78.08-1 -> 620.73.04-1  [cachyos-v4; newer build in extra-x86-64-v4: 620.73.04-1.1]"
+        );
+        // A plain apply upgrades it from cachyos-v4: no target, no --ignore.
+        let argv = apply_step_argv(&[], None, &state).unwrap();
+        assert_eq!(&argv[2..], ["paru", "-Syu", "--sudoloop"]);
+        // The window's choice of the newer build is a target the core takes.
+        let chosen = ["extra-x86-64-v4/nvidia-settings".to_string()];
+        let argv = apply_step_argv(&[], Some(&chosen), &state).unwrap();
+        assert_eq!(&argv[2..], ["paru", "-Syu", "--sudoloop", "extra-x86-64-v4/nvidia-settings"]);
+        // From another repository, the line says so.
+        let moved = check::Update { candidate_repo: "extra".into(), transition: check::Transition::Changed, ..upd("x") };
+        assert_eq!(
+            update_line(&moved),
+            "x 615.78.08-1 -> 620.73.04-1  [repo: cachyos-v4 -> extra; newer build in extra-x86-64-v4: 620.73.04-1.1]"
+        );
+        let none = check::Update { newer_repo: None, newer_version: None, ..upd("x") };
+        assert_eq!(update_line(&none), "x 615.78.08-1 -> 620.73.04-1  [cachyos-v4]");
+        // What the noted build would replace: choosing it removes that.
+        let replacing = check::Update {
+            newer_replaces: vec![check::Replaced { name: "zm".into(), version: "1.0-1".into(), installed_repo: None }],
+            ..upd("x")
+        };
+        assert_eq!(
+            update_line(&replacing),
+            "x 615.78.08-1 -> 620.73.04-1  [cachyos-v4; newer build in extra-x86-64-v4: 620.73.04-1.1, which replaces zm 1.0-1]"
+        );
+    }
+
+    #[test]
     fn replacements_apply_only_from_their_own_repo() {
         let replacement = check::Update {
             name: "coreutils-uutils".into(),
@@ -1230,6 +1303,9 @@ mod tests {
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: vec![check::Replaced {
                 name: "coreutils-hybrid".into(),
                 version: "9.4_0.0.28-1".into(),
@@ -1278,6 +1354,9 @@ mod tests {
             explicit_target: false,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held: false,
             held_by: None,
@@ -1308,6 +1387,9 @@ mod tests {
             explicit_target: true,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held: false,
             held_by: None,
@@ -1382,6 +1464,9 @@ mod tests {
             explicit_target: true,
             first_repo: None,
             first_version: None,
+            newer_repo: None,
+            newer_version: None,
+            newer_replaces: Vec::new(),
             replaces: Vec::new(),
             held: false,
             held_by: None,

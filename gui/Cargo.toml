@@ -10,8 +10,10 @@ name = "minka-syu-gui"
 path = "src/main.rs"
 
 [dependencies]
-anti-webui = { git = "https://github.com/bea4dev/AntiWebUI", rev = "25e82a1d2a7a08658f0eede14cde47b34cce40a6", default-features = false, features = ["wayland", "svg"] }
-anti-webui-md3e = { git = "https://github.com/bea4dev/AntiWebUI", rev = "25e82a1d2a7a08658f0eede14cde47b34cce40a6" }
+# The toolkit is MinkaDE's AntiWebUI submodule, a sibling of this repository, so every Minka
+# app builds the same revision and a toolkit fix reaches them all.
+anti-webui = { path = "../../AntiWebUI/src/anti-webui", default-features = false, features = ["wayland", "svg"] }
+anti-webui-md3e = { path = "../../AntiWebUI/src/anti-webui-md3e" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -19,8 +21,8 @@ serde_json = "1"
 lto = "thin"
 
 # AntiWebUI's workspace patches wgpu to bea4dev's adapter-filter fork. Cargo
-# ignores patch tables from git dependencies, so the consuming crate has to
-# carry the same patches (pinned to the fork revision in AntiWebUI's lockfile).
+# reads patch tables only from the crate being built, so this one has to carry
+# the same patches (pinned to the fork revision in ../../AntiWebUI/Cargo.lock).
 # Keep in step with MinkaMon/Cargo.toml and MinkaShell/Cargo.toml.
 [patch.crates-io]
 naga = { git = "https://github.com/bea4dev/wgpu", rev = "ff143aeeb126dce521b87f47547565c4b6a6da1e" }

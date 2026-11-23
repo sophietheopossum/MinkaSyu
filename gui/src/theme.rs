@@ -166,9 +166,9 @@ pub fn push_button(
 
 /// Buttons that touch, of which the one that is on takes a shape of its own:
 /// the tabs. `is_on` and `pick` go by position. While `disabled` holds, all
-/// of them are greyed (the one that is on keeps only its shape) and take no
-/// press, as md3e drops their handlers: it should hold exactly while a
-/// press would do nothing.
+/// of them are greyed (the one that is on keeps its shape and a faint fill)
+/// and take no press, as md3e drops their handlers: it should hold exactly
+/// while a press would do nothing.
 pub fn segmented(
     labels: Vec<&'static str>,
     is_on: impl Fn(usize) -> bool + 'static,

@@ -229,19 +229,61 @@ fn wrap_words(lead: &str, words: &[&str], width: usize) -> Vec<String> {
 
 /// "required by a, b and 3 more" with at most `max` names, as the window
 /// caps them, then "; optional for ..." when optional dependencies name
-/// it, and `full` (where to see every name) when a list was cut.
-fn needed_text(required_by: &[String], optional_for: &[String], max: usize, full: &str) -> String {
+/// it, then, given `needs` (all_required_by, needed_by_explicit and
+/// covered_by of a LocalPackage), whether anything installed explicitly
+/// needs it and what satisfies the packages that require it without
+/// needing it, and `full` (where to see every name) when a list was cut. `name` itself is
+/// left out of `required_by`: pacman lists a package that depends on itself
+/// there, which says nothing about what else needs it.
+fn needed_text(
+    name: &str,
+    required_by: &[String],
+    optional_for: &[String],
+    needs: Option<(&[String], &[String], &[String])>,
+    max: usize,
+    full: &str,
+) -> String {
     let list = |names: &[String]| {
         let shown: Vec<&str> = names.iter().take(max).map(String::as_str).collect();
         let more = names.len().saturating_sub(max);
         if more > 0 { format!("{} and {more} more", shown.join(", ")) } else { shown.join(", ") }
     };
-    let mut out =
-        if required_by.is_empty() { "nothing requires it".to_string() } else { format!("required by {}", list(required_by)) };
+    let others: Vec<String> = required_by.iter().filter(|n| *n != name).cloned().collect();
+    let mut out = match (others.is_empty(), required_by.is_empty()) {
+        (true, true) => "nothing requires it".to_string(),
+        (true, false) => "nothing else requires it".to_string(),
+        (false, _) => format!("required by {}", list(&others)),
+    };
     if !optional_for.is_empty() {
         out += &format!("; optional for {}", list(optional_for));
     }
-    if required_by.len() > max || optional_for.len() > max {
+    let mut cut = others.len() > max || optional_for.len() > max;
+    // Nothing (else) requires it: that has said all of it.
+    if let Some((all, explicit, covered_by)) = needs.filter(|_| !others.is_empty()) {
+        let (clause, shown) = match explicit.len() {
+            // Not expected: what requires it and stays has a provider that stays.
+            0 if all.is_empty() && covered_by.is_empty() => {
+                ("; nothing needs it: another installed package satisfies what requires it".to_string(), all)
+            }
+            0 if all.is_empty() => {
+                let verb = if covered_by.len() == 1 { "provides" } else { "provide" };
+                (format!("; nothing needs it: {} also {verb} what requires it", list(covered_by)), covered_by)
+            }
+            0 => {
+                let what = if all.len() == 1 { "dependency" } else { "dependencies" };
+                (format!("; nothing you installed explicitly needs it, only the {what} {}", list(all)), all)
+            }
+            n => (format!("; needed by {n} explicitly installed package{}: {}", if n == 1 { "" } else { "s" }, list(explicit)), explicit),
+        };
+        out += &clause;
+        cut |= shown.len() > max;
+        // Some need it, and the rest that require it have another provider.
+        if !all.is_empty() && !covered_by.is_empty() {
+            out += &format!("; others are covered by {}", list(covered_by));
+            cut |= covered_by.len() > max;
+        }
+    }
+    if cut {
         out += &format!("; {full}");
     }
     out
@@ -261,7 +303,7 @@ fn print_untracked(state: &State) {
         if n == 1 { "" } else { "s" }
     );
     for t in &state.untracked {
-        let needed = needed_text(&t.required_by, &t.optional_for, 4, "minka-syu reason --json lists them all");
+        let needed = needed_text(&t.name, &t.required_by, &t.optional_for, None, 4, "minka-syu reason --json lists them all");
         println!(
             "  {} {} ({}; {needed}): {}",
             t.name,
@@ -702,7 +744,8 @@ fn cmd_reason(args: &[&str]) -> Result<(), String> {
     if !local.installed {
         return Err(format!("{package} is not installed"));
     }
-    let needed = needed_text(&local.required_by, &local.optional_for, 6, "--json lists them all");
+    let needs = (local.all_required_by.as_slice(), local.needed_by_explicit.as_slice(), local.covered_by.as_slice());
+    let needed = needed_text(&local.name, &local.required_by, &local.optional_for, Some(needs), 6, "--json lists them all");
     println!(
         "{} {}: {} ({needed})",
         local.name,
@@ -1600,12 +1643,66 @@ mod tests {
         assert_eq!(joined.split_whitespace().filter(|w| w.starts_with("perl-")).count(), 30);
         assert_eq!(wrap_words("    a: ", &["x"], 10), ["    a: x"]);
         let many: Vec<String> = (0..9).map(|i| format!("p{i}")).collect();
-        assert_eq!(needed_text(&[], &[], 6, "x"), "nothing requires it");
+        assert_eq!(needed_text("pkg", &[], &[], None, 6, "x"), "nothing requires it");
         assert_eq!(
-            needed_text(&many, &[], 6, "--json lists them all"),
+            needed_text("pkg", &many, &[], None, 6, "--json lists them all"),
             "required by p0, p1, p2, p3, p4, p5 and 3 more; --json lists them all"
         );
-        assert_eq!(needed_text(&[], &["yt-dlp".into()], 6, "x"), "nothing requires it; optional for yt-dlp");
+        assert_eq!(needed_text("pkg", &[], &["yt-dlp".into()], None, 6, "x"), "nothing requires it; optional for yt-dlp");
+        // What `reason` adds: who needs it explicitly, said once.
+        let (none, many): (&[String], &[String]) = (&[], &many);
+        assert_eq!(needed_text("pkg", &[], &[], Some((none, none, none)), 6, "x"), "nothing requires it");
+        let one: &[String] = &["git".to_string()];
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((one, one, none)), 6, "x"),
+            "required by git; needed by 1 explicitly installed package: git"
+        );
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((many, none, none)), 6, "full"),
+            "required by git; nothing you installed explicitly needs it, only the dependencies p0, p1, p2, p3, p4, p5 and 3 more; full"
+        );
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((one, none, none)), 6, "x"),
+            "required by git; nothing you installed explicitly needs it, only the dependency git"
+        );
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((none, none, none)), 6, "x"),
+            "required by git; nothing needs it: another installed package satisfies what requires it"
+        );
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((many, &many[..2], none)), 6, "x"),
+            "required by git; needed by 2 explicitly installed packages: p0, p1",
+            "the uncut explicit list is all that is shown"
+        );
+        // It depends on itself, and nothing else requires it: no clause on
+        // what satisfies its requirers, as there are none.
+        assert_eq!(needed_text("git", one, &[], Some((none, none, none)), 6, "x"), "nothing else requires it");
+        let with_self = ["git".to_string(), "p0".to_string()];
+        assert_eq!(
+            needed_text("git", &with_self, &[], Some((&many[..1], none, none)), 6, "x"),
+            "required by p0; nothing you installed explicitly needs it, only the dependency p0"
+        );
+        // What satisfies the packages that require it without needing it.
+        let utils: &[String] = &["ca-certificates-utils".to_string()];
+        assert_eq!(
+            needed_text("ca-certificates", one, &[], Some((none, none, utils)), 6, "x"),
+            "required by git; nothing needs it: ca-certificates-utils also provides what requires it"
+        );
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((none, none, many)), 6, "full"),
+            "required by git; nothing needs it: p0, p1, p2, p3, p4, p5 and 3 more also provide what requires it; full"
+        );
+        let jdks: &[String] = &["jdk11-openjdk".to_string(), "jdk25-graalvm-bin".to_string()];
+        assert_eq!(
+            needed_text("jdk21-openjdk", &with_self, &[], Some((&many[..1], none, jdks)), 6, "x"),
+            "required by git, p0; nothing you installed explicitly needs it, only the dependency p0; \
+             others are covered by jdk11-openjdk, jdk25-graalvm-bin"
+        );
+        assert_eq!(
+            needed_text("pkg", one, &[], Some((one, one, &many[..7])), 6, "full"),
+            "required by git; needed by 1 explicitly installed package: git; others are covered by p0, p1, p2, p3, p4, p5 \
+             and 1 more; full"
+        );
     }
 
     #[test]

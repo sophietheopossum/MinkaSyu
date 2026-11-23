@@ -78,6 +78,22 @@ pub struct LocalPackage {
     /// For"). Only with both lists empty does `pacman -Qdt` list it as an
     /// orphan (when it is a dependency); with only this one, `-Qdtt` does.
     pub optional_for: Vec<String>,
+    /// Every installed package that needs it, directly or through others:
+    /// what `pacman -Rc` would remove with it (alpm::needed_by). Unlike
+    /// required_by, it leaves out a package that another installed one
+    /// satisfies just as well.
+    pub all_required_by: Vec<String>,
+    /// The explicitly installed packages in all_required_by. Empty: nothing
+    /// installed on purpose needs it, even when a cycle of dependencies
+    /// keeps it off `pacman -Qdt`.
+    pub needed_by_explicit: Vec<String>,
+    /// Why the packages in required_by but not in all_required_by do not
+    /// need it: the installed packages that satisfy those dependencies as
+    /// well and would stay (alpm::Needed::covered_by).
+    pub covered_by: Vec<String>,
+    /// The explicitly installed packages among required_by and
+    /// optional_for, sorted: the window marks them in those lists.
+    pub explicit_dependents: Vec<String>,
 }
 
 /// LocalPackage of `name`, from an installed map (not installed: only the
@@ -85,14 +101,31 @@ pub struct LocalPackage {
 pub fn local_package(name: &str, installed: &HashMap<String, alpm::InstalledPkg>) -> LocalPackage {
     let mut cmp = check::memo_vercmp();
     match installed.get(name) {
-        Some(pkg) => LocalPackage {
-            name: name.to_string(),
-            installed: true,
-            version: pkg.version.clone(),
-            explicit: pkg.explicit,
-            required_by: alpm::required_by(name, installed, &mut cmp),
-            optional_for: alpm::optional_for(name, installed, &mut cmp),
-        },
+        Some(pkg) => {
+            let needed = alpm::needed_by(name, installed, &mut cmp);
+            let required_by = alpm::required_by(name, installed, &mut cmp);
+            let optional_for = alpm::optional_for(name, installed, &mut cmp);
+            let mut explicit_dependents: Vec<String> = required_by
+                .iter()
+                .chain(&optional_for)
+                .filter(|n| installed[*n].explicit)
+                .cloned()
+                .collect();
+            explicit_dependents.sort();
+            explicit_dependents.dedup();
+            LocalPackage {
+                name: name.to_string(),
+                installed: true,
+                version: pkg.version.clone(),
+                explicit: pkg.explicit,
+                required_by,
+                optional_for,
+                all_required_by: needed.all,
+                needed_by_explicit: needed.explicit,
+                covered_by: needed.covered_by,
+                explicit_dependents,
+            }
+        }
         None => LocalPackage { name: name.to_string(), ..Default::default() },
     }
 }
@@ -614,6 +647,7 @@ cachyos-extra-v4/fastfetch 2.70.0-1.1 [0 B 2.01 MiB] [installed]\n    A fast sys
                 "app".to_string(),
                 alpm::InstalledPkg {
                     version: "1-1".into(),
+                    explicit: true,
                     optdepends: check::parse_depstring("wpebackend-fdo").into_iter().collect(),
                     ..Default::default()
                 },
@@ -623,9 +657,14 @@ cachyos-extra-v4/fastfetch 2.70.0-1.1 [0 B 2.01 MiB] [installed]\n    A fast sys
         assert!(l.installed && !l.explicit);
         assert_eq!((l.version.as_str(), l.required_by.as_slice()), ("1.16.3-1.1", &["wpebackend-fdo".to_string()][..]));
         assert!(l.optional_for.is_empty());
+        // Needed only by a dependency that nothing explicit needs.
+        assert_eq!((l.all_required_by.as_slice(), l.needed_by_explicit.as_slice()), (&["wpebackend-fdo".to_string()][..], &[][..]));
         let fdo = local_package("wpebackend-fdo", &installed);
         assert!(fdo.required_by.is_empty());
         assert_eq!(fdo.optional_for, ["app"]);
+        assert!(fdo.all_required_by.is_empty(), "optional dependencies never need it");
+        assert_eq!(fdo.explicit_dependents, ["app"], "the explicit ones among both lists");
+        assert!(l.explicit_dependents.is_empty());
         let absent = local_package("nope", &installed);
         assert!(!absent.installed && absent.name == "nope");
     }

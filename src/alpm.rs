@@ -4,7 +4,7 @@
 
 use crate::check::{DepSpec, dep_matches, parse_depstring};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -180,6 +180,100 @@ pub fn optional_for(
     cmp: &mut dyn FnMut(&str, &str) -> Ordering,
 ) -> Vec<String> {
     dependents(name, installed, |p| &p.optdepends, cmp)
+}
+
+/// Who needs an installed package, as `needed_by` finds it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Needed {
+    /// Every installed package that needs it, directly or through others,
+    /// sorted: what `pacman -Rc` of it would remove along with it.
+    pub all: Vec<String>,
+    /// The explicitly installed packages in `all`.
+    pub explicit: Vec<String>,
+    /// What excuses the packages that depend on it but are not in `all`:
+    /// the installed packages outside `all` that satisfy those dependencies
+    /// as well (ca-certificates-utils, which provides ca-certificates).
+    /// Sorted, each once.
+    pub covered_by: Vec<String>,
+}
+
+/// Who needs `name`, by pacman's removal check rather than its "Required
+/// By": a package needs it when one of its dependencies is satisfied only
+/// by `name` or by a package that already needs it (alpm_checkdeps with
+/// reversedeps, repeated until nothing more breaks, as `pacman -Rc` does).
+/// So a dependency another installed package still satisfies (a second
+/// provider of sh or java-runtime) does not count, one that was broken
+/// already is ignored as libalpm ignores it, and a cycle of dependencies
+/// ends. Optional dependencies never count; `name` itself is left out.
+///
+/// The reverse index is built once for the whole walk, and versions are
+/// compared only for dependencies that a package in the walk could
+/// satisfy: `cmp` may be the vercmp tool, one process per pair.
+pub fn needed_by(
+    name: &str,
+    installed: &HashMap<String, InstalledPkg>,
+    cmp: &mut dyn FnMut(&str, &str) -> Ordering,
+) -> Needed {
+    if !installed.contains_key(name) {
+        return Needed::default();
+    }
+    // Dependency name -> (who depends, the dependency); name or provide ->
+    // the packages with it.
+    let mut depending: HashMap<&str, Vec<(&str, &DepSpec)>> = HashMap::new();
+    let mut having: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (pkg_name, pkg) in installed {
+        for dep in &pkg.depends {
+            depending.entry(&dep.name).or_default().push((pkg_name, dep));
+        }
+        for key in std::iter::once(pkg_name.as_str()).chain(pkg.provides.iter().map(|p| p.name.as_str())) {
+            having.entry(key).or_default().push(pkg_name);
+        }
+    }
+    let mut satisfies = |dep: &DepSpec, who: &str| {
+        let pkg = &installed[who];
+        dep_matches(dep, who, &pkg.version, &pkg.provides, cmp)
+    };
+    let mut gone: HashSet<&str> = HashSet::from([name]);
+    let mut queue = vec![name];
+    while let Some(removed) = queue.pop() {
+        let pkg = &installed[removed];
+        for key in std::iter::once(removed).chain(pkg.provides.iter().map(|p| p.name.as_str())) {
+            for &(dependent, dep) in depending.get(key).into_iter().flatten() {
+                if gone.contains(dependent) || !satisfies(dep, removed) {
+                    continue;
+                }
+                let kept = having[dep.name.as_str()].iter().any(|&other| !gone.contains(other) && satisfies(dep, other));
+                if !kept {
+                    gone.insert(dependent);
+                    queue.push(dependent);
+                }
+            }
+        }
+    }
+    // Read once the walk is done: a provider that still stood when a
+    // dependent was checked may have gone since (one that depends on `name`
+    // itself), and then it took that dependent along and covers nothing.
+    let mut covered_by: Vec<String> = Vec::new();
+    let pkg = &installed[name];
+    for key in std::iter::once(name).chain(pkg.provides.iter().map(|p| p.name.as_str())) {
+        for &(dependent, dep) in depending.get(key).into_iter().flatten() {
+            if gone.contains(dependent) || !satisfies(dep, name) {
+                continue;
+            }
+            for &other in &having[dep.name.as_str()] {
+                if !gone.contains(other) && satisfies(dep, other) {
+                    covered_by.push(other.to_string());
+                }
+            }
+        }
+    }
+    covered_by.sort();
+    covered_by.dedup();
+    gone.remove(name);
+    let mut all: Vec<String> = gone.into_iter().map(String::from).collect();
+    all.sort();
+    let explicit = all.iter().filter(|n| installed[*n].explicit).cloned().collect();
+    Needed { all, explicit, covered_by }
 }
 
 /// Read every installed package's version + origin repo from the local DB.
@@ -375,6 +469,124 @@ mod tests {
         // A package that depends on itself counts, as in pacman.
         let selfish = parsed(&["%NAME%\nperl-x\n\n%VERSION%\n1-1\n\n%DEPENDS%\nperl-x\n\n"]);
         assert_eq!(required_by("perl-x", &selfish, &mut fixed), ["perl-x"]);
+    }
+
+    /// An installed package at 1-1: its dependencies, its provides, and
+    /// whether it was installed explicitly.
+    fn pkg(name: &str, depends: &[&str], provides: &[&str], explicit: bool) -> (String, InstalledPkg) {
+        let pkg = InstalledPkg { version: "1-1".into(), explicit, depends: deps(depends), provides: deps(provides), ..Default::default() };
+        (name.to_string(), pkg)
+    }
+
+    /// needed_by with versions compared as strings, which these tests keep
+    /// apart.
+    fn needs(name: &str, installed: &[(String, InstalledPkg)]) -> (Vec<String>, Vec<String>) {
+        let map: HashMap<String, InstalledPkg> = installed.iter().cloned().collect();
+        let n = needed_by(name, &map, &mut |a: &str, b: &str| a.cmp(b));
+        (n.all, n.explicit)
+    }
+
+    #[test]
+    fn needed_by_follows_dependencies_to_explicit_packages() {
+        // A chain: app (explicit) -> mid -> lib, and an optional user.
+        let chain = [
+            pkg("lib", &[], &[], false),
+            pkg("mid", &["lib"], &[], false),
+            pkg("app", &["mid"], &[], true),
+            pkg("viewer", &[], &[], true),
+        ];
+        let mut chain = chain.to_vec();
+        chain[3].1.optdepends = deps(&["lib"]);
+        assert_eq!(needs("lib", &chain), (vec!["app".into(), "mid".into()], vec!["app".into()]));
+        assert_eq!(needs("app", &chain), (vec![], vec![]), "an explicit package nothing needs");
+        assert_eq!(needs("viewer", &chain), (vec![], vec![]));
+        assert_eq!(needs("absent", &chain), (vec![], vec![]));
+        // A cycle of dependencies with no explicit package behind it: both
+        // are required by something, so `pacman -Qdt` lists neither, yet
+        // nothing installed on purpose needs lib.
+        let cycle = [pkg("lib", &[], &[], false), pkg("a", &["lib", "b"], &[], false), pkg("b", &["a"], &[], false)];
+        assert_eq!(needs("lib", &cycle), (vec!["a".into(), "b".into()], vec![]));
+        // A package that depends on itself neither needs itself nor stops
+        // the walk.
+        let selfish = [pkg("lib", &["lib"], &[], false), pkg("perl-x", &["perl-x", "lib"], &[], true)];
+        assert_eq!(needs("lib", &selfish), (vec!["perl-x".into()], vec!["perl-x".into()]));
+        assert_eq!(needs("perl-x", &selfish), (vec![], vec![]));
+    }
+
+    #[test]
+    fn needed_by_matches_provides_and_versions() {
+        // Through a soname the package provides, not its name.
+        let soname = [pkg("libwpe", &[], &["libwpe-1.0.so=1-64"], false), pkg("fdo", &["libwpe-1.0.so=1-64"], &[], true)];
+        assert_eq!(needs("libwpe", &soname), (vec!["fdo".into()], vec!["fdo".into()]));
+        // A version the installed one does not satisfy: that dependency
+        // was broken already, so removing it breaks nothing new.
+        let versioned = [pkg("x", &[], &[], false), pkg("new", &["x>=2"], &[], true), pkg("old", &["x>=1"], &[], true)];
+        assert_eq!(needs("x", &versioned), (vec!["old".into()], vec!["old".into()]));
+    }
+
+    #[test]
+    fn needed_by_counts_only_what_no_other_package_satisfies() {
+        // Two java runtimes: removing either leaves the app its runtime.
+        let two = [
+            pkg("jre-a", &[], &["java-runtime=21"], false),
+            pkg("jre-b", &[], &["java-runtime=21"], false),
+            pkg("app", &["java-runtime"], &[], true),
+        ];
+        assert_eq!(needs("jre-a", &two), (vec![], vec![]));
+        // Unless the other one goes too: jre-b depends on jre-a, so
+        // `pacman -Rc jre-a` takes jre-b, and then the app has none.
+        let mut chained = two.to_vec();
+        chained[1].1.depends = deps(&["jre-a"]);
+        assert_eq!(needs("jre-a", &chained), (vec!["app".into(), "jre-b".into()], vec!["app".into()]));
+        assert_eq!(needs("jre-b", &chained), (vec![], vec![]), "jre-a still provides it");
+        // A provide that fails the constraint is no alternative.
+        let mut old = two.to_vec();
+        old[1].1.provides = deps(&["java-runtime=11"]);
+        old[2].1.depends = deps(&["java-runtime>=17"]);
+        assert_eq!(needs("jre-a", &old), (vec!["app".into()], vec!["app".into()]));
+    }
+
+    fn covers(name: &str, installed: &[(String, InstalledPkg)]) -> Vec<String> {
+        let map: HashMap<String, InstalledPkg> = installed.iter().cloned().collect();
+        needed_by(name, &map, &mut |a: &str, b: &str| a.cmp(b)).covered_by
+    }
+
+    #[test]
+    fn needed_by_names_what_covers_a_dependent_it_excuses() {
+        // ca-certificates on 23/11/2026: what requires it by name is just as
+        // satisfied by ca-certificates-utils, which provides that name.
+        let certs = [
+            pkg("ca-certificates", &["ca-certificates-mozilla"], &[], false),
+            pkg("ca-certificates-mozilla", &["ca-certificates-utils"], &[], false),
+            pkg("ca-certificates-utils", &[], &["ca-certificates"], false),
+            pkg("curl", &["ca-certificates"], &[], false),
+            pkg("aria2", &["ca-certificates"], &[], true),
+        ];
+        assert_eq!(needs("ca-certificates", &certs), (vec![], vec![]));
+        assert_eq!(covers("ca-certificates", &certs), ["ca-certificates-utils"], "each once");
+        // Two other providers both cover, and what is needed has no cover.
+        let three = [
+            pkg("jre-a", &[], &["java-runtime=21"], false),
+            pkg("jre-b", &[], &["java-runtime=21"], false),
+            pkg("jre-c", &[], &["java-runtime=21"], false),
+            pkg("app", &["java-runtime"], &[], true),
+            pkg("ide", &["jre-a"], &[], true),
+        ];
+        assert_eq!(needs("jre-a", &three), (vec!["ide".into()], vec!["ide".into()]));
+        assert_eq!(covers("jre-a", &three), ["jre-b", "jre-c"]);
+        // A provider that depends on jre-a itself (through mid) goes with it,
+        // even when the walk reaches the app before it: no cover.
+        let mut through = three.to_vec();
+        through[1].1.depends = deps(&["mid"]);
+        through.push(pkg("mid", &["jre-a"], &[], false));
+        assert_eq!(needs("jre-a", &through).0, ["ide", "jre-b", "mid"]);
+        assert_eq!(covers("jre-a", &through), ["jre-c"]);
+        // With no provider left, the app needs it and nothing is covered.
+        through[2].1.depends = deps(&["jre-a"]);
+        assert_eq!(needs("jre-a", &through).0, ["app", "ide", "jre-b", "jre-c", "mid"]);
+        assert!(covers("jre-a", &through).is_empty());
+        // A package that depends on itself is no dependent to excuse.
+        assert!(covers("lib", &[pkg("lib", &["lib"], &[], false)]).is_empty());
     }
 
     #[test]

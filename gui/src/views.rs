@@ -1502,7 +1502,7 @@ fn installed_tab(app: App) -> Div {
                         .into()
                 } else {
                     format!(
-                        "{} selected — opens rio: paru -Rns {} (confirm there; Reload after)",
+                        "{} selected — opens rio: paru -Rns {} (confirm there)",
                         p.len(),
                         p.join(" ")
                     )
@@ -1839,6 +1839,8 @@ fn detail_field(label: &'static str, value: impl Fn() -> String + 'static) -> im
     )
 }
 
+/// One build in the detail view: the box and the row pick it for the action
+/// button, and the chip at its end picks it for "Compare in meld" instead.
 fn repo_option_row(app: App, o: RepoOption) -> Div {
     let target: Rc<str> = Rc::from(o.target.as_str());
     let chosen = {
@@ -1898,29 +1900,50 @@ fn repo_option_row(app: App, o: RepoOption) -> Div {
     if o.is_installed {
         row = row.child(ui_text("installed", FONT_SIZE - 2.0_f32, OK_GREEN).whitespace_nowrap());
     }
-    row
+    // A lone build has nothing to be compared with.
+    let repo: Rc<str> = Rc::from(o.repo.as_str());
+    row.child(show(
+        move || app.repos.with(|r| r.data.len() >= 2),
+        move || {
+            let (label, picked, pick) = (Rc::clone(&repo), Rc::clone(&repo), Rc::clone(&repo));
+            toggle_chip(
+                move || app.compare_picks.with(|p| compare_pick_label(p, &label)),
+                move || app.compare_picks.with(|p| p.iter().any(|r| **r == *picked)),
+                move || app.compare_picks.update(|p| toggle_compare_pick(p, &pick)),
+            )
+        },
+    ))
+}
+
+/// The detail view's package as the local DB has it: its name and install
+/// reason, without cloning its lists (glibc's run to thousands of names).
+fn local_name(app: App) -> String {
+    app.local.with(|l| l.data.as_ref().map(|p| p.name.clone())).unwrap_or_default()
+}
+
+fn local_explicit(app: App) -> bool {
+    app.local.with(|l| l.data.as_ref().is_some_and(|p| p.explicit))
 }
 
 /// An installed package's install reason, which a press changes (in a
 /// terminal: `sudo pacman -D`). The buttons show what the local DB says,
 /// read again once that step reports back; nothing flips before. How the
 /// last change of it ended, when it failed, shows here too: its card is
-/// under this view.
+/// under this view. What requires it is NEEDED BY's to say.
 fn reason_section(app: App) -> Div {
-    let local = move || app.local.with(|l| l.data.clone()).unwrap_or_default();
     // A change of this package's reason in flight.
     let busy = move || {
-        let name = local().name;
+        let name = local_name(app);
         app.reason_busy.with(|b| b.as_deref() == Some(name.as_str()))
     };
     // Another package's: a press here waits for it (set_reason).
     let other = move || {
-        let name = local().name;
+        let name = local_name(app);
         app.reason_busy.with(|b| b.as_deref().filter(|b| *b != name).map(str::to_string))
     };
     let failed = move || {
-        let name = local().name;
-        app.run_reports.with(|cards| reason_failure(cards, &name))
+        let name = local_name(app);
+        app.run_reports.with(|cards| step_failure(cards, "reason", &name))
     };
     div()
         .w_full()
@@ -1937,7 +1960,7 @@ fn reason_section(app: App) -> Div {
                 .gap(12.0_f32)
                 .child(segmented(
                     vec!["Dependency", "Explicit"],
-                    move |i| local().explicit == (i == 1),
+                    move |i| local_explicit(app) == (i == 1),
                     move |i| app.set_reason(i == 1),
                 ))
                 .child(
@@ -1949,30 +1972,10 @@ fn reason_section(app: App) -> Div {
                         .gap(1.0_f32)
                         .child(ui_text(
                             move || {
-                                let p = local();
-                                let reason = if p.explicit { "Explicitly installed" } else { "Installed as a dependency" };
-                                // Nothing requiring it is the consequence line's to say.
-                                let mut s = reason.to_string();
-                                if !p.required_by.is_empty() {
-                                    s += &format!(" · {}", required_by_text(&p.required_by, 6));
-                                    if !p.optional_for.is_empty() {
-                                        s += &format!(" · {}", optional_for_text(&p.optional_for, 4));
-                                    }
-                                }
-                                s
+                                if local_explicit(app) { "Explicitly installed" } else { "Installed as a dependency" }
                             },
                             FONT_SIZE - 1.0_f32,
                             TEXT_MUTED,
-                        ))
-                        .child(show(
-                            move || !busy() && reason_consequence(&local()).is_some(),
-                            move || {
-                                ui_text(
-                                    move || reason_consequence(&local()).unwrap_or_default(),
-                                    FONT_SIZE - 2.0_f32,
-                                    WARN_AMBER,
-                                )
-                            },
                         ))
                         .child(show(
                             move || !busy() && failed().is_some(),
@@ -1987,11 +1990,10 @@ fn reason_section(app: App) -> Div {
                         .child(show(busy, move || {
                             mono_text(
                                 move || {
-                                    let p = local();
                                     format!(
                                         "Waiting for the terminal: sudo pacman -D {} {}",
-                                        if p.explicit { "--asdeps" } else { "--asexplicit" },
-                                        p.name
+                                        if local_explicit(app) { "--asdeps" } else { "--asexplicit" },
+                                        local_name(app)
                                     )
                                 },
                                 FONT_SIZE - 2.0_f32,
@@ -2011,6 +2013,133 @@ fn reason_section(app: App) -> Div {
                         )),
                 ),
         )
+}
+
+/// Who needs an installed package (the core's alpm::needed_by): one line
+/// that says it, what "Remove…" in the footer would run, and the names
+/// behind it, each opening its own detail view (Back returns here).
+fn needed_section(app: App) -> Div {
+    let verdict = move || app.local.with(|l| l.data.as_ref().and_then(needed_verdict));
+    let warn = move || verdict().is_some_and(|(_, warn)| warn);
+    let targets = move || app.local.with(|l| l.data.as_ref().and_then(remove_targets));
+    let removing = move || app.removal_of(&local_name(app));
+    let failed = move || {
+        let name = local_name(app);
+        app.run_reports.with(|cards| step_failure(cards, "remove", &name))
+    };
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(3.0_f32)
+        .child(section_label("NEEDED BY"))
+        .child(
+            ui_text(move || verdict().map(|(line, _)| line).unwrap_or_default(), FONT_SIZE - 1.0_f32, TEXT_MUTED)
+                .dyn_style(move |s| s.text_color(color(if warn() { WARN_AMBER } else { TEXT_MUTED }))),
+        )
+        .child(show(
+            move || removing().is_none() && targets().is_some(),
+            move || {
+                mono_text(
+                    move || {
+                        format!(
+                            "Remove… opens rio: paru -Rns {} (confirm there)",
+                            targets().unwrap_or_default().join(" ")
+                        )
+                    },
+                    FONT_SIZE - 2.0_f32,
+                    TEXT_FAINT,
+                )
+            },
+        ))
+        .child(show(
+            move || removing().is_some(),
+            move || {
+                mono_text(
+                    move || {
+                        format!("Waiting for the terminal: paru -Rns {}", removing().unwrap_or_default().join(" "))
+                    },
+                    FONT_SIZE - 2.0_f32,
+                    TEXT_FAINT,
+                )
+            },
+        ))
+        .child(show(
+            move || removing().is_none() && failed().is_some(),
+            move || {
+                ui_text(
+                    move || format!("{} · its card is under this view", failed().unwrap_or_default()),
+                    FONT_SIZE - 2.0_f32,
+                    RED,
+                )
+            },
+        ))
+        .child(dyn_view(move || {
+            let open = app.need_list.get();
+            let all = app.need_all.get();
+            app.local.with(|l| match &l.data {
+                Some(p) => untrack(|| need_lists(app, p, open, all)),
+                None => div(),
+            })
+        }))
+}
+
+/// NEEDED BY's lists: a toggle per list that has names, and the open one's
+/// names (the first NAME_LIST_CAP, or all), explicitly installed ones marked.
+fn need_lists(app: App, p: &LocalPackage, open: Option<NeedList>, all: bool) -> Div {
+    let mut toggles = div().w_full().flex().flex_row().flex_wrap().items_center().column_gap(14.0_f32).row_gap(2.0_f32);
+    for kind in NeedList::ALL {
+        let n = kind.names(p).len();
+        if n == 0 {
+            continue;
+        }
+        let label = format!("{} ({n})", kind.label());
+        toggles = toggles.child(text_button(
+            move || label.clone(),
+            if open == Some(kind) { TEXT } else { PURPLE },
+            move || {
+                app.need_all.set(false);
+                app.need_list.update(|o| *o = if *o == Some(kind) { None } else { Some(kind) });
+            },
+        ));
+    }
+    let column = div().w_full().flex().flex_col().gap(3.0_f32).child(toggles);
+    let Some(kind) = open else {
+        return column;
+    };
+    let names = kind.names(p);
+    let (shown, left_out) = capped(&names, all);
+    let explicit: std::collections::HashSet<&str> = p.explicit_dependents.iter().map(String::as_str).collect();
+    let mut grid = div().w_full().flex().flex_row().flex_wrap().items_center().column_gap(12.0_f32).row_gap(1.0_f32);
+    for name in shown {
+        // Every name in the explicit list is explicit: no marks there.
+        let marked = kind != NeedList::Explicit && explicit.contains(name.as_str());
+        grid = grid.child(need_name(app, name.clone(), marked));
+    }
+    if left_out > 0 {
+        let total = names.len();
+        grid = grid.child(text_button(move || format!("Show all {total}"), PURPLE, move || app.need_all.set(true)));
+    } else if all && names.len() > NAME_LIST_CAP {
+        grid = grid.child(text_button(|| "Show fewer".into(), PURPLE, move || app.need_all.set(false)));
+    }
+    column.child(grid)
+}
+
+/// One name in a NEEDED BY list: opens that package's detail view.
+fn need_name(app: App, name: String, explicit: bool) -> Div {
+    let shown = name.clone();
+    let mut item = div()
+        .flex_none()
+        .max_w(pct(100.0_f32))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(4.0_f32)
+        .child(name_link(move || shown.clone(), FONT_SIZE - 1.0_f32, move || app.open_dependent(&name)));
+    if explicit {
+        item = item.child(mono_text("explicit", FONT_SIZE - 3.0_f32, OK_GREEN).whitespace_nowrap());
+    }
+    item
 }
 
 fn detail_overlay(app: App) -> Div {
@@ -2070,8 +2199,17 @@ fn detail_overlay(app: App) -> Div {
                     move || {
                         let d = d();
                         let mut s = d.name.clone();
-                        if !d.version.is_empty() {
-                            s += &format!("  {}", d.version);
+                        // A dependent opened from NEEDED BY comes with no
+                        // row: its installed version is the local DB's.
+                        let version = if d.version.is_empty() {
+                            app.local.with(|l| {
+                                l.data.as_ref().filter(|p| p.installed && p.name == d.name).map(|p| p.version.clone())
+                            })
+                        } else {
+                            Some(d.version.clone())
+                        };
+                        if let Some(v) = version {
+                            s += &format!("  {v}");
                         }
                         if !d.repo.is_empty() {
                             s += &format!("  [{}]", d.repo);
@@ -2085,6 +2223,20 @@ fn detail_overlay(app: App) -> Div {
                     TEXT_FAINT,
                 )),
         )
+        .child(show(
+            move || app.back_stack.with(|b| !b.is_empty()),
+            move || {
+                push_button(
+                    move || {
+                        let to = app.back_stack.with(|b| b.last().map(|p| p.detail.name.clone())).unwrap_or_default();
+                        format!("Back to {to}")
+                    },
+                    false,
+                    || true,
+                    move || app.go_back(),
+                )
+            },
+        ))
         .child(push_button(
             || "Close".into(),
             false,
@@ -2093,6 +2245,7 @@ fn detail_overlay(app: App) -> Div {
         ));
 
     let repos_loading = move || app.repos.with(|r| r.loading);
+    let local_installed = move || app.local.with(|l| l.data.as_ref().is_some_and(|p| p.installed));
     let body = div()
         .flex()
         .flex_col()
@@ -2106,10 +2259,8 @@ fn detail_overlay(app: App) -> Div {
             ),
             None => div(),
         }))
-        .child(show(
-            move || app.local.with(|l| l.data.as_ref().is_some_and(|p| p.installed)),
-            move || untrack(|| reason_section(app)),
-        ))
+        .child(show(local_installed, move || untrack(|| reason_section(app))))
+        .child(show(local_installed, move || untrack(|| needed_section(app))))
         .child(show(
             move || repos_loading() || app.repos.with(|r| !r.data.is_empty()),
             || section_label("AVAILABLE REPOSITORIES"),
@@ -2218,18 +2369,23 @@ fn detail_overlay(app: App) -> Div {
         app.comparing
             .with(|c| c.as_ref().filter(|(p, _)| *p == name).map(|(_, note)| note.clone()))
     };
+    // The picks for meld, when there are any, say what they will do. Why
+    // the action button is off comes first: picks stay after a compare,
+    // and the chips still read Left and Right.
+    let picks_note = move || app.compare_picks.with(|p| compare_picks_note(p));
     let warning = move || if comparing().is_some() { None } else { blocked() };
+    // The note has a line of its own above the buttons: beside three of
+    // them it broke inside repository and package names ("core/ca-").
     let footer_row = div()
         .w_full()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(10.0_f32)
+        .flex_col()
+        .gap(6.0_f32)
         .child(
-            div().flex_1().min_w(0.0_f32).child(
+            div().w_full().min_w(0.0_f32).child(
                 mono_text(
                     move || {
-                        comparing().or_else(blocked).unwrap_or_else(|| {
+                        comparing().or_else(blocked).or_else(picks_note).unwrap_or_else(|| {
                             let t = app.detail_target.get();
                             if t.is_empty() {
                                 "No repository build selected.".into()
@@ -2250,22 +2406,38 @@ fn detail_overlay(app: App) -> Div {
                 }),
             ),
         )
-        .child(push_button(
-            || "Compare in meld".into(),
-            false,
-            move || {
-                let target = app.detail_target.get();
-                app.comparing.with(|c| c.is_none())
-                    && app.repos.with(|r| compare_pair(&r.data, &target).is_some())
-            },
-            move || app.compare_in_meld(),
-        ))
-        .child(push_button(
-            action_label,
-            false,
-            move || app.selected_option().is_some() && app.blocked_reason().is_none(),
-            move || app.choose_detail_repo(),
-        ));
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(10.0_f32)
+                .child(show(local_installed, move || {
+                    push_button(
+                        || "Remove…".into(),
+                        false,
+                        move || {
+                            app.local.with(|l| l.data.as_ref().and_then(remove_targets)).is_some()
+                                && app.removal_free(&local_name(app))
+                        },
+                        move || app.remove_detail(),
+                    )
+                }))
+                .child(push_button(
+                    || "Compare in meld".into(),
+                    false,
+                    move || app.comparing.with(|c| c.is_none()) && app.compare_picks.with(|p| p.len() == 2),
+                    move || app.compare_in_meld(),
+                ))
+                .child(push_button(
+                    action_label,
+                    false,
+                    move || app.selected_option().is_some() && app.blocked_reason().is_none(),
+                    move || app.choose_detail_repo(),
+                )),
+        );
 
     // The scrim closes on a click outside the panel; the panel eats its own.
     div()

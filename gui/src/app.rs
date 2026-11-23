@@ -29,6 +29,16 @@ pub struct Detail {
     pub description: String,
 }
 
+/// A detail view that a dependent's was opened over, as it was left: Back
+/// returns to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailPlace {
+    pub detail: Detail,
+    pub target: String,
+    pub need_list: Option<NeedList>,
+    pub need_all: bool,
+}
+
 /// An answer that belongs to one package name: a slow reply for a package
 /// clicked past must not land in the open detail view.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -83,12 +93,25 @@ pub struct App {
     /// The package whose install reason a terminal is changing, until that
     /// step reports back. The shown reason is the DB's, never this guess.
     pub reason_busy: Signal<Option<String>>,
+    /// The NEEDED BY list that is open, and whether it shows every name.
+    pub need_list: Signal<Option<NeedList>>,
+    pub need_all: Signal<bool>,
+    /// The detail views that dependents' were opened over, newest last.
+    /// Closing the overlay clears them.
+    pub back_stack: Signal<Vec<DetailPlace>>,
+    /// Removals whose terminal is open, each as its package list, until
+    /// its step reports back.
+    pub removing: Signal<Vec<Vec<String>>>,
     /// The first screenshot, once downloaded (images load from files only).
     pub shot: Signal<Option<PathBuf>>,
     /// The compare in flight, as (package, the note the detail view shows
     /// meanwhile). One at a time: two compares of one build would write
     /// the same directory.
     pub comparing: Signal<Option<(String, String)>>,
+    /// The builds picked for "Compare in meld", as repositories in pick
+    /// order (toggle_compare_pick). Only the shown package's: another
+    /// package in the view starts with none.
+    pub compare_picks: Signal<Vec<String>>,
 
     pub sources: Signal<Option<Sources>>,
     pub sources_loading: Signal<bool>,
@@ -146,8 +169,13 @@ impl App {
             repos: signal(Loaded::default()),
             local: signal(Loaded::default()),
             reason_busy: signal(None),
+            need_list: signal(None),
+            need_all: signal(false),
+            back_stack: signal(Vec::new()),
+            removing: signal(Vec::new()),
             shot: signal(None),
             comparing: signal(None),
+            compare_picks: signal(Vec::new()),
             sources: signal(None),
             sources_loading: signal(false),
             sources_gen: signal(0),
@@ -183,11 +211,17 @@ impl App {
                     // Two steps can run at once: each report files only
                     // its own step's card.
                     let report: RunReport = parse(payload);
+                    let packages = command_packages(&report.command);
                     if report.step == "reason" {
                         self.reason_done();
-                        // The newest outcome of a package's reason change is
-                        // the one its card (and the detail view) tells.
-                        self.run_reports.update(|cards| drop_reason_cards(cards, report.command.last()));
+                    } else if report.step == "remove" {
+                        self.removing.update(|r| end_removal(r, packages));
+                        self.reread_local();
+                    }
+                    // The newest outcome of a package's reason change or
+                    // removal is the one its card (and the detail view) tells.
+                    if matches!(report.step.as_str(), "reason" | "remove") {
+                        self.run_reports.update(|cards| drop_step_cards(cards, &report.step, packages));
                     }
                     self.run_reports.update(|cards| record_run(cards, report));
                 }
@@ -202,6 +236,8 @@ impl App {
                     self.searching.set(false);
                     self.installed_loading.set(false);
                     self.sources_loading.set(false);
+                    // No report of a removal comes from a core that died.
+                    self.removing.set(Vec::new());
                     self.error.set(e);
                 }
             },
@@ -417,7 +453,11 @@ impl App {
             self.installed_loading.set(false);
             match reply {
                 Ok(v) => {
-                    self.installed.set(parse(v));
+                    let list: Vec<InstalledEntry> = parse(v);
+                    // A tick on a package that is gone would only make the
+                    // next removal fail.
+                    self.remove_sel.update(|s| s.retain(|n| list.iter().any(|p| &p.name == n)));
+                    self.installed.set(list);
                     self.installed_loaded.set(true);
                 }
                 Err(e) => self.error.set(e),
@@ -433,12 +473,60 @@ impl App {
         self.request("install", json!({ "packages": targets }), |_| {});
     }
 
+    /// Removes `names` in a terminal (`paru -Rns`, confirmed there). The
+    /// removal is in flight until its step reports back (see start).
     pub fn remove(self, names: Vec<String>) {
         if names.is_empty() {
             return;
         }
         self.error.set(String::new());
-        self.request("remove", json!({ "packages": names }), |_| {});
+        self.removing.update(|r| r.push(names.clone()));
+        let started = names.clone();
+        core::request("remove", json!({ "packages": names }), move |reply| {
+            if let Err(e) = reply {
+                self.removing.update(|r| end_removal(r, &started));
+                self.error.set(e);
+            }
+        });
+    }
+
+    /// The removal in flight that takes `name`, as its package list.
+    pub fn removal_of(self, name: &str) -> Option<Vec<String>> {
+        self.removing.with(|r| r.iter().find(|names| names.iter().any(|n| n == name)).cloned())
+    }
+
+    /// Nothing in flight can change what removing `name` takes: no removal
+    /// of it, and no install reason change, which can make one of its
+    /// remove_targets needed before the DB says so.
+    pub fn removal_free(self, name: &str) -> bool {
+        self.reason_busy.with(|b| b.is_none()) && self.removal_of(name).is_none()
+    }
+
+    /// "Remove…" in the detail view: the package and what needs it
+    /// (remove_targets). The view may have read the local DB long before
+    /// the press, so it is read again, and the terminal opens only on the
+    /// targets the view showed; otherwise the view shows what changed.
+    pub fn remove_detail(self) {
+        let Some(shown) = self.local.with_untracked(|l| l.data.as_ref().and_then(remove_targets)) else {
+            return;
+        };
+        let name = shown[0].clone();
+        if !untrack(|| self.removal_free(&name)) {
+            return;
+        }
+        core::request("local_package", json!({ "package": name }), move |reply| {
+            // A second press, or a reason change, may have started meanwhile.
+            if !untrack(|| self.removal_free(&name)) {
+                return;
+            }
+            let now: Option<LocalPackage> = reply.ok().and_then(|v| serde_json::from_value(v).ok());
+            if now.as_ref().and_then(remove_targets).as_ref() == Some(&shown) {
+                self.remove(shown);
+            } else {
+                self.error.set(format!("Nothing removed: what needs {name} changed since the view read it; see NEEDED BY"));
+                self.reread_local();
+            }
+        });
     }
 
     // ---- detail -----------------------------------------------------------
@@ -459,6 +547,9 @@ impl App {
         });
         self.detail_target.set(start);
         self.detail.set(Some(d));
+        self.need_list.set(None);
+        self.need_all.set(false);
+        self.compare_picks.set(Vec::new());
         self.shot.set(None);
         self.appstream.set(Loaded {
             name: name.clone(),
@@ -497,6 +588,7 @@ impl App {
                 return;
             }
             let data: Vec<RepoOption> = reply.ok().map(parse).unwrap_or_default();
+            self.compare_picks.update(|picks| prune_compare_picks(picks, &data));
             self.repos.set(Loaded {
                 name: n,
                 loading: false,
@@ -509,6 +601,49 @@ impl App {
 
     pub fn close_detail(self) {
         self.detail.set(None);
+        self.back_stack.set(Vec::new());
+        self.compare_picks.set(Vec::new());
+    }
+
+    /// Opens the detail view of `name`, a package that needs the one shown,
+    /// over it: Back returns to this one as it was left.
+    pub fn open_dependent(self, name: &str) {
+        let Some(current) = self.detail.get_untracked() else {
+            return;
+        };
+        if current.name == name {
+            return;
+        }
+        self.back_stack.update(|stack| {
+            stack.push(DetailPlace {
+                detail: current,
+                target: self.detail_target.get_untracked(),
+                need_list: self.need_list.get_untracked(),
+                need_all: self.need_all.get_untracked(),
+            })
+        });
+        // The installed list's facts, when it has been read; the view
+        // reads the rest from the local DB as usual.
+        let entry = self.installed.with_untracked(|l| l.iter().find(|p| p.name == name).cloned());
+        self.open_detail(Detail {
+            name: name.to_string(),
+            context: Context::Installed,
+            version: entry.as_ref().map(|p| p.version.clone()).unwrap_or_default(),
+            repo: entry.as_ref().map(|p| p.repo.clone()).unwrap_or_default(),
+            description: entry.map(|p| p.description).unwrap_or_default(),
+        });
+    }
+
+    /// Back to the detail view the shown one was opened over.
+    pub fn go_back(self) {
+        let Some(place) = self.back_stack.update(|stack| stack.pop()) else {
+            return;
+        };
+        self.open_detail(place.detail);
+        // Kept if the repo list still offers it (sync_detail_target).
+        self.detail_target.set(place.target);
+        self.need_list.set(place.need_list);
+        self.need_all.set(place.need_all);
     }
 
     /// Asks the local DB about `name` for the detail view (its install
@@ -547,7 +682,9 @@ impl App {
         let Some(p) = self.local.with_untracked(|l| l.data.clone()).filter(|p| p.installed) else {
             return;
         };
-        if p.explicit == explicit {
+        // Not while a removal that takes it is open: paru removes what it
+        // names whatever its reason says by then.
+        if p.explicit == explicit || untrack(|| self.removal_of(&p.name)).is_some() {
             return;
         }
         self.reason_busy.set(Some(p.name.clone()));
@@ -565,17 +702,22 @@ impl App {
                     ..Default::default()
                 };
                 self.run_reports.update(|cards| {
-                    drop_reason_cards(cards, report.command.last());
+                    drop_step_cards(cards, "reason", command_packages(&report.command));
                     record_run(cards, report);
                 });
             }
         });
     }
 
-    /// A reason change ended, whichever way: read the DB again, for the
-    /// open detail view and the installed list.
+    /// A reason change ended, whichever way: read the DB again.
     fn reason_done(self) {
         self.reason_busy.set(None);
+        self.reread_local();
+    }
+
+    /// A step that changes the local DB ended: read it again, for the open
+    /// detail view and the installed list (when it has been read).
+    fn reread_local(self) {
         if let Some(name) = self.detail.with_untracked(|d| d.as_ref().map(|d| d.name.clone())) {
             self.load_local(name);
         }
@@ -653,26 +795,29 @@ impl App {
         self.close_detail();
     }
 
-    /// Opens meld on the source trees behind the selected build and the
-    /// one compare_pair sets against it. The core fetches them (a few
-    /// seconds cold) and starts meld; its errors, meld missing among them,
-    /// land in the error bar.
+    /// Opens meld on the source trees behind the two builds picked, the
+    /// first on the left. The core fetches them (a few seconds cold) and
+    /// starts meld; its errors, meld missing among them, land in the error
+    /// bar.
     pub fn compare_in_meld(self) {
         if self.comparing.with_untracked(|c| c.is_some()) {
             return;
         }
-        let Some(option) = untrack(|| self.selected_option()) else {
+        let Some(package) = self.repos.with_untracked(|r| r.loaded.then(|| r.name.clone())) else {
             return;
         };
-        let Some((left, right)) = self.repos.with_untracked(|r| compare_pair(&r.data, &option.target)) else {
+        let Some((left, right)) = self.compare_picks.with_untracked(|p| match p.as_slice() {
+            [left, right] => Some((left.clone(), right.clone())),
+            _ => None,
+        }) else {
             return;
         };
         self.error.set(String::new());
         let note = format!("Fetching sources for meld… ({left} against {right})");
-        self.comparing.set(Some((option.name.clone(), note)));
+        self.comparing.set(Some((package.clone(), note)));
         core::request(
             "compare",
-            json!({ "package": option.name, "left": left, "right": right }),
+            json!({ "package": package, "left": left, "right": right }),
             move |reply| {
                 self.comparing.set(None);
                 if let Err(e) = reply {

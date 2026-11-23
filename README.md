@@ -55,18 +55,68 @@ When the AUR has a package, its detail view links to the package's AUR
 page (comments, votes, maintainer) under the repository builds.
 
 The detail view of an installed package shows its install reason as
-two buttons, Dependency and Explicit, with what requires it and what it
-is optional for (pacman's "Required By" and "Optional For", versions
-and sonames matched as libalpm matches them). A press opens the
-terminal on `sudo pacman -D --asdeps|--asexplicit -- <pkg>` (the
-"reason" step, reported like the others); the buttons show what the
-local DB says, read again when that step ends, and never flip before. A
-failed change says so under the buttons too, as long as its card is
-there. A package nothing requires gets one more line: as a dependency
-it is an orphan, which `pacman -Qdt` lists; if something has it as an
-optional dependency, only `pacman -Qdtt` does. From the CLI:
-`minka-syu reason [--json] <pkg>` shows it, `minka-syu reason
+two buttons, Dependency and Explicit. A press opens the terminal on
+`sudo pacman -D --asdeps|--asexplicit -- <pkg>` (the "reason" step,
+reported like the others); the buttons show what the local DB says,
+read again when that step ends, and never flip before. A failed change
+says so under the buttons too, as long as its card is there. From the
+CLI: `minka-syu reason [--json] <pkg>` shows it, `minka-syu reason
 [--dry-run] --asdeps|--asexplicit <pkg>` changes it.
+
+Who actually needs a package is a narrower question than "Required
+By", and `reason` answers it too: the installed packages that `pacman
+-Rc` would remove along with it. A package needs it when one of its
+dependencies is satisfied only by it, or by a package that already
+needs it, so a dependency another installed package satisfies as well
+(a second provider of java-runtime or sh) does not count, and neither
+does an optional one; versions and provides match as for Required By.
+The explicitly installed packages among them are what keeps it wanted.
+With none, nothing installed on purpose needs it, which `pacman -Qdt`
+misses when dependencies require each other in a cycle. What excuses a
+package that requires it without needing it is named too: the installed
+packages that would stay and satisfy that dependency as well (for
+ca-certificates, ca-certificates-utils, which provides it; a provider
+that itself goes with the package is none). `reason` says how many
+explicitly installed packages need it, or that none do, and what covers
+the rest; `--json` lists those as `needed_by_explicit`, every package
+that needs it as `all_required_by`, and the providers as `covered_by`.
+
+In the window, NEEDED BY under the install reason says it in one line:
+how many explicitly installed packages need it, and the first few; or,
+in amber, that none do and only dependencies need it (named), or that
+nothing needs it because other installed packages (named) also provide
+what requires it. When some need it and other packages that require it
+are covered, "· others are covered by …" names the providers, so an
+explicitly installed package under "Required by" that is missing here
+has its reason. A package nothing requires gets the orphan line instead:
+as a dependency it is an orphan, which `pacman -Qdt` lists; if something
+has it as an optional dependency, only `pacman -Qdtt` does. A package
+that depends on itself (perl-business-isbn-data) is in its own "Required
+By", so neither lists it; when nothing else requires it, the line says
+so, and it is left out of its own lists. What it is optional for comes
+after. "Required by" and "Optional for" (pacman's "Required By" and
+"Optional For", versions and sonames matched as libalpm matches them)
+and "Explicit packages that need it" open lists of names, the first 12
+until "Show all", with explicitly installed packages marked. A name
+opens that package's detail view, and "Back to <package>" in its header
+returns; closing the view forgets the way back.
+
+"Remove…" in the footer removes the package in the terminal with every
+package that needs it, which pacman would not leave broken: `paru -Rns
+-- <pkg> <what needs it>` (the "remove" step, as from the Installed
+tab), and paru asks before anything goes. All of those are dependencies,
+since the button is off while anything explicitly installed needs the
+package. The command shows under NEEDED BY before the press, which
+reads the local DB again and opens the terminal only if the targets are
+still those. The button is off while an install reason change runs
+(it can make one of them needed), and while its own terminal is open,
+when Dependency and Explicit do nothing either and the line says what
+it waits for; when the step ends, the view and the Installed tab's list
+(once it has been read) read the local DB again, and a failed removal
+says so under NEEDED BY as long as its card is there (the next removal
+of the same packages replaces it, as the next change of a package's
+install reason replaces that one's). The QML fallback
+has neither the section nor the button.
 
 Tabs: **Updates** (below), **Browse** (search repos + AUR, tick builds
 to install together), **Installed** (filter, tick to remove), and
@@ -233,13 +283,17 @@ dir, how sure the tree is (`matched`) and its provenance lines, and
 opens meld. meld is an optional dependency: without it the trees are
 still written, and the error says so.
 
-In the window, a package's detail view has "Compare in meld" beside its
-action button: the selected build against the installed one, or against
-pacman's default when the selected build is the installed one or none
-is (an upgrade's new version is not installed yet), else against the
-first other build offered (the view opens on the installed or default
-build). The other build is meld's left side, the selected one its right.
-The button is off when there is no second build, and while a compare
+In the window, when a package's detail view offers two builds or more,
+each (the AUR's too) has a Compare chip at the end of its row, apart
+from its box: a press picks the build for meld without selecting it,
+and the chip then reads Left or Right, meld's side for it, in the order
+the two were picked. A press on a picked build unpicks it, and a third
+pick replaces the older one. Nothing is picked when the view opens, and
+the picks go when it shows another package (a dependent, Back) or
+closes. "Compare in meld" beside the action button is on with two
+builds picked, and the footer says what it opens ("Compare cachyos-v4
+with extra-x86-64-v4 in meld"), or with one, to pick one more, unless
+it says why the action button is off. The button is off while a compare
 runs; meanwhile the footer says "Fetching sources for meld… (<left>
 against <right>)", and a failure shows in the error bar above it.
 Compares run one at a time across processes too (`compare/.lock`), so

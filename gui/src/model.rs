@@ -115,13 +115,37 @@ pub struct LocalPackage {
     /// What optionally depends on it: then `pacman -Qdt` skips it as a
     /// dependency, and `-Qdtt` lists it.
     pub optional_for: Vec<String>,
+    /// Every installed package that needs it, directly or through others
+    /// (what `pacman -Rc` would take with it): a package that another
+    /// installed one satisfies as well is not among them.
+    pub all_required_by: Vec<String>,
+    /// The explicitly installed packages in all_required_by.
+    pub needed_by_explicit: Vec<String>,
+    /// What satisfies the packages in required_by that do not need it,
+    /// and would stay: why they do not.
+    pub covered_by: Vec<String>,
+    /// The explicitly installed packages among required_by and
+    /// optional_for, which their lists mark.
+    pub explicit_dependents: Vec<String>,
 }
 
 /// What changing a package's install reason would mean, in one line, or
 /// None when it means nothing worth saying.
 pub fn reason_consequence(p: &LocalPackage) -> Option<String> {
-    if !p.installed || !p.required_by.is_empty() {
+    if !p.installed || !requires_only_itself(p) {
         return None;
+    }
+    if !p.required_by.is_empty() {
+        // pacman puts a package that depends on itself in its own Required
+        // By, so -Qdt and -Qdtt never list it.
+        if !p.optional_for.is_empty() {
+            return Some(format!(
+                "Nothing else requires it, only optional for {}: it depends on itself, so pacman -Qdt and -Qdtt never list it.",
+                name_list(&p.optional_for, 4)
+            ));
+        }
+        let what = if p.explicit { "as a dependency it would be an orphan" } else { "it is an orphan" };
+        return Some(format!("Nothing else requires it: {what} that pacman -Qdt never lists, as it depends on itself."));
     }
     if !p.optional_for.is_empty() {
         let names = name_list(&p.optional_for, 4);
@@ -136,6 +160,12 @@ pub fn reason_consequence(p: &LocalPackage) -> Option<String> {
     } else {
         "Nothing requires it: it is an orphan (pacman -Qdt lists it).".into()
     })
+}
+
+/// Nothing but the package itself requires it (perl-business-isbn-data
+/// depends on itself), or nothing at all.
+fn requires_only_itself(p: &LocalPackage) -> bool {
+    p.required_by.iter().all(|n| *n == p.name)
 }
 
 /// "a, b, c and 3 more", with at most `max` names.
@@ -159,6 +189,108 @@ pub fn optional_for_text(names: &[String], max: usize) -> String {
         return String::new();
     }
     format!("Optional for {}", name_list(names, max))
+}
+
+/// The detail view's one line on who needs an installed package, and
+/// whether it is worth a second look (amber): nothing installed on purpose
+/// needs it. Nothing requiring it at all is reason_consequence's line, so
+/// that is said once. None when it is not installed.
+pub fn needed_verdict(p: &LocalPackage) -> Option<(String, bool)> {
+    if !p.installed {
+        return None;
+    }
+    if requires_only_itself(p) {
+        return reason_consequence(p).map(|line| (line, true));
+    }
+    let covers = &p.covered_by;
+    let (mut line, warn) = match p.needed_by_explicit.len() {
+        // An older core's answer, without covered_by.
+        0 if p.all_required_by.is_empty() && covers.is_empty() => {
+            ("Nothing needs it: another installed package satisfies what requires it".to_string(), true)
+        }
+        0 if p.all_required_by.is_empty() => {
+            let verb = if covers.len() == 1 { "provides" } else { "provide" };
+            (format!("Nothing needs it: {} also {verb} what requires it", name_list(covers, 4)), true)
+        }
+        0 => {
+            let what = if p.all_required_by.len() == 1 { "dependency" } else { "dependencies" };
+            (
+                format!("Nothing you installed explicitly needs it, only the {what} {}", name_list(&p.all_required_by, 4)),
+                true,
+            )
+        }
+        n => (
+            format!(
+                "Needed by {n} explicitly installed package{}: {}",
+                if n == 1 { "" } else { "s" },
+                name_list(&p.needed_by_explicit, 4)
+            ),
+            false,
+        ),
+    };
+    // Some need it, and the rest that require it have another provider:
+    // without this, an explicit package in Required by but not here looks
+    // like a mistake.
+    if !p.all_required_by.is_empty() && !covers.is_empty() {
+        line += &format!(" · others are covered by {}", name_list(covers, 4));
+    }
+    if !p.optional_for.is_empty() {
+        line += &format!("; optional for {}", name_list(&p.optional_for, 4));
+    }
+    Some((line, warn))
+}
+
+/// The lists of names the detail view's NEEDED BY section can open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeedList {
+    RequiredBy,
+    OptionalFor,
+    Explicit,
+}
+
+impl NeedList {
+    pub const ALL: [NeedList; 3] = [NeedList::RequiredBy, NeedList::OptionalFor, NeedList::Explicit];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NeedList::RequiredBy => "Required by",
+            NeedList::OptionalFor => "Optional for",
+            NeedList::Explicit => "Explicit packages that need it",
+        }
+    }
+
+    /// Its names, without the package itself: one that depends on itself
+    /// is in its own Required By, and its name would open this same view.
+    pub fn names(self, p: &LocalPackage) -> Vec<String> {
+        let names = match self {
+            NeedList::RequiredBy => &p.required_by,
+            NeedList::OptionalFor => &p.optional_for,
+            NeedList::Explicit => &p.needed_by_explicit,
+        };
+        names.iter().filter(|n| **n != p.name).cloned().collect()
+    }
+}
+
+/// How many names an open list shows before "Show all": the overlay stays
+/// short, and glibc is required by a thousand.
+pub const NAME_LIST_CAP: usize = 12;
+
+/// The names an open list shows, and how many it leaves out.
+pub fn capped(names: &[String], all: bool) -> (&[String], usize) {
+    let shown = if all { names.len() } else { names.len().min(NAME_LIST_CAP) };
+    (&names[..shown], names.len() - shown)
+}
+
+/// What "Remove…" in the detail view passes to `paru -Rns`: the package and
+/// every package that needs it, which pacman would refuse to leave broken
+/// (all of them dependencies nothing explicit needs). None while anything
+/// explicitly installed needs it: that is hers to remove first, and the
+/// verdict says what it is.
+pub fn remove_targets(p: &LocalPackage) -> Option<Vec<String>> {
+    if !p.installed || !p.needed_by_explicit.is_empty() {
+        return None;
+    }
+    Some(std::iter::once(&p.name).chain(&p.all_required_by).cloned().collect())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -871,24 +1003,44 @@ pub fn aur_page(repos: &[RepoOption]) -> Option<String> {
         .map(|o| format!("https://aur.archlinux.org/packages/{}", o.name))
 }
 
-/// The two repositories "Compare in meld" sets side by side, as (left,
-/// right): the selected build against the installed one, or against
-/// pacman's default when the selected build is the installed one or none
-/// is, else against the first other build offered. The detail view opens
-/// on the installed or default build, so without that last step the
-/// button would start greyed out on most packages. None when there is no
-/// second build. The other build goes on the left, as meld reads left to
-/// right: what changes if the selected one is taken.
-pub fn compare_pair(repos: &[RepoOption], selected: &str) -> Option<(String, String)> {
-    let chosen = repos.iter().find(|o| o.target == selected)?;
-    let not_chosen = |o: &&RepoOption| o.target != chosen.target;
-    let base = repos
-        .iter()
-        .find(|o| o.is_installed)
-        .filter(not_chosen)
-        .or_else(|| repos.iter().find(|o| o.is_default).filter(not_chosen))
-        .or_else(|| repos.iter().find(not_chosen))?;
-    Some((base.repo.clone(), chosen.repo.clone()))
+/// The builds picked for "Compare in meld" are their repositories, in the
+/// order they were picked: meld's left pane, then its right. Both are
+/// picked by hand, so no rule has to guess which pair was meant. Picking a
+/// picked build unpicks it; a third pick replaces the older of the two.
+pub fn toggle_compare_pick(picks: &mut Vec<String>, repo: &str) {
+    if let Some(i) = picks.iter().position(|p| p == repo) {
+        picks.remove(i);
+        return;
+    }
+    if picks.len() == 2 {
+        picks.remove(0);
+    }
+    picks.push(repo.to_string());
+}
+
+/// A pick of a build the repo list no longer offers goes.
+pub fn prune_compare_picks(picks: &mut Vec<String>, repos: &[RepoOption]) {
+    picks.retain(|p| repos.iter().any(|o| o.repo == *p));
+}
+
+/// What a build's compare chip reads: the meld pane it is picked for, or
+/// "Compare".
+pub fn compare_pick_label(picks: &[String], repo: &str) -> &'static str {
+    match picks.iter().position(|p| p == repo) {
+        Some(0) => "Left",
+        Some(_) => "Right",
+        None => "Compare",
+    }
+}
+
+/// The footer's note on the picks: what one more pick would do, or what
+/// "Compare in meld" will open. None with nothing picked.
+pub fn compare_picks_note(picks: &[String]) -> Option<String> {
+    match picks {
+        [] => None,
+        [_] => Some("Pick one more build to compare".into()),
+        [left, right, ..] => Some(format!("Compare {left} with {right} in meld")),
+    }
 }
 
 /// The repo build the detail view starts on.
@@ -1051,21 +1203,44 @@ pub fn dismiss_run(cards: &mut Vec<RunReport>, report: &RunReport) {
     cards.retain(|c| c != report);
 }
 
-/// Takes away the cards of earlier install reason changes of `package`
-/// (their command's last word): a new outcome tells the story.
-pub fn drop_reason_cards(cards: &mut Vec<RunReport>, package: Option<&String>) {
-    let Some(package) = package else { return };
-    cards.retain(|c| !(c.step == "reason" && c.command.last() == Some(package)));
+/// Takes away the cards of earlier runs of `step` ("reason", "remove") on
+/// the same packages (command_packages) in any order, since the detail
+/// view names its package first and the Installed tab sorts its ticks: a
+/// new outcome tells the story, and a failure line in the detail view must
+/// not outlive a retry that worked.
+pub fn drop_step_cards(cards: &mut Vec<RunReport>, step: &str, packages: &[String]) {
+    if packages.is_empty() {
+        return;
+    }
+    cards.retain(|c| {
+        let theirs = command_packages(&c.command);
+        !(c.step == step && theirs.len() == packages.len() && theirs.iter().all(|p| packages.contains(p)))
+    });
 }
 
-/// The headline of the failed install reason change of `package` that a
-/// card still shows (dismissing the card ends it here too).
-pub fn reason_failure(cards: &[RunReport], package: &str) -> Option<String> {
+/// The packages a step's command names: the words after its "--"
+/// (`paru -Rns -- a b`, `sudo pacman -D --asdeps -- a`).
+pub fn command_packages(command: &[String]) -> &[String] {
+    command.iter().position(|a| a == "--").map_or(&[], |i| &command[i + 1..])
+}
+
+/// The headline of the failed `step` ("reason", "remove") naming `package`
+/// that a card still shows, if its newest card for that package is a
+/// failure (dismissing the card ends it here too).
+pub fn step_failure(cards: &[RunReport], step: &str, package: &str) -> Option<String> {
     cards
         .iter()
-        .find(|r| r.step == "reason" && r.command.last().is_some_and(|p| p == package))
+        .find(|r| r.step == step && command_packages(&r.command).iter().any(|p| p == package))
         .filter(|r| !r.ok && !r.cancelled)
         .map(|r| r.headline.clone())
+}
+
+/// A removal reported back: it is no longer in flight. Removals are told
+/// apart by their package lists, which the core passes on unchanged.
+pub fn end_removal(removing: &mut Vec<Vec<String>>, packages: &[String]) {
+    if let Some(i) = removing.iter().position(|r| r == packages) {
+        removing.remove(i);
+    }
 }
 
 #[cfg(test)]
@@ -1213,45 +1388,33 @@ mod tests {
     }
 
     #[test]
-    fn meld_compares_the_selected_build_with_the_installed_or_default_one() {
-        let build = |repo: &str, default: bool, installed: bool| RepoOption {
-            repo: repo.into(),
-            name: "nvidia-settings".into(),
-            target: format!("{repo}/nvidia-settings"),
-            is_default: default,
-            is_installed: installed,
-            ..Default::default()
-        };
-        let pair = |l: &str, r: &str| Some((l.to_string(), r.to_string()));
-        let installed_lower = [
-            build("cachyos-v4", true, false),
-            build("extra-x86-64-v4", false, true),
-            build("extra", false, false),
-            build("aur", false, false),
-        ];
-        // Another build against the installed one, the installed one on the left.
-        assert_eq!(compare_pair(&installed_lower, "cachyos-v4/nvidia-settings"), pair("extra-x86-64-v4", "cachyos-v4"));
-        assert_eq!(compare_pair(&installed_lower, "aur/nvidia-settings"), pair("extra-x86-64-v4", "aur"));
-        // The installed build itself goes against pacman's default.
-        assert_eq!(compare_pair(&installed_lower, "extra-x86-64-v4/nvidia-settings"), pair("cachyos-v4", "extra-x86-64-v4"));
+    fn meld_compares_the_two_builds_picked_in_pick_order() {
+        let mut picks: Vec<String> = Vec::new();
+        assert_eq!(compare_picks_note(&picks), None);
+        assert_eq!(compare_pick_label(&picks, "extra"), "Compare");
+        toggle_compare_pick(&mut picks, "cachyos-v4");
+        assert_eq!(compare_picks_note(&picks).as_deref(), Some("Pick one more build to compare"));
+        toggle_compare_pick(&mut picks, "aur");
+        assert_eq!(picks, ["cachyos-v4", "aur"]);
+        assert_eq!((compare_pick_label(&picks, "cachyos-v4"), compare_pick_label(&picks, "aur")), ("Left", "Right"));
+        assert_eq!(compare_picks_note(&picks).as_deref(), Some("Compare cachyos-v4 with aur in meld"));
+        // A third pick replaces the older one, and the newer moves left.
+        toggle_compare_pick(&mut picks, "extra");
+        assert_eq!(picks, ["aur", "extra"]);
+        // Picking a picked build unpicks it; the other one stays.
+        toggle_compare_pick(&mut picks, "aur");
+        assert_eq!(picks, ["extra"]);
+        assert_eq!(compare_pick_label(&picks, "extra"), "Left");
+        toggle_compare_pick(&mut picks, "extra");
+        assert!(picks.is_empty());
 
-        // An upgrade: nothing offered is the installed version.
-        let upgrade = [build("cachyos-v4", true, false), build("extra-x86-64-v4", false, false), build("extra", false, false)];
-        assert_eq!(compare_pair(&upgrade, "extra-x86-64-v4/nvidia-settings"), pair("cachyos-v4", "extra-x86-64-v4"));
-        // ...whose default build, where the Updates tab opens, goes against
-        // the first other one offered.
-        assert_eq!(compare_pair(&upgrade, "cachyos-v4/nvidia-settings"), pair("extra-x86-64-v4", "cachyos-v4"));
-
-        // The installed build is the default one (where the Installed tab
-        // opens): the same.
-        let installed_default = [build("cachyos-v4", true, true), build("extra", false, false)];
-        assert_eq!(compare_pair(&installed_default, "cachyos-v4/nvidia-settings"), pair("extra", "cachyos-v4"));
-        assert_eq!(compare_pair(&installed_default, "extra/nvidia-settings"), pair("cachyos-v4", "extra"));
-
-        // An AUR-only package, and a selection the list no longer offers.
-        assert_eq!(compare_pair(&[build("aur", false, true)], "aur/nvidia-settings"), None);
-        assert_eq!(compare_pair(&installed_lower, ""), None);
-        assert_eq!(compare_pair(&[], "extra/nvidia-settings"), None);
+        // A build the repo list no longer offers is unpicked.
+        let build = |repo: &str| RepoOption { repo: repo.into(), target: format!("{repo}/nvidia-settings"), ..Default::default() };
+        let mut picks: Vec<String> = vec!["extra".into(), "aur".into()];
+        prune_compare_picks(&mut picks, &[build("cachyos-v4"), build("aur")]);
+        assert_eq!(picks, ["aur"]);
+        prune_compare_picks(&mut picks, &[]);
+        assert!(picks.is_empty());
     }
 
     fn switch(name: &str, from: Option<&str>, to: &str) -> Update {
@@ -1918,23 +2081,207 @@ mod tests {
         let mut cards = Vec::new();
         record_run(&mut cards, report("libwpe", false, "a"));
         record_run(&mut cards, report("aria2", false, "b"));
-        assert_eq!(reason_failure(&cards, "libwpe").as_deref(), Some("Install reason change failed: libwpe"));
-        assert_eq!(reason_failure(&cards, "zstd"), None);
+        assert_eq!(step_failure(&cards, "reason", "libwpe").as_deref(), Some("Install reason change failed: libwpe"));
+        assert_eq!(step_failure(&cards, "reason", "zstd"), None);
         // A later outcome of the same package replaces its card; a clean one
         // leaves none, and the line goes.
         let ok = report("libwpe", true, "c");
-        drop_reason_cards(&mut cards, ok.command.last());
+        drop_step_cards(&mut cards, "reason", command_packages(&ok.command));
         record_run(&mut cards, ok);
-        assert_eq!(reason_failure(&cards, "libwpe"), None);
-        assert!(reason_failure(&cards, "aria2").is_some(), "another package's card stays");
+        assert_eq!(step_failure(&cards, "reason", "libwpe"), None);
+        assert!(step_failure(&cards, "reason", "aria2").is_some(), "another package's card stays");
         // A cancel is no failure to tell.
         let mut cancelled = report("aria2", false, "d");
         cancelled.cancelled = true;
-        assert_eq!(reason_failure(&[cancelled], "aria2"), None);
+        assert_eq!(step_failure(&[cancelled], "reason", "aria2"), None);
         // Dismissed: gone here too.
         let card = cards[0].clone();
         dismiss_run(&mut cards, &card);
-        assert_eq!(reason_failure(&cards, "aria2"), None);
+        assert_eq!(step_failure(&cards, "reason", "aria2"), None);
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn who_needs_it_in_one_line() {
+        // An older core's answer has none of the new lists.
+        let mut p: LocalPackage = serde_json::from_value(serde_json::json!({
+            "name": "perl", "installed": true, "version": "5.42.0-1", "explicit": false,
+            "required_by": ["git", "perl-error"], "optional_for": []
+        }))
+        .unwrap();
+        assert!(p.all_required_by.is_empty() && p.needed_by_explicit.is_empty() && p.explicit_dependents.is_empty());
+        assert!(p.covered_by.is_empty());
+        // Explicit packages need it: a plain line.
+        p.all_required_by = names(&["git", "perl-error"]);
+        p.needed_by_explicit = names(&["git", "a", "b", "c", "d"]);
+        assert_eq!(
+            needed_verdict(&p),
+            Some(("Needed by 5 explicitly installed packages: git, a, b, c and 1 more".into(), false))
+        );
+        p.needed_by_explicit = names(&["git"]);
+        p.optional_for = names(&["yt-dlp"]);
+        assert_eq!(
+            needed_verdict(&p),
+            Some(("Needed by 1 explicitly installed package: git; optional for yt-dlp".into(), false))
+        );
+        // Only dependencies need it (a cycle -Qdt cannot see): amber.
+        p.optional_for.clear();
+        p.needed_by_explicit.clear();
+        assert_eq!(
+            needed_verdict(&p),
+            Some(("Nothing you installed explicitly needs it, only the dependencies git, perl-error".into(), true))
+        );
+        p.all_required_by = names(&["perl-error"]);
+        assert!(needed_verdict(&p).unwrap().0.ends_with("only the dependency perl-error"));
+        // Required, but another provider would do (said in general by an
+        // older core, which does not name it).
+        p.all_required_by.clear();
+        assert_eq!(
+            needed_verdict(&p),
+            Some(("Nothing needs it: another installed package satisfies what requires it".into(), true))
+        );
+        // The provider named: ca-certificates on 23/11/2026.
+        p.covered_by = names(&["ca-certificates-utils"]);
+        assert_eq!(
+            needed_verdict(&p),
+            Some(("Nothing needs it: ca-certificates-utils also provides what requires it".into(), true))
+        );
+        p.covered_by = names(&["jdk11-openjdk", "jdk25-graalvm-bin"]);
+        assert_eq!(
+            needed_verdict(&p).unwrap().0,
+            "Nothing needs it: jdk11-openjdk, jdk25-graalvm-bin also provide what requires it"
+        );
+        // Some need it and the others are covered (jdk21-openjdk, whose
+        // Required by lists biglybt, explicit, which another JDK satisfies).
+        p.all_required_by = names(&["intellij-idea-oss"]);
+        p.optional_for = names(&["clion"]);
+        assert_eq!(
+            needed_verdict(&p),
+            Some((
+                "Nothing you installed explicitly needs it, only the dependency intellij-idea-oss \
+                 · others are covered by jdk11-openjdk, jdk25-graalvm-bin; optional for clion"
+                    .into(),
+                true
+            ))
+        );
+        p.needed_by_explicit = names(&["intellij-idea-oss"]);
+        assert_eq!(
+            needed_verdict(&p).unwrap().0,
+            "Needed by 1 explicitly installed package: intellij-idea-oss \
+             · others are covered by jdk11-openjdk, jdk25-graalvm-bin; optional for clion"
+        );
+        p.needed_by_explicit.clear();
+        p.optional_for.clear();
+        p.all_required_by.clear();
+        p.covered_by.clear();
+        // Nothing requires it: reason_consequence's line, said once.
+        p.required_by.clear();
+        let (line, warn) = needed_verdict(&p).unwrap();
+        assert!(warn && line.starts_with("Nothing requires it: it is an orphan"), "{line}");
+        // Only itself (it depends on itself): an orphan all the same, one
+        // that -Qdt misses.
+        p.required_by = names(&["perl"]);
+        let (line, warn) = needed_verdict(&p).unwrap();
+        assert!(warn && line.starts_with("Nothing else requires it: it is an orphan"), "{line}");
+        assert!(line.contains("pacman -Qdt never lists"), "{line}");
+        p.optional_for = names(&["yt-dlp"]);
+        assert!(needed_verdict(&p).unwrap().0.contains("only optional for yt-dlp: it depends on itself"));
+        assert!(NeedList::RequiredBy.names(&p).is_empty(), "no link to the view already open");
+        p.installed = false;
+        assert_eq!(needed_verdict(&p), None);
+    }
+
+    #[test]
+    fn need_lists_cap_and_remove_targets() {
+        let many: Vec<String> = (0..30).map(|i| format!("p{i:02}")).collect();
+        let (shown, left) = capped(&many, false);
+        assert_eq!((shown.len(), left, shown[11].as_str()), (NAME_LIST_CAP, 18, "p11"));
+        assert_eq!(capped(&many, true), (&many[..], 0));
+        assert_eq!(capped(&many[..3], false), (&many[..3], 0));
+        assert_eq!(capped(&[], false).1, 0);
+
+        let mut p = LocalPackage {
+            name: "jdk21-openjdk".into(),
+            installed: true,
+            required_by: names(&["biglybt", "intellij-idea-oss"]),
+            optional_for: names(&["clion"]),
+            all_required_by: names(&["intellij-idea-oss"]),
+            explicit_dependents: names(&["biglybt", "clion"]),
+            ..Default::default()
+        };
+        assert_eq!(NeedList::RequiredBy.names(&p), ["biglybt", "intellij-idea-oss"]);
+        assert_eq!(NeedList::OptionalFor.names(&p), ["clion"]);
+        assert!(NeedList::Explicit.names(&p).is_empty());
+        // Nothing explicit needs it: it goes with what needs it.
+        assert_eq!(remove_targets(&p), Some(names(&["jdk21-openjdk", "intellij-idea-oss"])));
+        p.all_required_by.clear();
+        assert_eq!(remove_targets(&p), Some(names(&["jdk21-openjdk"])));
+        // Something explicit needs it: no removal offered.
+        p.all_required_by = names(&["intellij-idea-oss"]);
+        p.needed_by_explicit = names(&["intellij-idea-oss"]);
+        assert_eq!(remove_targets(&p), None);
+        assert_eq!(remove_targets(&LocalPackage { name: "gone".into(), ..Default::default() }), None);
+    }
+
+    #[test]
+    fn a_removal_is_in_flight_until_its_step_reports() {
+        let command = names(&["paru", "-Rns", "--", "jdk21-openjdk", "intellij-idea-oss"]);
+        assert_eq!(command_packages(&command), ["jdk21-openjdk", "intellij-idea-oss"]);
+        assert!(command_packages(&names(&["paru", "-Rns"])).is_empty());
+        let mut removing = vec![names(&["a", "b"]), names(&["jdk21-openjdk", "intellij-idea-oss"]), names(&["a", "b"])];
+        end_removal(&mut removing, command_packages(&command));
+        assert_eq!(removing, [names(&["a", "b"]), names(&["a", "b"])]);
+        end_removal(&mut removing, &names(&["a", "b"]));
+        assert_eq!(removing, [names(&["a", "b"])], "one report ends one removal");
+        end_removal(&mut removing, &names(&["b"]));
+        assert_eq!(removing.len(), 1, "a list that only overlaps is another removal");
+        // A failed removal is told for every package it named.
+        let failed = RunReport {
+            id: "r".into(),
+            step: "remove".into(),
+            command,
+            headline: "Removal failed (exit status 1)".into(),
+            ..Default::default()
+        };
+        let mut cards = vec![failed.clone()];
+        assert!(step_failure(&cards, "remove", "intellij-idea-oss").is_some());
+        assert_eq!(step_failure(&cards, "reason", "intellij-idea-oss"), None);
+        assert_eq!(step_failure(&cards, "remove", "paru"), None);
+        // A later removal of the same packages tells the story: one that
+        // worked leaves no card, and no stale failure line.
+        let other_set = RunReport { id: "s".into(), command: names(&["paru", "-Rns", "--", "jdk21-openjdk"]), ..failed.clone() };
+        let reason = RunReport { id: "t".into(), step: "reason".into(), ..failed.clone() };
+        record_run(&mut cards, other_set);
+        record_run(&mut cards, reason);
+        let ok = RunReport { id: "u".into(), ok: true, headline: String::new(), ..failed };
+        drop_step_cards(&mut cards, &ok.step, command_packages(&ok.command));
+        record_run(&mut cards, ok);
+        assert_eq!(step_failure(&cards, "remove", "intellij-idea-oss"), None);
+        let left: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(left, ["t", "s"], "another set's removal, and another step, keep their cards");
+        // The same set from the Installed tab comes sorted: still the same
+        // removal, so the detail view's failed one goes.
+        record_run(
+            &mut cards,
+            RunReport {
+                id: "v".into(),
+                step: "remove".into(),
+                command: names(&["paru", "-Rns", "--", "jdk21-openjdk", "intellij-idea-oss"]),
+                headline: "Removal failed (exit status 1)".into(),
+                ..Default::default()
+            },
+        );
+        assert!(step_failure(&cards, "remove", "intellij-idea-oss").is_some());
+        let sorted = names(&["paru", "-Rns", "--", "intellij-idea-oss", "jdk21-openjdk"]);
+        drop_step_cards(&mut cards, "remove", command_packages(&sorted));
+        assert_eq!(step_failure(&cards, "remove", "intellij-idea-oss"), None);
+        assert_eq!(cards.len(), 2, "jdk21-openjdk's removal alone is another set");
+        // A command without "--" names no packages, and drops nothing.
+        drop_step_cards(&mut cards, "remove", &[]);
+        assert_eq!(cards.len(), 2);
     }
 
     #[test]

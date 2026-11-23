@@ -184,6 +184,18 @@ pub fn filter_toggle(label: &'static str, on: Signal<bool>) -> Div {
     filter_chip(label, on).flex_none()
 }
 
+/// A filter chip whose press does `toggle` and nothing else: a clickable
+/// row it sits in does not also take the press as its own.
+pub fn toggle_chip(
+    label: impl Fn() -> &'static str + 'static,
+    on: impl Fn() -> bool + 'static,
+    toggle: impl Fn() + 'static,
+) -> Div {
+    filter_chip(label, Binding::new(on, move |_| toggle()))
+        .flex_none()
+        .on_click(|e: &PointerEvent| e.stop_propagation())
+}
+
 /// The wavy line of something that takes as long as it takes, across the
 /// width it is given. It is drawn into the gap under it (the bottom margin
 /// takes its height back), so it costs the layout nothing and what is below

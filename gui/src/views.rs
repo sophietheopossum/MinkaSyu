@@ -2124,6 +2124,13 @@ fn detail_overlay(app: App) -> Div {
             move |o| untrack(|| repo_option_row(app, o)),
         ))
         .child(show(
+            move || app.repos.with(|r| aur_page(&r.data).is_some()),
+            move || {
+                let url = move || app.repos.with(|r| aur_page(&r.data)).unwrap_or_default();
+                text_button(url, PURPLE, move || open_url(&url()))
+            },
+        ))
+        .child(show(
             move || app.appstream.with(|a| a.loading),
             || ui_text("Loading AppStream data…", FONT_SIZE - 1.0_f32, TEXT_MUTED),
         ))

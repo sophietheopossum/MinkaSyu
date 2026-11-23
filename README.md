@@ -48,6 +48,9 @@ command preview lists them under `--ignore` (the group as
 `(no recorded repository)`). The core drops those names before paru
 runs: an unticked switch or reinstall is only left out.
 
+When the AUR has a package, its detail view links to the package's AUR
+page (comments, votes, maintainer) under the repository builds.
+
 The detail view of an installed package shows its install reason as
 two buttons, Dependency and Explicit, with what requires it and what it
 is optional for (pacman's "Required By" and "Optional For", versions

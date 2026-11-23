@@ -738,6 +738,16 @@ pub fn age_label(verb: &str, at: i64, now: i64) -> String {
     }
 }
 
+/// The AUR's page for a package the detail view offers an AUR build of,
+/// where its comments (build problems get reported there), votes and
+/// maintainer are.
+pub fn aur_page(repos: &[RepoOption]) -> Option<String> {
+    repos
+        .iter()
+        .find(|o| o.repo == "aur")
+        .map(|o| format!("https://aur.archlinux.org/packages/{}", o.name))
+}
+
 /// The repo build the detail view starts on.
 pub fn default_detail_target(
     context: Context,
@@ -1036,6 +1046,26 @@ mod tests {
         };
         assert!(
             upgrade_blocked_reason(Context::Updates, Some(&own), &[u], &BTreeSet::new()).is_none()
+        );
+    }
+
+    #[test]
+    fn aur_page_only_when_the_aur_offers_it() {
+        let repo = RepoOption {
+            name: "lib32-taglib".into(),
+            repo: "multilib".into(),
+            target: "multilib/lib32-taglib".into(),
+            ..Default::default()
+        };
+        assert_eq!(aur_page(std::slice::from_ref(&repo)), None);
+        let aur = RepoOption {
+            repo: "aur".into(),
+            target: "aur/lib32-taglib".into(),
+            ..repo.clone()
+        };
+        assert_eq!(
+            aur_page(&[repo, aur]).as_deref(),
+            Some("https://aur.archlinux.org/packages/lib32-taglib")
         );
     }
 

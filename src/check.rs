@@ -1659,19 +1659,28 @@ pub fn aur_info_form(names: &[String]) -> String {
     names.iter().map(|n| format!("arg%5B%5D={}", encode(n))).collect::<Vec<_>>().join("&")
 }
 
-/// Which of `names` the AUR has, with its versions: one RPC info request,
-/// POSTed so any number of names fits (what paru asks for its foreign
-/// packages anyway), through curl, as the window fetches screenshots.
+/// The User-Agent of every request MinkaSyu makes itself: generic, the
+/// program and its version only.
+pub const USER_AGENT: &str = concat!("minka-syu/", env!("CARGO_PKG_VERSION"));
+
+/// Which of `names` the AUR has, with its versions (what paru asks for its
+/// foreign packages anyway).
 fn aur_versions(names: &[String]) -> Result<HashMap<String, String>, String> {
-    use std::io::Write;
     if names.is_empty() {
         return Ok(HashMap::new());
     }
+    parse_aur_info(&aur_info(names)?)
+}
+
+/// The AUR's answer to one RPC info request about `names`, POSTed so any
+/// number of names fits, through curl, as the window fetches screenshots.
+pub fn aur_info(names: &[String]) -> Result<String, String> {
+    use std::io::Write;
     let url = std::env::var("MINKA_SYU_AUR_RPC").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| AUR_INFO_URL.to_string());
     let mut child = Command::new("curl")
         // It answers in well under a second; a host that never answers
         // costs 5 s, not the 30 of a plain --max-time.
-        .args(["-sS", "--fail", "--connect-timeout", "5", "--max-time", "15", "-A", "minka-syu", "--data-binary", "@-", "--"])
+        .args(["-sS", "--fail", "--connect-timeout", "5", "--max-time", "15", "-A", USER_AGENT, "--data-binary", "@-", "--"])
         .arg(&url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1686,7 +1695,7 @@ fn aur_versions(names: &[String]) -> Result<HashMap<String, String>, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("curl failed").trim().to_string());
     }
-    parse_aur_info(&String::from_utf8_lossy(&out.stdout))
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn home_dir() -> PathBuf {
@@ -1704,11 +1713,13 @@ pub fn state_path() -> PathBuf {
     state_dir().join("state.json")
 }
 
-fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".cache"));
-    base.join("minka-syu")
+/// $XDG_CACHE_HOME, or ~/.cache: where MinkaSyu's cache is, and paru's.
+pub fn xdg_cache_home() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|| home_dir().join(".cache"))
+}
+
+pub fn cache_dir() -> PathBuf {
+    xdg_cache_home().join("minka-syu")
 }
 
 /// The throwaway pacman DB root a check refreshes. Browsing reads it

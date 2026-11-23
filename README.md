@@ -219,3 +219,83 @@ When the AUR cannot be asked, no package of the first kind is flagged
 (most are AUR packages) and an amber note says so instead. A package
 whose recorded repository moved past it is tracked by that repository,
 and a row (an update, a replacement) keeps a package off the list.
+
+## Comparing sources
+
+`minka-syu compare <pkg> <repo-a> <repo-b>` opens meld on the source
+trees (the PKGBUILD and the files beside it) behind two repositories'
+builds of a package, `aur` standing for the AUR's current version:
+`minka-syu compare nvidia-settings cachyos-v4 extra-x86-64-v4`. With
+`--print` it only prints where the two trees are and where they came
+from. `serve` has it as `compare` {package, left, right}, on a thread of
+its own; it answers {package, left, right}, each side's repo, version,
+dir, how sure the tree is (`matched`) and its provenance lines, and
+opens meld. meld is an optional dependency: without it the trees are
+still written, and the error says so.
+
+In the window, a package's detail view has "Compare in meld" beside its
+action button: the selected build against the installed one, or against
+pacman's default when the selected build is the installed one or none
+is (an upgrade's new version is not installed yet), else against the
+first other build offered (the view opens on the installed or default
+build). The other build is meld's left side, the selected one its right.
+The button is off when there is no second build, and while a compare
+runs; meanwhile the footer says "Fetching sources for meld… (<left>
+against <right>)", and a failure shows in the error bar above it.
+Compares run one at a time across processes too (`compare/.lock`), so
+the window and the command line never write one tree at once. The QML
+fallback has no such button.
+
+Who built a package decides where its tree is, told by repository and
+packager, never by architecture or a ".N" suffix (CachyOS's v4
+repositories have x86_64 files with ".1", like ALHP's):
+
+- Arch (`core`, `extra`, `multilib`): the package base's GitLab project
+  at the tag of its version, exact by construction (Arch's repositories
+  take a package only with the PKGBUILD at its signed tag).
+- ALHP and CachyOS's rebuilds of Arch (`cachyos-core-v4`,
+  `cachyos-extra-v4`): that tag for the version less its ".N", with the
+  pkgrel line rewritten to the suffixed one, as they build it (ALHP's
+  builds since 21/9/2026 also turn a `name<=V-R` in conflicts or replaces
+  into `name<V-(R+1)`; the .BUILDINFO hash says which form a build used).
+  The rest of the difference is build flags: ALHP publishes its
+  makepkg.conf (alhp.dev/makepkg), CachyOS does not.
+- CachyOS's own packages (`cachyos`, `cachyos-v4`, ...): CachyOS-PKGBUILDS,
+  linux-cachyos or cachyos-aur-derived on GitHub, at the commit whose
+  PKGBUILD has the sha256 the build's .BUILDINFO names (also as CachyOS's
+  builder edits it: its `_optimize_v4` switch on, or without the final
+  newline), else the newest commit naming the version by the build date
+  (plus 2 days, as CachyOS's commits can trail its builds), else the
+  newest commit before the build, marked approximate. Every repository
+  is searched (a pkgbase can be in two), and for `cachyos` the AUR's
+  history too, as it is or with the pkgrel rewritten: it built AUR
+  PKGBUILDs before cachyos-aur-derived began. A hash match whose local
+  files do not match the PKGBUILD's checksums says so ("PKGBUILD exact;
+  local files … differ": gcc's patches were never published). Kernels
+  are always approximate: their builder edits each variant's PKGBUILD.
+- The AUR: the package base's git repository, at the commit a built
+  package in the pacman cache or paru's clone directory names, else the
+  newest commit naming the version (by the installed build's date when
+  it is paru's build).
+- `[minka]`: MinkaPKG, the checkout minkarepo lives in, only read: the
+  commit the build's .BUILDINFO names, else the uncommitted working tree
+  when its PKGBUILD is that one, else a commit naming the version,
+  marked unverified.
+- Any other repository (kotontrion): "no known source".
+
+A repository build's .BUILDINFO comes from `/var/cache/pacman/pkg`, or
+else the first 256 KiB of the package from its repository's servers
+(`pacman-conf -r`); it also marks Arch, ALHP and rebuild trees as
+hash-verified or not. Each tree is written afresh to
+`$XDG_CACHE_HOME/minka-syu/compare/<repo>/<pkgbase>/<version>/` with a
+`MINKA-SYU-SOURCE.txt` on top (repository, package, pkgbase, version,
+packager, build date, source and revision, how it was matched, build
+flags), the same name on both sides so meld lines them up. The GitHub
+and AUR clones are kept under `compare/git/` (CachyOS's blobless) and
+fetched again after 10 minutes. What is downloaded is only data: no
+PKGBUILD is sourced or built, archives are unpacked with bsdtar's
+defaults (no absolute paths, no `..`, nothing written through a
+symlink), a symlink in a tree becomes a file saying where it pointed
+(meld would follow it), and requests carry a generic
+`minka-syu/<version>` user agent, with git run without the user's
+configuration and unable to prompt for credentials.

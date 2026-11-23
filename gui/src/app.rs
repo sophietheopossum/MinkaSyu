@@ -85,6 +85,10 @@ pub struct App {
     pub reason_busy: Signal<Option<String>>,
     /// The first screenshot, once downloaded (images load from files only).
     pub shot: Signal<Option<PathBuf>>,
+    /// The compare in flight, as (package, the note the detail view shows
+    /// meanwhile). One at a time: two compares of one build would write
+    /// the same directory.
+    pub comparing: Signal<Option<(String, String)>>,
 
     pub sources: Signal<Option<Sources>>,
     pub sources_loading: Signal<bool>,
@@ -143,6 +147,7 @@ impl App {
             local: signal(Loaded::default()),
             reason_busy: signal(None),
             shot: signal(None),
+            comparing: signal(None),
             sources: signal(None),
             sources_loading: signal(false),
             sources_gen: signal(0),
@@ -646,6 +651,35 @@ impl App {
             Context::Installed => self.install(vec![option.target.clone()]),
         }
         self.close_detail();
+    }
+
+    /// Opens meld on the source trees behind the selected build and the
+    /// one compare_pair sets against it. The core fetches them (a few
+    /// seconds cold) and starts meld; its errors, meld missing among them,
+    /// land in the error bar.
+    pub fn compare_in_meld(self) {
+        if self.comparing.with_untracked(|c| c.is_some()) {
+            return;
+        }
+        let Some(option) = untrack(|| self.selected_option()) else {
+            return;
+        };
+        let Some((left, right)) = self.repos.with_untracked(|r| compare_pair(&r.data, &option.target)) else {
+            return;
+        };
+        self.error.set(String::new());
+        let note = format!("Fetching sources for meld… ({left} against {right})");
+        self.comparing.set(Some((option.name.clone(), note)));
+        core::request(
+            "compare",
+            json!({ "package": option.name, "left": left, "right": right }),
+            move |reply| {
+                self.comparing.set(None);
+                if let Err(e) = reply {
+                    self.error.set(e);
+                }
+            },
+        );
     }
 
     /// Screenshots are URLs; the toolkit loads images from files only, so

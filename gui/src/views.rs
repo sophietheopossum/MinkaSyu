@@ -2212,6 +2212,13 @@ fn detail_overlay(app: App) -> Div {
             }
         }
     };
+    // While this package's sources are fetched for meld, the note says so.
+    let comparing = move || {
+        let name = app.detail.with(|d| d.as_ref().map(|d| d.name.clone()))?;
+        app.comparing
+            .with(|c| c.as_ref().filter(|(p, _)| *p == name).map(|(_, note)| note.clone()))
+    };
+    let warning = move || if comparing().is_some() { None } else { blocked() };
     let footer_row = div()
         .w_full()
         .flex()
@@ -2221,22 +2228,21 @@ fn detail_overlay(app: App) -> Div {
         .child(
             div().flex_1().min_w(0.0_f32).child(
                 mono_text(
-                    move || match blocked() {
-                        Some(reason) => reason,
-                        None => {
+                    move || {
+                        comparing().or_else(blocked).unwrap_or_else(|| {
                             let t = app.detail_target.get();
                             if t.is_empty() {
                                 "No repository build selected.".into()
                             } else {
                                 format!("Selected build: {t}")
                             }
-                        }
+                        })
                     },
                     FONT_SIZE - 2.0_f32,
                     TEXT_FAINT,
                 )
                 .dyn_style(move |s| {
-                    s.text_color(color(if blocked().is_some() {
+                    s.text_color(color(if warning().is_some() {
                         WARN_AMBER
                     } else {
                         TEXT_FAINT
@@ -2244,6 +2250,16 @@ fn detail_overlay(app: App) -> Div {
                 }),
             ),
         )
+        .child(push_button(
+            || "Compare in meld".into(),
+            false,
+            move || {
+                let target = app.detail_target.get();
+                app.comparing.with(|c| c.is_none())
+                    && app.repos.with(|r| compare_pair(&r.data, &target).is_some())
+            },
+            move || app.compare_in_meld(),
+        ))
         .child(push_button(
             action_label,
             false,
@@ -2279,6 +2295,9 @@ fn detail_overlay(app: App) -> Div {
                 .on_click(|e: &PointerEvent| e.stop_propagation())
                 .child(header)
                 .child(scroller(body))
+                // The window's own error bar is under the scrim: a compare
+                // that fails must say so where it was asked for.
+                .child(error_bar(app))
                 .child(footer_row),
         )
 }

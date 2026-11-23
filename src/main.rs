@@ -18,6 +18,11 @@
 //!   sources [--refresh]
 //!                      MinkaPKG packages vs upstream, through
 //!                      `minkarepo check` (JSON; cached unless --refresh)
+//!   compare <pkg> <repo-a> <repo-b> [--print]
+//!                      the source trees behind two repositories' builds
+//!                      of a package ("aur" for the AUR's), written to the
+//!                      cache dir and opened in meld (--print: only say
+//!                      where they are and where they came from)
 //!   ui                 open the window: the AntiWebUI front end
 //!                      (minka-syu-gui), or Quickshell when it is missing
 //!                      or MINKA_SYU_FRONTEND=quickshell
@@ -38,6 +43,7 @@ mod alpm;
 mod appstream;
 mod catalog;
 mod check;
+mod compare;
 mod run;
 mod sources;
 
@@ -62,6 +68,7 @@ fn main() {
         "remove" => cmd_packages(false, rest.contains(&"--dry-run"), &positional(&rest), Report::Wait),
         "reason" => cmd_reason(&rest),
         "sources" => cmd_sources(rest.contains(&"--refresh")),
+        "compare" => cmd_compare(&positional(&rest), rest.contains(&"--print")),
         "ui" => cmd_ui(),
         "run" => match run::run_verb(&rest) {
             Ok(code) => std::process::exit(code),
@@ -73,7 +80,7 @@ fn main() {
         }
         other => {
             eprintln!(
-                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|reason|sources|ui|serve)"
+                "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|reason|sources|compare|ui|serve)"
             );
             std::process::exit(2);
         }
@@ -773,6 +780,26 @@ fn cmd_sources(refresh: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `compare <pkg> <repo-a> <repo-b>`: each tree's directory and where it
+/// came from, then meld on the two, unless --print.
+fn cmd_compare(args: &[String], print: bool) -> Result<(), String> {
+    let [package, left, right] = args else {
+        return Err("compare takes a package and two repositories (aur for the AUR)".to_string());
+    };
+    let c = compare::compare(package, left, right)?;
+    for side in [&c.left, &c.right] {
+        println!("{}", side.dir);
+        if print {
+            for line in &side.provenance {
+                println!("  {line}");
+            }
+        } else {
+            println!("  {}", side.matched);
+        }
+    }
+    if print { Ok(()) } else { compare::open_meld(&c) }
+}
+
 /// The front end binary: $MINKA_SYU_GUI, `minka-syu-gui` beside this
 /// binary (installed, both are in /usr/bin; in a checkout, gui/target
 /// is searched too), then PATH.
@@ -1014,6 +1041,14 @@ fn dispatch(
             let found = sources::set_tracked(package, tracked).map_err(error_code)?;
             serde_json::to_value(found).map_err(|e| Error::internal(e.to_string()))
         }
+        "compare" => {
+            let text = |key: &str| {
+                params.get(key).and_then(|v| v.as_str()).ok_or_else(|| error_code(format!("compare needs {key}")))
+            };
+            let c = compare::compare(text("package")?, text("left")?, text("right")?).map_err(error_code)?;
+            compare::open_meld(&c).map_err(error_code)?;
+            serde_json::to_value(c).map_err(|e| Error::internal(e.to_string()))
+        }
         "sources_update" => {
             let packages = string_array(params, "packages");
             if packages.is_empty() {
@@ -1063,11 +1098,12 @@ fn handle_line(state: &mut State, line: &str, out: &mut impl Write) {
     let _ = out.flush();
 }
 
-/// Methods that only run minkarepo (network, tens of seconds) get a
-/// thread of their own, so a slow sources check never holds up the
+/// Methods that only run minkarepo or fetch sources (network, seconds to
+/// tens of seconds) get a thread of their own, so they never hold up the
 /// update list. Every other method stays in order on the main loop:
-/// check, search and the catalog share the throwaway sync databases.
-const THREADED: &[&str] = &["sources", "sources_track"];
+/// check, search and the catalog share the throwaway sync databases
+/// (compare only reads them, with one `pacman -Sp` per side).
+const THREADED: &[&str] = &["sources", "sources_track", "compare"];
 
 fn serve() {
     let mut state = state_or_empty();
@@ -1570,6 +1606,19 @@ mod tests {
             "required by p0, p1, p2, p3, p4, p5 and 3 more; --json lists them all"
         );
         assert_eq!(needed_text(&[], &["yt-dlp".into()], 6, "x"), "nothing requires it; optional for yt-dlp");
+    }
+
+    #[test]
+    fn compare_requests_are_checked_before_anything_runs() {
+        let mut state = state_or_empty();
+        let mut ask = |params: serde_json::Value| dispatch(&mut state, "compare", &params).err().map(|e| (e.code, e.message));
+        let missing = ask(serde_json::json!({"package": "perl", "left": "core"}));
+        assert_eq!(missing, Some(("bad_request", "compare needs right".to_string())));
+        let forged = ask(serde_json::json!({"package": "perl", "left": "core", "right": "--help"}));
+        assert_eq!(forged, Some(("bad_request", "invalid repository name: \"--help\"".to_string())));
+        let same = ask(serde_json::json!({"package": "perl", "left": "core", "right": "core"}));
+        assert!(same.is_some_and(|(_, m)| m.starts_with("core twice")));
+        assert!(THREADED.contains(&"compare"), "fetching sources must never hold up the update list");
     }
 
     #[test]

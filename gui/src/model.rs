@@ -871,6 +871,26 @@ pub fn aur_page(repos: &[RepoOption]) -> Option<String> {
         .map(|o| format!("https://aur.archlinux.org/packages/{}", o.name))
 }
 
+/// The two repositories "Compare in meld" sets side by side, as (left,
+/// right): the selected build against the installed one, or against
+/// pacman's default when the selected build is the installed one or none
+/// is, else against the first other build offered. The detail view opens
+/// on the installed or default build, so without that last step the
+/// button would start greyed out on most packages. None when there is no
+/// second build. The other build goes on the left, as meld reads left to
+/// right: what changes if the selected one is taken.
+pub fn compare_pair(repos: &[RepoOption], selected: &str) -> Option<(String, String)> {
+    let chosen = repos.iter().find(|o| o.target == selected)?;
+    let not_chosen = |o: &&RepoOption| o.target != chosen.target;
+    let base = repos
+        .iter()
+        .find(|o| o.is_installed)
+        .filter(not_chosen)
+        .or_else(|| repos.iter().find(|o| o.is_default).filter(not_chosen))
+        .or_else(|| repos.iter().find(not_chosen))?;
+    Some((base.repo.clone(), chosen.repo.clone()))
+}
+
 /// The repo build the detail view starts on.
 pub fn default_detail_target(
     context: Context,
@@ -1190,6 +1210,48 @@ mod tests {
             aur_page(&[repo, aur]).as_deref(),
             Some("https://aur.archlinux.org/packages/lib32-taglib")
         );
+    }
+
+    #[test]
+    fn meld_compares_the_selected_build_with_the_installed_or_default_one() {
+        let build = |repo: &str, default: bool, installed: bool| RepoOption {
+            repo: repo.into(),
+            name: "nvidia-settings".into(),
+            target: format!("{repo}/nvidia-settings"),
+            is_default: default,
+            is_installed: installed,
+            ..Default::default()
+        };
+        let pair = |l: &str, r: &str| Some((l.to_string(), r.to_string()));
+        let installed_lower = [
+            build("cachyos-v4", true, false),
+            build("extra-x86-64-v4", false, true),
+            build("extra", false, false),
+            build("aur", false, false),
+        ];
+        // Another build against the installed one, the installed one on the left.
+        assert_eq!(compare_pair(&installed_lower, "cachyos-v4/nvidia-settings"), pair("extra-x86-64-v4", "cachyos-v4"));
+        assert_eq!(compare_pair(&installed_lower, "aur/nvidia-settings"), pair("extra-x86-64-v4", "aur"));
+        // The installed build itself goes against pacman's default.
+        assert_eq!(compare_pair(&installed_lower, "extra-x86-64-v4/nvidia-settings"), pair("cachyos-v4", "extra-x86-64-v4"));
+
+        // An upgrade: nothing offered is the installed version.
+        let upgrade = [build("cachyos-v4", true, false), build("extra-x86-64-v4", false, false), build("extra", false, false)];
+        assert_eq!(compare_pair(&upgrade, "extra-x86-64-v4/nvidia-settings"), pair("cachyos-v4", "extra-x86-64-v4"));
+        // ...whose default build, where the Updates tab opens, goes against
+        // the first other one offered.
+        assert_eq!(compare_pair(&upgrade, "cachyos-v4/nvidia-settings"), pair("extra-x86-64-v4", "cachyos-v4"));
+
+        // The installed build is the default one (where the Installed tab
+        // opens): the same.
+        let installed_default = [build("cachyos-v4", true, true), build("extra", false, false)];
+        assert_eq!(compare_pair(&installed_default, "cachyos-v4/nvidia-settings"), pair("extra", "cachyos-v4"));
+        assert_eq!(compare_pair(&installed_default, "extra/nvidia-settings"), pair("cachyos-v4", "extra"));
+
+        // An AUR-only package, and a selection the list no longer offers.
+        assert_eq!(compare_pair(&[build("aur", false, true)], "aur/nvidia-settings"), None);
+        assert_eq!(compare_pair(&installed_lower, ""), None);
+        assert_eq!(compare_pair(&[], "extra/nvidia-settings"), None);
     }
 
     fn switch(name: &str, from: Option<&str>, to: &str) -> Update {

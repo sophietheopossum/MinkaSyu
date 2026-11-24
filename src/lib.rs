@@ -558,8 +558,18 @@ pub fn apply_argv() -> Vec<String> {
     upgrade_argv(&[])
 }
 
-pub fn install_argv(packages: &[String]) -> Vec<String> {
-    let mut argv = vec![terminal(), "-e".into(), "paru".into(), "-S".into(), "--sudoloop".into(), "--".into()];
+/// The terminal argv for an install. The window offers what the check's
+/// copy of the sync DBs holds; when the system's own are older (no `-Sy`
+/// since that check), plain `-S` reads those instead, and a package
+/// published since is "target not found" (minkade, 24/11/2026) while an
+/// older build's file may be gone from the mirror. Refreshing them
+/// without upgrading is a partial upgrade, so the install then goes with
+/// a full upgrade, the way Arch says to install against new lists:
+/// `-Syu name`. paru shows the whole transaction before it starts;
+/// IgnorePkg still holds packages back.
+pub fn install_argv(packages: &[String], lists_current: bool) -> Vec<String> {
+    let op = if lists_current { "-S" } else { "-Syu" };
+    let mut argv = vec![terminal(), "-e".into(), "paru".into(), op.into(), "--sudoloop".into(), "--".into()];
     argv.extend(packages.iter().cloned());
     argv
 }
@@ -714,7 +724,11 @@ fn cmd_packages(install: bool, dry_run: bool, packages: &[String], report: Repor
     } else {
         validate_names(packages, "remove")?;
     }
-    let argv = if install { install_argv(packages) } else { remove_argv(packages) };
+    let argv = if install {
+        install_argv(packages, check::system_lists_match_check())
+    } else {
+        remove_argv(packages)
+    };
     launch_step(&argv, if install { "install" } else { "remove" }, dry_run, report)
 }
 
@@ -1207,8 +1221,10 @@ mod tests {
 
     #[test]
     fn package_argv_forms() {
-        let i = install_argv(&["ripgrep".into()]);
+        let i = install_argv(&["ripgrep".into()], true);
         assert_eq!(&i[2..], ["paru", "-S", "--sudoloop", "--", "ripgrep"]);
+        let i = install_argv(&["minka/minkade".into()], false);
+        assert_eq!(&i[2..], ["paru", "-Syu", "--sudoloop", "--", "minka/minkade"]);
         let r = remove_argv(&["ripgrep".into(), "fd".into()]);
         assert_eq!(&r[2..], ["paru", "-Rns", "--", "ripgrep", "fd"]);
     }

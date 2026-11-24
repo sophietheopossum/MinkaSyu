@@ -1729,6 +1729,35 @@ pub fn checkdb_path() -> PathBuf {
     cache_dir().join("checkdb")
 }
 
+/// Whether the system's sync DBs are the lists the window shows: every
+/// repository in pacman.conf has the same database in the checker's copy
+/// as in /var/lib/pacman. With no copy yet, browsing read the system's
+/// own lists, so they match by definition. When pacman-conf cannot list
+/// the repos, they count as different (an install then refreshes them).
+pub fn system_lists_match_check() -> bool {
+    let checker = checkdb_path().join("sync");
+    if !checker.exists() {
+        return true;
+    }
+    let Ok(repos) = run_capture("pacman-conf", &["--repo-list"]) else {
+        return false;
+    };
+    let repos: Vec<&str> = repos.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    sync_dbs_match(&repos, &checker, Path::new("/var/lib/pacman/sync"))
+}
+
+/// Byte for byte, `<repo>.db` in one sync directory against the other. A
+/// database missing from either side is a difference.
+fn sync_dbs_match(repos: &[&str], a: &Path, b: &Path) -> bool {
+    repos.iter().all(|repo| {
+        let file = format!("{repo}.db");
+        match (std::fs::read(a.join(&file)), std::fs::read(b.join(&file))) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    })
+}
+
 pub fn load_state() -> Option<State> {
     let text = std::fs::read_to_string(state_path()).ok()?;
     serde_json::from_str(&text).ok()
@@ -2090,6 +2119,28 @@ pub fn maybe_notify(state: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_dbs_match_byte_for_byte_and_every_repo() {
+        let root = std::env::temp_dir().join(format!("minka-syu-check-test-{}-syncdbs", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (checker, system) = (root.join("checker"), root.join("system"));
+        std::fs::create_dir_all(&checker).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        for dir in [&checker, &system] {
+            std::fs::write(dir.join("core.db"), b"core 1").unwrap();
+            std::fs::write(dir.join("minka.db"), b"minka 1").unwrap();
+        }
+        assert!(sync_dbs_match(&["core", "minka"], &checker, &system));
+        // 24/11/2026: the check saw minkade, the system's lists did not.
+        std::fs::write(checker.join("minka.db"), b"minka 2").unwrap();
+        assert!(!sync_dbs_match(&["core", "minka"], &checker, &system));
+        assert!(sync_dbs_match(&["core"], &checker, &system));
+        // A repository new to pacman.conf, not yet synced by the system.
+        std::fs::write(checker.join("new.db"), b"new").unwrap();
+        assert!(!sync_dbs_match(&["core", "new"], &checker, &system));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn pkg(version: &str, repo: Option<&str>) -> alpm::InstalledPkg {
         alpm::InstalledPkg {

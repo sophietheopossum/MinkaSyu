@@ -87,7 +87,7 @@ fn shot() -> Option<i32> {
         .unwrap_or_default()
         .join("minka-syu");
     let drawn = anti_webui::app::headless::render_png(file, 1100, height, 1.25, move || {
-        theme::install_widget_theme();
+        theme::install();
         let app = app::App::new();
         app.load_saved(&dir, tab);
         for file in &runs {
@@ -120,7 +120,7 @@ fn shot() -> Option<i32> {
     }
 }
 
-fn main() {
+pub fn main() {
     if let Some(code) = shot() {
         std::process::exit(code);
     }
@@ -133,7 +133,7 @@ fn main() {
         .app_id(instance::APP_ID)
         .size(880, 700)
         .run(|| {
-            theme::install_widget_theme();
+            theme::install();
             let app = app::App::new();
             let (tab, detail) = start_options();
             app.start(tab, detail);

@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::time::Duration;
@@ -48,23 +47,20 @@ fn core() -> Option<Rc<Core>> {
     CORE.with(|c| c.borrow().clone())
 }
 
-/// $MINKA_SYU_BIN, the `minka-syu` beside this binary (installed: both in
-/// /usr/bin; in the checkout: both in the MinkaDE workspace's
-/// target/<profile>/), then PATH.
-pub fn core_bin() -> PathBuf {
-    if let Some(p) = std::env::var_os("MINKA_SYU_BIN").filter(|v| !v.is_empty()) {
-        return PathBuf::from(p);
-    }
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
-    {
-        let beside = dir.join("minka-syu");
-        if beside.is_file() {
-            return beside;
+/// The core: $MINKA_SYU_BIN, else this binary run as `minka-syu`. MinkaDE's
+/// one binary holds both, and /proc/self/exe is the build this window runs
+/// even after an upgrade replaced the file, so a restarted core always
+/// speaks the window's protocol.
+fn core_command() -> Command {
+    use std::os::unix::process::CommandExt;
+    match std::env::var_os("MINKA_SYU_BIN").filter(|v| !v.is_empty()) {
+        Some(p) => Command::new(p),
+        None => {
+            let mut core = Command::new("/proc/self/exe");
+            core.arg0("minka-syu");
+            core
         }
     }
-    PathBuf::from("minka-syu")
 }
 
 /// Starts the core. Must run inside the window's root (the message channel
@@ -92,8 +88,7 @@ pub fn start(
 fn spawn(core: &Rc<Core>) {
     let generation = core.generation.get() + 1;
     core.generation.set(generation);
-    let bin = core_bin();
-    let child = Command::new(&bin)
+    let child = core_command()
         .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -102,7 +97,7 @@ fn spawn(core: &Rc<Core>) {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            (core.on_status)(Err(format!("cannot start {} serve: {e}", bin.display())));
+            (core.on_status)(Err(format!("cannot start minka-syu serve: {e}")));
             return;
         }
     };

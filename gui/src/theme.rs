@@ -1,8 +1,6 @@
-//! Proustite tokens, the Material 3 Expressive color scheme made from them,
-//! and the window's controls: AntiWebUI's md3e components in that scheme.
-//! The token values mirror the shared Proustite QML singleton (MinkaSyu's
-//! ui/services/Theme.qml facade); keep them in sync with
-//! ../../Proustite/Proustite.qml, as MinkaMon's and MinkaShell's theme.rs do.
+//! Proustite (the `proustite` crate, generated from Proustite.qml; the QML
+//! window's ui/services/Theme.qml is a facade over the same singleton) and
+//! the window's controls: AntiWebUI's md3e components in its scheme.
 
 use anti_webui::prelude::*;
 pub use anti_webui_md3e::components::CheckState;
@@ -11,123 +9,8 @@ use anti_webui_md3e::components::{
     indeterminate_wavy_progress, outlined_card, styled_button, styled_checkbox,
     styled_tri_state_checkbox,
 };
-use anti_webui_md3e::{ColorScheme, set_color_scheme};
+pub use proustite::*;
 use std::rc::Rc;
-
-pub const GROUND: u32 = 0x0a0709;
-pub const SURFACE: u32 = 0x161013;
-pub const SURFACE_RAISED: u32 = 0x1e161a;
-pub const LINE: u32 = 0x2e2228;
-pub const TEXT: u32 = 0xece5e7;
-pub const TEXT_MUTED: u32 = 0xa3959b;
-pub const TEXT_FAINT: u32 = 0x6e6167;
-pub const RED: u32 = 0xff0000;
-pub const RED_DIM: u32 = 0x8f1e2d;
-pub const PURPLE: u32 = 0xa488c9;
-pub const PURPLE_DIM: u32 = 0x4c3a63;
-pub const GAUGE_DIM: u32 = 0x3a1219;
-pub const OK_GREEN: u32 = 0x7dc98c;
-pub const WARN_AMBER: u32 = 0xe0a026;
-
-/// The md3e components set their own labels in this family (Roboto Flex,
-/// which comes with the crate), so the rest of the window uses it too.
-pub const FONT_FAMILY: &str = anti_webui_md3e::typography::FONT_FAMILY;
-pub const MONO_FAMILY: &str = "monospace";
-pub const FONT_SIZE: f32 = 13.0_f32;
-
-pub fn color(hex: u32) -> Color {
-    Color::from_rgb(hex)
-}
-
-pub fn color_alpha(hex: u32, alpha: f32) -> Color {
-    Color::from_rgb(hex).with_alpha(alpha.clamp(0.0_f32, 1.0_f32))
-}
-
-/// Proustite's tokens in Material's color roles: what the md3e components
-/// draw with. The roles Proustite has no token for (the error ones and the
-/// scrim) are the ones Material grows from Proustite's red.
-pub fn proustite_scheme() -> ColorScheme {
-    ColorScheme {
-        primary: color(RED),
-        on_primary: color(GROUND),
-        primary_container: color(RED_DIM),
-        on_primary_container: color(TEXT),
-        secondary: color(PURPLE),
-        on_secondary: color(GROUND),
-        secondary_container: color(PURPLE_DIM),
-        on_secondary_container: color(TEXT),
-        tertiary: color(WARN_AMBER),
-        on_tertiary: color(GROUND),
-        tertiary_container: color(GAUGE_DIM),
-        on_tertiary_container: color(TEXT),
-        surface: color(GROUND),
-        surface_dim: color(GROUND),
-        surface_bright: color(LINE),
-        surface_variant: color(SURFACE_RAISED),
-        on_surface: color(TEXT),
-        on_surface_variant: color(TEXT_MUTED),
-        inverse_surface: color(TEXT),
-        inverse_on_surface: color(GROUND),
-        inverse_primary: color(RED_DIM),
-        surface_container_lowest: color(GROUND),
-        surface_container_low: color(SURFACE),
-        surface_container: color(SURFACE),
-        surface_container_high: color(SURFACE_RAISED),
-        surface_container_highest: color(LINE),
-        outline: color(TEXT_FAINT),
-        outline_variant: color(LINE),
-        ..ColorScheme::from_seed(color(RED), true)
-    }
-}
-
-/// The colors of both widget sets: the md3e components take the scheme, and
-/// the toolkit's own widgets (text fields), which default to a light theme,
-/// take the theme below.
-pub fn install_widget_theme() {
-    set_color_scheme(proustite_scheme());
-    set_theme(Theme {
-        page: color(GROUND),
-        surface: color(SURFACE),
-        surface_muted: color(SURFACE),
-        overlay: color(SURFACE_RAISED),
-        hover: color(SURFACE_RAISED),
-        pressed: color(LINE),
-        selected: color(PURPLE_DIM),
-        text: color(TEXT),
-        text_muted: color(TEXT_MUTED),
-        text_disabled: color(TEXT_FAINT),
-        on_accent: color(TEXT),
-        border: color(LINE),
-        border_strong: color(TEXT_FAINT),
-        accent: color(PURPLE_DIM),
-        accent_hover: color(PURPLE),
-        accent_pressed: color(PURPLE_DIM),
-        accent_text: color(PURPLE),
-        accent_muted: color(GAUGE_DIM),
-        warning: color(WARN_AMBER),
-        success: color(OK_GREEN),
-        danger: color(RED),
-        tooltip: color(SURFACE_RAISED),
-        on_tooltip: color(TEXT),
-        scrollbar: color_alpha(TEXT_FAINT, 0.6_f32),
-        text_selection: color_alpha(RED_DIM, 0.5_f32),
-        ..Theme::dark()
-    });
-}
-
-pub fn ui_text(source: impl IntoTextSource, size: f32, hex: u32) -> Text {
-    text(source)
-        .font_family(FONT_FAMILY)
-        .text_size(size)
-        .text_color(color(hex))
-}
-
-pub fn mono_text(source: impl IntoTextSource, size: f32, hex: u32) -> Text {
-    text(source)
-        .font_family(MONO_FAMILY)
-        .text_size(size)
-        .text_color(color(hex))
-}
 
 /// Small bold caps over a list section ("REPOSITORIES", "AUR").
 pub fn section_label(label: &str) -> Text {

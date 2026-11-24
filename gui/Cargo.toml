@@ -5,9 +5,12 @@ edition = "2024"
 description = "MinkaSyu's window (AntiWebUI): a view over `minka-syu serve`"
 license = "MIT"
 
-[[bin]]
-name = "minka-syu-gui"
-path = "src/main.rs"
+# A library: MinkaDE's one binary (minka/, at the top of the checkout) runs it
+# under the name it was started as. Nothing is built from here alone.
+[lib]
+name = "minka_syu_gui"
+path = "src/lib.rs"
+doctest = false
 
 [dependencies]
 # The toolkit is MinkaDE's AntiWebUI submodule, a sibling of this repository, so every Minka
@@ -16,3 +19,5 @@ anti-webui = { path = "../../AntiWebUI/src/anti-webui", default-features = false
 anti-webui-md3e = { path = "../../AntiWebUI/src/anti-webui-md3e" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MinkaDE's palette (generated from Proustite.qml), shared by every app.
+proustite = { path = "../../Proustite" }

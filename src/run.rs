@@ -726,6 +726,9 @@ pub fn wrap(terminal_argv: &[String], self_exe: &Path, step: &str, result: &Path
     let mut argv = terminal.to_vec();
     argv.extend([
         self_exe.display().to_string(),
+        // MinkaDE's one binary: a terminal cannot set argv[0], so the name
+        // to run as goes first.
+        "minka-syu".to_string(),
         "run".to_string(),
         "--step".to_string(),
         step.to_string(),
@@ -737,11 +740,12 @@ pub fn wrap(terminal_argv: &[String], self_exe: &Path, step: &str, result: &Path
     argv
 }
 
-/// This binary, for the terminal to run. After the package is upgraded
-/// under a running core, /proc/self/exe reads "… (deleted)"; the path
-/// itself then holds the new binary, which is the one to start.
+/// This binary (MinkaDE's one binary, which `wrap` tells to run as
+/// minka-syu), for the terminal to run. After the package is upgraded under a
+/// running core, /proc/self/exe reads "… (deleted)"; the path itself then
+/// holds the new binary, which is the one to start.
 pub fn self_exe() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minka-syu"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("minka"));
     match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(path) => PathBuf::from(path),
         None => exe,
@@ -1071,11 +1075,11 @@ mod tests {
     #[test]
     fn wrap_runs_the_command_through_the_runner() {
         let argv = vec!["rio".to_string(), "-e".into(), "paru".into(), "-S".into(), "--".into(), "foo".into()];
-        let wrapped = wrap(&argv, Path::new("/usr/bin/minka-syu"), "install", Path::new("/s/runs/i.json"));
+        let wrapped = wrap(&argv, Path::new("/usr/bin/minka"), "install", Path::new("/s/runs/i.json"));
         assert_eq!(
             wrapped,
             [
-                "rio", "-e", "/usr/bin/minka-syu", "run", "--step", "install", "--result", "/s/runs/i.json", "--",
+                "rio", "-e", "/usr/bin/minka", "minka-syu", "run", "--step", "install", "--result", "/s/runs/i.json", "--",
                 "paru", "-S", "--", "foo"
             ]
         );

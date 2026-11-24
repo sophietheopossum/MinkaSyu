@@ -34,8 +34,8 @@ are kept, and a clean step's log is deleted.
 ## The window
 
 `minka-syu ui` opens it (the .desktop entry and MinkaShell's updates
-pill do). It runs `minka-syu-gui` (beside the core binary, or
-`$MINKA_SYU_GUI`), a view over `minka-syu serve` on its stdio; only one
+pill do). It runs `minka-syu-gui` (MinkaDE's one binary, `minka`, under that
+name, or `$MINKA_SYU_GUI`), a view over `minka-syu serve` on its stdio; only one
 window runs per session, and a second launch raises it. The QML window
 in `ui/` is kept as the fallback: `MINKA_SYU_FRONTEND=quickshell`, or
 whenever `minka-syu-gui` is missing (`$MINKA_SYU_DIR` points `qs -p` at

@@ -49,10 +49,9 @@ mod sources;
 
 use check::{load_state, maybe_notify, run_check, State};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 use std::process::Command;
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verb = args.first().map(String::as_str).unwrap_or("serve");
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
@@ -870,23 +869,18 @@ fn cmd_compare(args: &[String], print: bool) -> Result<(), String> {
     if print { Ok(()) } else { compare::open_meld(&c) }
 }
 
-/// The front end binary: $MINKA_SYU_GUI, `minka-syu-gui` beside this
-/// binary (installed, both are in /usr/bin; in a checkout, both are in the
-/// MinkaDE workspace's target/<profile>/), then PATH.
-fn find_gui() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("MINKA_SYU_GUI").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(p));
-    }
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
-        let beside = dir.join("minka-syu-gui");
-        if beside.is_file() {
-            return Some(beside);
+/// The window: $MINKA_SYU_GUI, else this binary run as `minka-syu-gui`.
+/// MinkaDE's one binary holds both, so the window is always this build.
+fn gui_command() -> Command {
+    use std::os::unix::process::CommandExt;
+    match std::env::var_os("MINKA_SYU_GUI").filter(|v| !v.is_empty()) {
+        Some(p) => Command::new(p),
+        None => {
+            let mut gui = Command::new("/proc/self/exe");
+            gui.arg0("minka-syu-gui");
+            gui
         }
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join("minka-syu-gui"))
-        .find(|p| p.is_file())
 }
 
 /// Replaces this process with the window, so whoever launched it (the
@@ -895,10 +889,8 @@ fn cmd_ui() -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let quickshell = std::env::var("MINKA_SYU_FRONTEND").is_ok_and(|v| v == "quickshell");
     if !quickshell {
-        if let Some(gui) = find_gui() {
-            let err = Command::new(&gui).exec();
-            eprintln!("minka-syu: {}: {err}; falling back to Quickshell", gui.display());
-        }
+        let err = gui_command().exec();
+        eprintln!("minka-syu: cannot start the window: {err}; falling back to Quickshell");
     }
     let dir = std::env::var("MINKA_SYU_DIR")
         .ok()
@@ -1633,14 +1625,14 @@ mod tests {
         assert_eq!(&deps[1..], ["-e", "sudo", "pacman", "-D", "--asdeps", "--", "python-lockfile"]);
         let explicit = reason_argv("libwpe", true);
         assert_eq!(&explicit[2..], ["sudo", "pacman", "-D", "--asexplicit", "--", "libwpe"]);
-        // launch_step's wrapping: the terminal runs `minka-syu run --step
-        // reason`, which records it and reports how it ended.
-        let wrapped = run::wrap(&deps, std::path::Path::new("/usr/bin/minka-syu"), "reason", std::path::Path::new("/s/r.json"));
+        // launch_step's wrapping: the terminal runs `minka minka-syu run
+        // --step reason`, which records it and reports how it ended.
+        let wrapped = run::wrap(&deps, std::path::Path::new("/usr/bin/minka"), "reason", std::path::Path::new("/s/r.json"));
         assert_eq!(
             &wrapped[1..],
             [
-                "-e", "/usr/bin/minka-syu", "run", "--step", "reason", "--result", "/s/r.json", "--", "sudo", "pacman",
-                "-D", "--asdeps", "--", "python-lockfile"
+                "-e", "/usr/bin/minka", "minka-syu", "run", "--step", "reason", "--result", "/s/r.json", "--", "sudo",
+                "pacman", "-D", "--asdeps", "--", "python-lockfile"
             ]
         );
         assert_eq!(run::step_label("reason"), "Install reason change");

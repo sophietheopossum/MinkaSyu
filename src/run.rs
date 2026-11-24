@@ -631,7 +631,7 @@ fn run_step(args: &[&str], console: Console) -> Result<i32, String> {
     let written = write_result(&result_path, &result);
     let _ = std::fs::remove_file(&pid_path);
     if let Err(e) = written {
-        eprintln!("minka-syu: cannot write {}: {e}", result_path.display());
+        minka_note::note!("minka-syu: cannot write {}: {e}", result_path.display());
     }
 
     if let Some(report) = held_report(&result) {
@@ -639,7 +639,7 @@ fn run_step(args: &[&str], console: Console) -> Result<i32, String> {
         // holds for a step that exited 0 with error lines (a failed dkms or
         // mkinitcpio hook) as much as for a failure: the window's card is
         // gone with the window, and the QML front end shows none.
-        eprintln!("{report}");
+        minka_note::note!("{report}");
         if console == Console::Attached && std::io::stdin().is_terminal() {
             eprint!("\n==> Press Enter to close this window. ");
             let mut line = String::new();

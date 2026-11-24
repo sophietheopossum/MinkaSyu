@@ -13,5 +13,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
+# MinkaDE's log line (minka-note/, at the top of the checkout): one write(2) each.
+minka-note = { path = "../minka-note" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

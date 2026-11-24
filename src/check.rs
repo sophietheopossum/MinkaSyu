@@ -1942,7 +1942,7 @@ fn explicit_candidate_info(db: &str, updates: &[Update]) -> HashMap<(String, Str
     {
         Ok(out) if out.status.success() => parse_candidate_info(&String::from_utf8_lossy(&out.stdout)),
         Ok(out) => {
-            eprintln!(
+            minka_note::note!(
                 "minka-syu: pacman -Sp for later-repo builds failed ({}): {}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
@@ -1950,7 +1950,7 @@ fn explicit_candidate_info(db: &str, updates: &[Update]) -> HashMap<(String, Str
             HashMap::new()
         }
         Err(e) => {
-            eprintln!("minka-syu: pacman -Sp for later-repo builds failed: {e}");
+            minka_note::note!("minka-syu: pacman -Sp for later-repo builds failed: {e}");
             HashMap::new()
         }
     }
@@ -1980,7 +1980,7 @@ fn switch_builds(db: &str, updates: &[Update], inputs: &Inputs) -> SyncBuilds {
         {
             Ok(out) if out.status.success() => builds.extend(parse_sync_builds(&String::from_utf8_lossy(&out.stdout))),
             Ok(out) => {
-                eprintln!(
+                minka_note::note!(
                     "minka-syu: pacman -Sp for same-version builds failed ({}): {}",
                     out.status,
                     String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
@@ -1988,7 +1988,7 @@ fn switch_builds(db: &str, updates: &[Update], inputs: &Inputs) -> SyncBuilds {
                 break;
             }
             Err(e) => {
-                eprintln!("minka-syu: pacman -Sp for same-version builds failed: {e}");
+                minka_note::note!("minka-syu: pacman -Sp for same-version builds failed: {e}");
                 break;
             }
         }
@@ -2024,14 +2024,14 @@ pub fn run_check() -> Result<State, String> {
     let sync_entries = alpm::parse_sync_list(&sync_text);
 
     let aur_lines = run_capture("paru", &["-Qua"]).unwrap_or_else(|e| {
-        eprintln!("minka-syu: paru -Qua failed, continuing without AUR: {e}");
+        minka_note::note!("minka-syu: paru -Qua failed, continuing without AUR: {e}");
         String::new()
     });
 
     let installed = alpm::read_installed(Path::new("/var/lib/pacman/local"));
     let conf = read_conf(&installed);
     let sysupgrade = sysupgrade_targets(db_str, true)
-        .map_err(|e| eprintln!("minka-syu: sysupgrade check failed, falling back to -Qu alone: {e}"))
+        .map_err(|e| minka_note::note!("minka-syu: sysupgrade check failed, falling back to -Qu alone: {e}"))
         .ok();
     // Only with replacements does it matter what dependencies pull back
     // in (a replaced package installed again), so only then pay for it.
@@ -2040,7 +2040,7 @@ pub fn run_check() -> Result<State, String> {
     });
     let final_targets = if has_replacements {
         sysupgrade_targets(db_str, false)
-            .map_err(|e| eprintln!("minka-syu: full sysupgrade check failed, using the -dd one: {e}"))
+            .map_err(|e| minka_note::note!("minka-syu: full sysupgrade check failed, using the -dd one: {e}"))
             .ok()
     } else {
         None
@@ -2074,7 +2074,7 @@ pub fn run_check() -> Result<State, String> {
     let names: Vec<String> = candidates.iter().map(|c| c.name.clone()).collect();
     let aur = aur_versions(&names);
     if let Err(e) = &aur {
-        eprintln!("minka-syu: could not ask the AUR which packages it has: {e}");
+        minka_note::note!("minka-syu: could not ask the AUR which packages it has: {e}");
     }
     let (untracked, aur_unreachable) = flag_untracked(candidates, aur.as_ref().map_err(String::as_str));
 

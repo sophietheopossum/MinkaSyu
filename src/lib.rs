@@ -78,14 +78,14 @@ pub fn main() {
             Ok(())
         }
         other => {
-            eprintln!(
+            minka_note::note!(
                 "minka-syu: unknown verb '{other}' (expected check|apply|search|repos|installed|install|remove|reason|sources|compare|ui|serve)"
             );
             std::process::exit(2);
         }
     };
     if let Err(e) = result {
-        eprintln!("minka-syu: {e}");
+        minka_note::note!("minka-syu: {e}");
         std::process::exit(1);
     }
 }
@@ -644,7 +644,7 @@ fn launch_step(argv: &[String], step: &str, dry_run: bool, report: Report) -> Re
                 return Err(run::report_text(&r));
             }
             if !r.excerpt.is_empty() {
-                eprintln!("minka-syu: {}", run::report_text(&r));
+                minka_note::note!("minka-syu: {}", run::report_text(&r));
             }
             // A failed step's window may still be open, held for Enter: it
             // is not ours to wait on, and this process ends here anyway.
@@ -904,7 +904,7 @@ fn cmd_ui() -> Result<(), String> {
     let quickshell = std::env::var("MINKA_SYU_FRONTEND").is_ok_and(|v| v == "quickshell");
     if !quickshell {
         let err = gui_command().exec();
-        eprintln!("minka-syu: cannot start the window: {err}; falling back to Quickshell");
+        minka_note::note!("minka-syu: cannot start the window: {err}; falling back to Quickshell");
     }
     let dir = std::env::var("MINKA_SYU_DIR")
         .ok()

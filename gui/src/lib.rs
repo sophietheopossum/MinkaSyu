@@ -54,7 +54,7 @@ fn shot() -> Option<i32> {
     let at = args.iter().position(|a| a == "--shot")?;
     let (Some(tab), Some(file)) = (args.get(at + 1).and_then(|t| tab_named(t)), args.get(at + 2))
     else {
-        eprintln!("usage: minka-syu-gui --shot updates|browse|installed|sources <file.png>");
+        minka_note::note!("usage: minka-syu-gui --shot updates|browse|installed|sources <file.png>");
         return Some(2);
     };
     let busy = args.iter().any(|a| a == "--busy");
@@ -114,7 +114,7 @@ fn shot() -> Option<i32> {
     match drawn {
         Ok(()) => Some(0),
         Err(e) => {
-            eprintln!("minka-syu-gui: {e}");
+            minka_note::note!("minka-syu-gui: {e}");
             Some(1)
         }
     }
@@ -140,7 +140,7 @@ pub fn main() {
             views::root(app)
         });
     if let Err(e) = result {
-        eprintln!("minka-syu-gui: {e}");
+        minka_note::note!("minka-syu-gui: {e}");
         std::process::exit(1);
     }
 }

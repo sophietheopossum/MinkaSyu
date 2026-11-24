@@ -257,7 +257,7 @@ pub fn run_search(query: &str) -> Result<SearchResponse, String> {
             results.extend(aur);
         }
         Err(e) => {
-            eprintln!("minka-syu: AUR search unavailable, repo results only: {e}");
+            minka_note::note!("minka-syu: AUR search unavailable, repo results only: {e}");
         }
     }
     if results.len() > TOTAL_CAP {

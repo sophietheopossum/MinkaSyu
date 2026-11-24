@@ -1635,7 +1635,7 @@ fn mirror(url: &str, dir: &Path, blobless: bool) -> Result<(), String> {
             return Ok(());
         }
         if let Err(e) = run_text(git(dir).args(["fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*"])) {
-            eprintln!("minka-syu: fetching {url}: {e}; using the copy fetched before");
+            minka_note::note!("minka-syu: fetching {url}: {e}; using the copy fetched before");
         }
         return Ok(());
     }

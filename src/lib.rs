@@ -23,9 +23,7 @@
 //!                      of a package ("aur" for the AUR's), written to the
 //!                      cache dir and opened in meld (--print: only say
 //!                      where they are and where they came from)
-//!   ui                 open the window: the AntiWebUI front end
-//!                      (minka-syu-gui), or Quickshell when it is missing
-//!                      or MINKA_SYU_FRONTEND=quickshell
+//!   ui                 open the window (minka-syu-gui)
 //!   serve              NDJSON over stdio for the UI
 //!                      (MinkaLink's protocol, verbatim)
 //!   run --step <s> --result <f> -- <command...>
@@ -901,17 +899,8 @@ fn gui_command() -> Command {
 /// shell's updates pill, the .desktop entry) owns the window process.
 fn cmd_ui() -> Result<(), String> {
     use std::os::unix::process::CommandExt;
-    let quickshell = std::env::var("MINKA_SYU_FRONTEND").is_ok_and(|v| v == "quickshell");
-    if !quickshell {
-        let err = gui_command().exec();
-        minka_note::note!("minka-syu: cannot start the window: {err}; falling back to Quickshell");
-    }
-    let dir = std::env::var("MINKA_SYU_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "/usr/share/minka-syu/ui".to_string());
-    let err = Command::new("qs").args(["-p", &dir]).exec();
-    Err(format!("starting qs -p {dir}: {err}"))
+    let err = gui_command().exec();
+    Err(format!("cannot start the window: {err}"))
 }
 
 fn cmd_installed() -> Result<(), String> {

@@ -1,8 +1,6 @@
 //! minka-syu-gui — MinkaSyu's window on AntiWebUI: updates, browse,
 //! installed packages, and the MinkaPKG sources. A view over the core
-//! (`minka-syu serve`); `minka-syu ui` starts it, and falls back to the
-//! QML window (ui/) when this binary is missing or
-//! MINKA_SYU_FRONTEND=quickshell.
+//! (`minka-syu serve`); `minka-syu ui` starts it.
 
 mod app;
 mod core;

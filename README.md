@@ -36,20 +36,10 @@ are kept, and a clean step's log is deleted.
 `minka-syu ui` opens it (the .desktop entry and MinkaShell's updates
 pill do). It runs `minka-syu-gui` (MinkaDE's one binary, `minka`, under that
 name, or `$MINKA_SYU_GUI`), a view over `minka-syu serve` on its stdio; only one
-window runs per session, and a second launch raises it. The QML window
-in `ui/` is kept as the fallback: `MINKA_SYU_FRONTEND=quickshell`, or
-whenever `minka-syu-gui` is missing (`$MINKA_SYU_DIR` points `qs -p` at
-a checkout's `ui/`). `minka-syu-gui --tab updates|browse|installed|sources`
-opens on a tab, and `--detail <pkg>` on a package's detail view.
-
-The QML fallback does not know switch rows or the no-recorded-repository
-row. It shows them as later-repo rows, and while they are unticked its
-command preview lists them under `--ignore` (the group as
-`(no recorded repository)`). The core drops those names before paru
-runs: an unticked switch or reinstall is only left out. Its detail view
-does not keep an installed build either: choosing that build, or the
-first repository's copy, for a later-repo row leaves the row ticked with
-nothing to do.
+window runs per session, and a second launch raises it. (The QML window
+it replaced is gone, 24/11/2026.) `minka-syu-gui --tab
+updates|browse|installed|sources` opens on a tab, and `--detail <pkg>` on a
+package's detail view.
 
 When the AUR has a package, its detail view links to the package's AUR
 page (comments, votes, maintainer) under the repository builds.
@@ -141,8 +131,7 @@ it waits for; when the step ends, the view and the Installed tab's list
 (once it has been read) read the local DB again, and a failed removal
 says so under NEEDED BY as long as its card is there (the next removal
 of the same packages replaces it, as the next change of a package's
-install reason replaces that one's). The QML fallback has neither these
-sections nor the button.
+install reason replaces that one's).
 
 Tabs: **Updates** (below), **Browse** (search repos + AUR, tick builds
 to install together), **Installed** (filter, tick to remove), and
@@ -192,9 +181,7 @@ where. If that fails, the check falls back to `-Qu` and pacman.conf.
   installed to pacman's candidate; choosing the noted build makes it a
   change to that build's repository instead, which may add one or take
   one away (a package installed from the lower repository changes back
-  to the first one unless its build is chosen). The QML fallback shows
-  such a row as a plain upgrade, without the note or what the noted
-  build replaces.
+  to the first one unless its build is chosen).
 - **Same-version switches.** An installed package whose build is in no
   repository, while a repository carries that version as a build of its
   own: its repository dropped it (Arch's `[multilib]` lib32-libcaca,
@@ -323,8 +310,7 @@ it says why the action button is off. The button is off while a compare
 runs; meanwhile the footer says "Fetching sources for meld… (<left>
 against <right>)", and a failure shows in the error bar above it.
 Compares run one at a time across processes too (`compare/.lock`), so
-the window and the command line never write one tree at once. The QML
-fallback has no such button.
+the window and the command line never write one tree at once.
 
 Who built a package decides where its tree is, told by repository and
 packager, never by architecture or a ".N" suffix (CachyOS's v4

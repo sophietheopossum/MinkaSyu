@@ -4,8 +4,8 @@
 
 mod app;
 mod core;
-mod instance;
 mod model;
+mod raise;
 mod theme;
 mod views;
 
@@ -122,13 +122,14 @@ pub fn main() {
     if let Some(code) = shot() {
         std::process::exit(code);
     }
-    if let instance::Claim::Duplicate = instance::claim() {
+    let minka_instance::Claim::Primary(instance) = minka_instance::claim("minka-syu-gui") else {
         // The running window raises itself on our probe.
         return;
-    }
+    };
+    raise::on_turned_away(instance);
     let result = App::new()
         .title("MinkaSyu")
-        .app_id(instance::APP_ID)
+        .app_id(raise::APP_ID)
         .size(880, 700)
         .run(|| {
             theme::install();

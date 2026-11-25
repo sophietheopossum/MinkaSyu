@@ -15,6 +15,8 @@ doctest = false
 [dependencies]
 # MinkaDE's log line (minka-note/, at the top of the checkout): one write(2) each.
 minka-note = { path = "../../minka-note" }
+# One window per session ($XDG_RUNTIME_DIR/minka-syu-gui.lock), shared with the other apps.
+minka-instance = { path = "../../minka-instance" }
 
 # The toolkit is MinkaDE's AntiWebUI submodule, a sibling of this repository, so every Minka
 # app builds the same revision and a toolkit fix reaches them all.

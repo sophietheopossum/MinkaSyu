@@ -1,24 +1,16 @@
-//! One window per session. The first instance holds a Unix socket in
-//! $XDG_RUNTIME_DIR; a second launch (the bar's updates pill clicked again)
-//! connects, and the first raises its own window through the ShojiWM IPC
-//! (`windows.activate`): the toolkit has no self-activation. Same scheme as
-//! MinkaMon's instance.rs, with the raise done in the listener thread
-//! instead of a UI ticker.
+//! One window per session, raised when a second launch (the bar's updates
+//! pill clicked again) is turned away by `minka-instance`. The window raises
+//! itself through the ShojiWM IPC (`windows.activate`): the toolkit has no
+//! self-activation.
 
+use minka_instance::{Event, Instance};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
-const LOCK_NAME: &str = "minka-syu-gui.lock";
 pub const APP_ID: &str = "minka-syu";
-
-pub enum Claim {
-    Primary,
-    Duplicate,
-}
 
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -26,48 +18,18 @@ fn runtime_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Whether a live instance answers on the socket (that connection is
-/// also what asks it to raise itself).
-fn probe(path: &Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(path) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    let Ok(pid) = String::from_utf8_lossy(&buf[..n]).trim().parse::<u32>() else {
-        return false;
-    };
-    pid != std::process::id() && Path::new(&format!("/proc/{pid}")).exists()
-}
-
-pub fn claim() -> Claim {
-    let Some(path) = runtime_dir().map(|d| d.join(LOCK_NAME)) else {
-        return Claim::Primary;
-    };
-    if probe(&path) {
-        return Claim::Duplicate;
-    }
-    if let Ok(meta) = std::fs::symlink_metadata(&path)
-        && meta.file_type().is_socket()
-    {
-        let _ = std::fs::remove_file(&path);
-    }
-    // Without the socket the window still runs, just unguarded.
-    if let Ok(listener) = UnixListener::bind(&path) {
-        let pid = std::process::id();
-        let _ = std::thread::Builder::new()
-            .name("minka-syu-instance".into())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { continue };
-                    let _ = writeln!(stream, "{pid}");
-                    drop(stream);
+/// Raises the window for each launch turned away, on a thread of its own:
+/// the IPC round trip can take a while. Unguarded, there are none.
+pub fn on_turned_away(instance: Instance) {
+    let _ = std::thread::Builder::new()
+        .name("minka-syu-raise".into())
+        .spawn(move || {
+            for event in instance.events() {
+                if let Event::TurnedAway = event {
                     raise_self();
                 }
-            });
-    }
-    Claim::Primary
+            }
+        });
 }
 
 /// `workspaces.get`, find our window by app id, `windows.activate` it.
